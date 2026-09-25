@@ -1,0 +1,30 @@
+From 1eb97e46dc29dc7f691ce1cb048f2a8ec4db6d90 Mon Sep 17 00:00:00 2001
+From: greyoak111 <greyoak111@users.noreply.github.com>
+Date: Fri, 25 Sep 2026 23:37:00 +0800
+Subject: [PATCH 2/2] Register the livehime plugin for Windows
+
+plugins/CMakeLists.txt said 'add_obs_plugin(livehime PLATFORMS MACOS)', so OBS
+skipped the directory entirely on Windows: cmake configured cleanly and the
+module never appeared in the enabled-modules list, with no error to say why.
+The plugin's own CMakeLists.txt was already platform-aware; this is the
+registration the port also needed.
+---
+ plugins/CMakeLists.txt | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/plugins/CMakeLists.txt b/plugins/CMakeLists.txt
+index 47c44c8..4576b25 100644
+--- a/plugins/CMakeLists.txt
++++ b/plugins/CMakeLists.txt
+@@ -59,7 +59,7 @@ add_obs_plugin(
+     WITH_MESSAGE
+ )
+ add_obs_plugin(image-source)
+-add_obs_plugin(livehime PLATFORMS MACOS)
++add_obs_plugin(livehime PLATFORMS MACOS WINDOWS)
+ add_obs_plugin(linux-alsa PLATFORMS LINUX FREEBSD OPENBSD)
+ add_obs_plugin(linux-capture PLATFORMS LINUX FREEBSD OPENBSD)
+ add_obs_plugin(linux-jack PLATFORMS LINUX FREEBSD OPENBSD)
+-- 
+2.54.0 (Apple Git-157)
+

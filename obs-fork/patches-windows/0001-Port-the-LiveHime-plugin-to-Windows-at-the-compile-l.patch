@@ -1,7 +1,7 @@
 From 31261bd71e2b6a49c1f77f123cf3f6c76d4f5312 Mon Sep 17 00:00:00 2001
 From: greyoak111 <greyoak111@users.noreply.github.com>
 Date: Fri, 25 Sep 2026 23:22:11 +0800
-Subject: [PATCH] Port the LiveHime plugin to Windows at the compile layer
+Subject: [PATCH 1/2] Port the LiveHime plugin to Windows at the compile layer
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
