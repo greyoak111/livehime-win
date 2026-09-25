@@ -1,0 +1,146 @@
+From 2588d14139db01d5e45800e0656e1ec9cb25f946 Mon Sep 17 00:00:00 2001
+From: greyoak111 <greyoak111@users.noreply.github.com>
+Date: Fri, 25 Sep 2026 23:41:06 +0800
+Subject: [PATCH 3/3] Fix the two compile errors the first Windows build found
+
+plugins/livehime/src/update-page.cpp included CoreFoundation/CoreFoundation.h
+unconditionally; UpdatePage::currentVersion() read CFBundleShortVersionString
+from the main bundle. It now reads ProductVersion from the running executable's
+version resource on Windows -- the value frontend/cmake/windows/obs.rc.in
+writes. The macOS path is unchanged. This was the only C++ file in the plugin
+that touched an Apple framework; the extension-based sweep that classified the
+C++ side as portable missed an #include.
+
+It also redefined NOMINMAX after CMake already defined it, which /WX turned
+from C4005 into C2220. Both that file and window-native.cpp now guard the
+macros.
+
+version.lib is linked for GetFileVersionInfoW/VerQueryValueW.
+---
+ plugins/livehime/CMakeLists.txt        |  7 ++--
+ plugins/livehime/src/update-page.cpp   | 55 ++++++++++++++++++++++++++
+ plugins/livehime/src/window-native.cpp |  7 ++++
+ 3 files changed, 66 insertions(+), 3 deletions(-)
+
+diff --git a/plugins/livehime/CMakeLists.txt b/plugins/livehime/CMakeLists.txt
+index 048419d..b800be8 100644
+--- a/plugins/livehime/CMakeLists.txt
++++ b/plugins/livehime/CMakeLists.txt
+@@ -146,9 +146,10 @@ elseif(WIN32)
+   target_compile_definitions(livehime PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+   # user32/dwmapi: window level and capture affinity for the floating chat and
+   # the per-window capture exceptions (the Windows counterpart of NSWindow's
+-  # sharingType). crypt32: SHA-256, which the update check needs once the real
+-  # core lands.
+-  target_link_libraries(livehime PRIVATE user32 dwmapi crypt32)
++  # sharingType). version: the version resource UpdatePage::currentVersion()
++  # reads. crypt32: SHA-256, which the update check needs once the real core
++  # lands.
++  target_link_libraries(livehime PRIVATE user32 dwmapi version crypt32)
+ endif()
+ 
+ set_target_properties_obs(livehime PROPERTIES FOLDER plugins/livehime PREFIX "" AUTOMOC ON)
+diff --git a/plugins/livehime/src/update-page.cpp b/plugins/livehime/src/update-page.cpp
+index 177a086..14f109c 100644
+--- a/plugins/livehime/src/update-page.cpp
++++ b/plugins/livehime/src/update-page.cpp
+@@ -5,7 +5,19 @@
+ #include <livehime-core.h>
+ #include <obs-module.h>
+ 
++#ifdef _WIN32
++/* Also defined by target_compile_definitions in plugins/livehime/CMakeLists.txt;
++ * guard them so /WX does not turn C4005 into an error. */
++#ifndef WIN32_LEAN_AND_MEAN
++#define WIN32_LEAN_AND_MEAN
++#endif
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++#include <windows.h>
++#else
+ #include <CoreFoundation/CoreFoundation.h>
++#endif
+ 
+ #include <QCheckBox>
+ #include <QDesktopServices>
+@@ -30,6 +42,48 @@ QString text(const char *key)
+ 
+ QString UpdatePage::currentVersion()
+ {
++#ifdef _WIN32
++	/* The Windows counterpart of the macOS Info.plist lookup below: the version
++	 * comes from the running executable's version resource, which
++	 * frontend/cmake/windows/obs.rc.in fills in (see
++	 * cmake/windows/defaults.cmake). ProductVersion carries the OBS version the
++	 * build is based on -- the Windows build does not yet set a separate
++	 * LiveHime application version the way LIVEHIME_APP_VERSION does on macOS
++	 * (docs/WINDOWS_PORT.md). */
++	wchar_t path[MAX_PATH] = {};
++	if (!GetModuleFileNameW(nullptr, path, MAX_PATH))
++		return QString();
++
++	DWORD ignored = 0;
++	const DWORD size = GetFileVersionInfoSizeW(path, &ignored);
++	if (!size)
++		return QString();
++
++	QByteArray block(static_cast<int>(size), '\0');
++	if (!GetFileVersionInfoW(path, 0, size, block.data()))
++		return QString();
++
++	struct LangCodePage {
++		WORD language;
++		WORD codePage;
++	} *translations = nullptr;
++	UINT translationsSize = 0;
++	if (!VerQueryValueW(block.constData(), L"\\VarFileInfo\\Translation",
++			    reinterpret_cast<LPVOID *>(&translations), &translationsSize) ||
++	    !translations || translationsSize < sizeof(LangCodePage))
++		return QString();
++
++	wchar_t query[64] = {};
++	swprintf_s(query, L"\\StringFileInfo\\%04x%04x\\ProductVersion", translations[0].language,
++		   translations[0].codePage);
++
++	wchar_t *value = nullptr;
++	UINT valueSize = 0;
++	if (!VerQueryValueW(block.constData(), query, reinterpret_cast<LPVOID *>(&value), &valueSize) || !value || !valueSize)
++		return QString();
++
++	return QString::fromWCharArray(value).trimmed();
++#else
+ 	auto value = static_cast<CFStringRef>(
+ 		CFBundleGetValueForInfoDictionaryKey(CFBundleGetMainBundle(), CFSTR("CFBundleShortVersionString")));
+ 	if (!value || CFGetTypeID(value) != CFStringGetTypeID())
+@@ -37,6 +91,7 @@ QString UpdatePage::currentVersion()
+ 	char buffer[64] = {};
+ 	CFStringGetCString(value, buffer, sizeof(buffer), kCFStringEncodingUTF8);
+ 	return QString::fromUtf8(buffer);
++#endif
+ }
+ 
+ namespace {
+diff --git a/plugins/livehime/src/window-native.cpp b/plugins/livehime/src/window-native.cpp
+index bc02d8e..754372b 100644
+--- a/plugins/livehime/src/window-native.cpp
++++ b/plugins/livehime/src/window-native.cpp
+@@ -26,8 +26,15 @@
+ #include <string>
+ 
+ #ifdef _WIN32
++/* NOMINMAX/WIN32_LEAN_AND_MEAN also come from target_compile_definitions in
++ * plugins/livehime/CMakeLists.txt; guard them so /WX does not turn the
++ * redefinition warning (C4005) into an error (C2220). */
++#ifndef WIN32_LEAN_AND_MEAN
+ #define WIN32_LEAN_AND_MEAN
++#endif
++#ifndef NOMINMAX
+ #define NOMINMAX
++#endif
+ #include <windows.h>
+ #endif
+ 
+-- 
+2.54.0 (Apple Git-157)
+

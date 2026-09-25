@@ -1,7 +1,7 @@
 From 1eb97e46dc29dc7f691ce1cb048f2a8ec4db6d90 Mon Sep 17 00:00:00 2001
 From: greyoak111 <greyoak111@users.noreply.github.com>
 Date: Fri, 25 Sep 2026 23:37:00 +0800
-Subject: [PATCH 2/2] Register the livehime plugin for Windows
+Subject: [PATCH 2/3] Register the livehime plugin for Windows
 
 plugins/CMakeLists.txt said 'add_obs_plugin(livehime PLATFORMS MACOS)', so OBS
 skipped the directory entirely on Windows: cmake configured cleanly and the
