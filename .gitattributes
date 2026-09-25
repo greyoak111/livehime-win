@@ -1,0 +1,7 @@
+# Patch files must be byte-exact: git am reads them as data, and the macOS
+# series carries binary payloads (icons, AppIcon assets) inside its diffs.
+# Without this, a clone on Windows with core.autocrlf=true rewrites every LF to
+# CRLF and git am fails with "git diff header lacks filename information".
+*.patch -text
+*.ico binary
+*.png binary
