@@ -65,10 +65,23 @@ if ( ! $SkipClone ) {
     Pop-Location
 
     Step 'apply the macOS series, then the Windows series'
+    # PowerShell does not expand globs for native commands: passing
+    # 'obs-fork/patches/*.patch' hands git the literal string and it answers
+    # "could not open ... *.patch". The files are enumerated here instead.
+    function PatchList($dir, $pattern) {
+        $found = Get-ChildItem (Join-Path $dir $pattern) -ErrorAction SilentlyContinue |
+                 Sort-Object Name | ForEach-Object { $_.FullName }
+        if ( ! $found ) { throw "no patches matched $pattern under $dir" }
+        return , $found
+    }
+    $macPatches = PatchList $patches 'obs-fork/patches/*.patch'
+    $winPatches = PatchList $patches 'obs-fork/patches-windows/*.patch'
+    Say ("{0} macOS patches, {1} Windows patches" -f $macPatches.Count, $winPatches.Count)
+
     Push-Location $fork
-    & git -c user.name=build -c user.email=build@local am (Join-Path $patches 'obs-fork/patches/*.patch')
+    & git -c user.name=build -c user.email=build@local am @macPatches
     if ( $LASTEXITCODE -ne 0 ) { throw 'the macOS patch series did not apply' }
-    & git -c user.name=build -c user.email=build@local am (Join-Path $patches 'obs-fork/patches-windows/*.patch')
+    & git -c user.name=build -c user.email=build@local am @winPatches
     if ( $LASTEXITCODE -ne 0 ) { throw 'the Windows patch series did not apply' }
     Say ((& git rev-list --count HEAD) + ' commits')
     Pop-Location
