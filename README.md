@@ -33,6 +33,7 @@ plugins/livehime/
   core/include/            livehime-core.h, the C bridge both cores implement
 build-aux/livehime-win/    build-win.ps1
 docs/WINDOWS_PORT.md       port map: done / stubbed / remaining
+docs/PORTING_NOTES.md      how the port was done, and where it went wrong
 docs/port-spec/            the port contract and the module specifications
 ```
 
@@ -42,7 +43,9 @@ functions). On macOS that core is Swift; on Windows it is C++, selected in
 structure — it is a port of its behaviour, and
 **[docs/port-spec/CONTRACT.md](docs/port-spec/CONTRACT.md)** is where the
 endpoints, the signing algorithms, the JSON shapes and every deliberate
-deviation are written down.
+deviation are written down. **[docs/PORTING_NOTES.md](docs/PORTING_NOTES.md)**
+is the working record: what worked, what did not, and the mistakes worth not
+repeating.
 
 ## Building
 
