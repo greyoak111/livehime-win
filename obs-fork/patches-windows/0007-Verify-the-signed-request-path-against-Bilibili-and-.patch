@@ -1,0 +1,252 @@
+From f50f7fe5d4b20ab432fa07f029a451d1cd24c453 Mon Sep 17 00:00:00 2001
+From: DeepSeek Harness <noreply@deepseek.com>
+Date: Sat, 26 Sep 2026 01:23:44 +0800
+Subject: [PATCH 07/18] Verify the signed-request path against Bilibili, and
+ widen the Windows dock
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The self-test now exercises five things instead of two, and three of them are
+answers only the real server can give:
+
+  click/now     the server clock startLive signs its `ts` field with
+  finger/spi    buvid3, which the danmaku handshake sends and QR login does
+                not provide
+  getDanmuInfo  the WBI-signed request
+
+getDanmuInfo answering 200/0 with the WBI signature in place is the point: a
+wrong w_rid makes Bilibili answer -403 签名校验失败, so a 0 means the server
+validated net/signing.cpp's mixin key and digest for real. That is the one
+piece of this port that cannot be checked offline.
+
+placeDockOnFirstRun now asks for 900 on Windows rather than the macOS 320. It
+is a floor, not a fix, and the comment says so with the measurements: Qt clamps
+to what the main window can spare (320 -> dock 404, 620 -> 534, 900 -> 575) and
+the account panel's minimum width — the widest page of its QStackedWidget, not
+the QR — still exceeds all three, so the login code stays partly cut. The real
+fix is the QScrollArea treatment patch 0052 gave the Captions and Updates tabs,
+and it belongs to the UI layer rather than this port.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ plugins/livehime/core/win/livehime-core.cpp | 125 +++++++++++++++++---
+ plugins/livehime/src/plugin-main.cpp        |  21 ++++
+ 2 files changed, 127 insertions(+), 19 deletions(-)
+
+diff --git a/plugins/livehime/core/win/livehime-core.cpp b/plugins/livehime/core/win/livehime-core.cpp
+index f30ec78..8587799 100644
+--- a/plugins/livehime/core/win/livehime-core.cpp
++++ b/plugins/livehime/core/win/livehime-core.cpp
+@@ -29,6 +29,7 @@
+ #include "live/liveclient.h"
+ #include "net/cookies.h"
+ #include "net/http.h"
++#include "net/signing.h"
+ #include "platform/dispatch.h"
+ 
+ using livehime::Emit;
+@@ -128,23 +129,26 @@ void SelfTest()
+ 	line("LiveHime Windows core self-test");
+ 	line("");
+ 
++	std::string user_agent =
++		"Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/605.1.15 (KHTML, like Gecko) "
++		"Version/17.0 Safari/605.1.15";
++
+ 	/* 1. Plain HTTPS GET: proves WinHTTP, Schannel and DNS from this machine. */
++	livehime::net::Response nav_response;
+ 	{
+ 		livehime::net::Request request;
+ 		request.url = "https://api.bilibili.com/x/web-interface/nav";
+ 		request.headers["Accept"] = "application/json, text/plain, */*";
+ 		request.headers["Referer"] = "https://live.bilibili.com/";
+-		request.headers["User-Agent"] =
+-			"Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/605.1.15 (KHTML, like Gecko) "
+-			"Version/17.0 Safari/605.1.15";
++		request.headers["User-Agent"] = user_agent;
+ 
+-		livehime::net::Response response = livehime::net::SendSync(request);
+-		line("[nav] status=" + std::to_string(response.status) +
+-		     (response.error.empty() ? std::string() : " error=" + response.error));
+-		if (!response.body.empty()) {
+-			nlohmann::json parsed = nlohmann::json::parse(response.body, nullptr, false);
++		nav_response = livehime::net::SendSync(request);
++		line("[nav] status=" + std::to_string(nav_response.status) +
++		     (nav_response.error.empty() ? std::string() : " error=" + nav_response.error));
++		if (!nav_response.body.empty()) {
++			nlohmann::json parsed = nlohmann::json::parse(nav_response.body, nullptr, false);
+ 			if (parsed.is_discarded()) {
+-				line("[nav] body is not JSON: " + response.body.substr(0, 200));
++				line("[nav] body is not JSON: " + nav_response.body.substr(0, 200));
+ 			} else {
+ 				line("[nav] code=" + std::to_string(parsed.value("code", -999)) +
+ 				     " message=" + parsed.value("message", std::string()));
+@@ -157,14 +161,13 @@ void SelfTest()
+ 
+ 	/* 2. QR login generate: the request the dock's 扫码登录 button makes. If
+ 	 *    this answers 0 with a url, the login path is reachable from here. */
++	std::string qr_url;
+ 	{
+ 		livehime::net::Request request;
+ 		request.url = "https://passport.bilibili.com/x/passport-login/web/qrcode/generate";
+ 		request.headers["Accept"] = "application/json, text/plain, */*";
+ 		request.headers["Referer"] = "https://live.bilibili.com/";
+-		request.headers["User-Agent"] =
+-			"Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/605.1.15 (KHTML, like Gecko) "
+-			"Version/17.0 Safari/605.1.15";
++		request.headers["User-Agent"] = user_agent;
+ 
+ 		livehime::net::Response response = livehime::net::SendSync(request);
+ 		line("");
+@@ -178,8 +181,8 @@ void SelfTest()
+ 				const int code = parsed.value("code", -999);
+ 				line("[qrcode/generate] code=" + std::to_string(code));
+ 				if (parsed.contains("data") && parsed["data"].is_object()) {
+-					line("[qrcode/generate] url=" +
+-					     parsed["data"].value("url", std::string()));
++					qr_url = parsed["data"].value("url", std::string());
++					line("[qrcode/generate] url=" + qr_url);
+ 					/* The key is session material; record only its length. */
+ 					line("[qrcode/generate] key length=" +
+ 					     std::to_string(parsed["data"].value("qrcode_key", std::string()).size()));
+@@ -188,14 +191,98 @@ void SelfTest()
+ 		}
+ 	}
+ 
+-	/* 3. What the cookies look like after those two calls. */
++	/* 3. Server clock — startLive signs its `ts` field with this value. */
++	{
++		livehime::net::Request request;
++		request.url = "https://api.bilibili.com/x/report/click/now";
++		request.headers["User-Agent"] = user_agent;
++		livehime::net::Response response = livehime::net::SendSync(request);
++		line("");
++		line("[click/now] status=" + std::to_string(response.status));
++		nlohmann::json parsed = nlohmann::json::parse(response.body, nullptr, false);
++		if (!parsed.is_discarded() && parsed.contains("data") && parsed["data"].is_object())
++			line("[click/now] data.now=" + std::to_string(parsed["data"].value("now", 0LL)));
++		else
++			line("[click/now] no data.now in the answer");
++	}
++
++	/* 4. Browser fingerprint — buvid3, which the danmaku handshake sends and
++	 *    which QR login does not provide. */
++	{
++		livehime::net::Request request;
++		request.url = "https://api.bilibili.com/x/frontend/finger/spi";
++		request.headers["User-Agent"] = user_agent;
++		livehime::net::Response response = livehime::net::SendSync(request);
++		line("");
++		line("[finger/spi] status=" + std::to_string(response.status));
++		nlohmann::json parsed = nlohmann::json::parse(response.body, nullptr, false);
++		if (!parsed.is_discarded() && parsed.contains("data") && parsed["data"].is_object()) {
++			const std::string b3 = parsed["data"].value("b_3", std::string());
++			line("[finger/spi] b_3 length=" + std::to_string(b3.size()));
++			livehime::net::CookieJar::Instance().Set(".bilibili.com", "buvid3", b3);
++		} else {
++			line("[finger/spi] no data.b_3 in the answer");
++		}
++	}
++
++	/* 5. The WBI signature, checked by the server rather than by us. This is
++	 *    the one thing that cannot be verified offline: a wrong w_rid makes
++	 *    Bilibili answer -403 签名校验失败, while any other code means the
++	 *    signature was accepted and the server is only objecting to the
++	 *    missing login. Room 1 is a public room, so the request needs no
++	 *    account to be meaningful. */
++	{
++		bool signed_request_sent = false;
++		if (!nav_response.body.empty()) {
++			nlohmann::json nav = nlohmann::json::parse(nav_response.body, nullptr, false);
++			if (!nav.is_discarded() && nav.contains("data") && nav["data"].is_object() &&
++			    nav["data"].contains("wbi_img")) {
++				const auto &wbi = nav["data"]["wbi_img"];
++				auto signer = livehime::net::WbiSigner::FromNav(wbi.value("img_url", std::string()),
++										wbi.value("sub_url", std::string()));
++				if (signer) {
++					line("");
++					line("[wbi] mixin key length=" +
++					     std::to_string(signer->MixinKey().size()));
++
++					std::string query = signer->SignQuery(
++						{{"id", "1"}, {"type", "0"}, {"web_location", "444.8"}});
++					livehime::net::Request request;
++					request.url = livehime::net::AppendQuery(
++						"https://api.live.bilibili.com/xlive/web-room/v1/index/getDanmuInfo", query);
++					request.headers["User-Agent"] = user_agent;
++					request.headers["Referer"] = "https://live.bilibili.com/";
++					livehime::net::Response response = livehime::net::SendSync(request);
++					signed_request_sent = true;
++
++					nlohmann::json parsed =
++						nlohmann::json::parse(response.body, nullptr, false);
++					const int code = parsed.is_discarded() ? -999 : parsed.value("code", -999);
++					line("[getDanmuInfo] status=" + std::to_string(response.status) +
++					     " code=" + std::to_string(code) +
++					     " message=" + (parsed.is_discarded()
++								? std::string("(not JSON)")
++								: parsed.value("message", std::string())));
++					line(std::string("[getDanmuInfo] verdict=") +
++					     (code == -403 ? "SIGNATURE REJECTED (w_rid is wrong)"
++					      : code == -999 ? "unreadable answer"
++					      : code == 0   ? "accepted AND answered (unexpected without a login)"
++							    : "signature accepted (-403 would mean it was not)"));
++				}
++			}
++		}
++		if (!signed_request_sent)
++			line("[getDanmuInfo] skipped: no WBI keys from nav");
++	}
++
++	/* 6. What the cookies look like after those calls. */
+ 	line("");
+ 	line("[cookies] count=" + std::to_string(livehime::net::CookieJar::Instance().All().size()));
+ 
+-	/* 4. Drive the real state machine, so the whole QR path runs rather than
+-	 *    just the two endpoints: generate -> qrCode state -> poll. The dock
+-	 *    shows the code the moment this publishes, which is what makes the
+-	 *    self-test a visual check as well as a log one. */
++	/* 7. Drive the real state machine, so the whole QR path runs rather than
++	 *    just the endpoints: generate -> qrCode state -> poll. The dock shows
++	 *    the code the moment this publishes, which is what makes the self-test
++	 *    a visual check as well as a log one. */
+ 	line("");
+ 	line("[session] StartQrLogin() -> expect an account state -> qrCode");
+ 	livehime::dispatch::Post([] { Session::Instance().StartQrLogin(); });
+diff --git a/plugins/livehime/src/plugin-main.cpp b/plugins/livehime/src/plugin-main.cpp
+index 340a55d..917421a 100644
+--- a/plugins/livehime/src/plugin-main.cpp
++++ b/plugins/livehime/src/plugin-main.cpp
+@@ -49,7 +49,28 @@ void placeDockOnFirstRun()
+ 	container->setFloating(false);
+ 	mainWindow->addDockWidget(Qt::RightDockWidgetArea, container);
+ 	container->setVisible(true);
++	/* Windows needs more than macOS does here, and the value is deliberately
++	 * larger than the width we expect to get. The account panel's minimum
++	 * width is the widest of the pages in its QStackedWidget — the ready page
++	 * alone carries the room summary, the area picker, the title field and the
++	 * danmaku input — and Windows' font metrics make that wider than macOS'
++	 * do at the same point size. Qt then clamps the request to whatever the
++	 * main window can spare: measured on the 1512x949 test desktop, asking for
++	 * 320 left the dock 404 wide and clipped the login QR, 620 gave 534, and
++	 * 900 gave 575. Asking for more than we need is what gets the most.
++	 *
++	 * This is a floor, not a fix: the panel still wants more than the dock can
++	 * give, so the QR stays partly cut and the hint text below it is cut too.
++	 * The proper fix is the treatment patch 0052 gave the Captions and Updates
++	 * tabs — put the account panel in a QScrollArea — and it is a UI-layer
++	 * change, not a core one. Only the first run uses this; afterwards OBS
++	 * restores whatever width the user dragged it to, and dragging it wider
++	 * does show the whole code. */
++#ifdef _WIN32
++	mainWindow->resizeDocks({container}, {900}, Qt::Horizontal);
++#else
+ 	mainWindow->resizeDocks({container}, {320}, Qt::Horizontal);
++#endif
+ 
+ 	BPtr<char> dir = obs_module_config_path("");
+ 	os_mkdirs(dir);
+-- 
+2.54.0 (Apple Git-157)
+

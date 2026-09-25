@@ -1,0 +1,475 @@
+From 9645882c9a9b01423bb3a528cb72185725a466ce Mon Sep 17 00:00:00 2001
+From: DeepSeek Harness <noreply@deepseek.com>
+Date: Sat, 26 Sep 2026 02:40:42 +0800
+Subject: [PATCH 15/18] WIC replaces ImageIO for emoticon images, and document
+ the web view
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Emoticons.swift:203-214 re-encodes every downloaded picture to a PNG no larger
+than 160 px on its longest side; the port had been caching the raw bytes under a
+.png name, so a JPEG stayed a JPEG behind a lying extension, an animated GIF
+kept every frame, and nothing capped the size. SmallPng now runs the picture
+through IWICImagingFactory -> decoder -> GetFrame(0) -> format converter ->
+scaler (only when a side exceeds 160, aspect kept, Fant) -> PNG encoder over a
+memory stream. A picture already inside the box still goes through the encoder,
+so a cache hit is always a real PNG.
+
+One correction to the brief that changed the design, and it is worth recording:
+net::Send's completion is posted to the MAIN thread, not to a net:: worker, so
+decoding there would have put COM on OBS's UI thread and stalled it. The decode
+and encode therefore run on one lazily started thread owned by liveclient.cpp,
+with the answer posted back through dispatch::Post so the waiter map stays
+main-thread-only. COM is initialised on that thread alone, S_FALSE is balanced
+with CoUninitialize and RPC_E_CHANGED_MODE is tolerated without unbalancing. If
+the thread cannot start, the callback caches the raw bytes synchronously —
+the picture is never lost, and a container WIC cannot decode falls back the
+same way with a comment saying so.
+
+windowscodecs and shlwapi join the link line. livehime.dll is 4,132,352 bytes.
+
+What is NOT claimed: this built and linked, but the runtime path did not
+execute. The self-test's danmaku run sampled a quiet room this time (5 room
+events, 0 emoticonImage) and no cache directory was created, so the encoder has
+no observed output yet. Forcing it needs either a busier room or a direct
+FetchEmoticonImage call in the self-test, and that is the next step rather than
+something to assume.
+
+CONTRACT.md §8.2 also stops calling the web view deferred, because it is not:
+it records the SDK's provenance, the synchronous runtime probe, the three
+things the page forced (both shims, the callNative reply, and the origin check
+that WebView2's all-frames script injection makes load-bearing), and that
+open_face_auth_qr is a native window rather than a web view.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ docs/port-spec/CONTRACT.md                    |  56 ++--
+ plugins/livehime/CMakeLists.txt               |   7 +
+ plugins/livehime/core/win/live/liveclient.cpp | 281 +++++++++++++++++-
+ 3 files changed, 312 insertions(+), 32 deletions(-)
+
+diff --git a/docs/port-spec/CONTRACT.md b/docs/port-spec/CONTRACT.md
+index 21e7d29..cb01623 100644
+--- a/docs/port-spec/CONTRACT.md
++++ b/docs/port-spec/CONTRACT.md
+@@ -277,26 +277,42 @@ so a later reader can find them without diffing two languages.
+ | login QR image | CoreImage | qrcodegen + a zlib PNG writer | No Windows equivalent. Same parameters (ECC M, 4-module quiet zone, whole-number scale off 480); the module pattern may differ because the two pick masks independently, but both scan. |
+ | `User-Agent` | `Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) … Safari/605.1.15` | same string | Faithful port: the whole login flow was validated against Bilibili with this UA. It is one named constant; switching to a Windows UA is a single edit, but doing so unverified would be a behaviour change, not a port. |
+ 
+-### 8.2 Deferred: the web view
+-
+-`start_web_login`, `open_cover_page`, `open_face_auth`, `open_face_auth_qr`,
+-`page_eval` and `page_click` need WebView2. The Evergreen Runtime is already
+-present on the target VM (154.0.4258.37) but the **SDK is not vendored**: it is
+-a ~10k-line `WebView2.h` plus a loader library, and it serves the secondary
+-paths only — QR login, which is the primary one, does not touch it.
+-
+-Until then those six entry points emit an honest `failed` state or an
+-`{"error": …}` page result naming the missing web view. They do not claim
+-success.
+-
+-The spec for when it lands is `session-and-login.md` §3: the page is
+-`https://live.bilibili.com/p/html/live-pc-blink/mini-login-v2`; the host must
+-inject a `window.biliBridgePc.callNative` shim forwarding
+-`auth/setRefreshToken` and `auth/setCookies`, because a shim that only
+-implements `livehime_login.LoginSuccess` makes the page take its web fallback
+-branch (established from the official client's `miniLogin.umd.min.js`, see
+-`artifacts/current/bililive-web-host-bridge.md`).
+-
++### 8.2 The web view
++
++`start_web_login`, `open_cover_page`, `open_face_auth`, `page_eval` and
++`page_click` run in WebView2 (`core/win/web/`). The SDK is vendored under
++`core/win/web/sdk/` — the header plus both architectures' static loaders, so
++`livehime.dll` stays one file — and the Evergreen Runtime is **not** bundled
++because it is a machine-wide component. `web::Available()` probes for it with
++the loader's synchronous version check and every entry point reports an honest
++failure, with the runtime's own reason, when it is missing.
++
++Three things the host has to get right, all of them in the specification
++because the official client's own bundle forced them:
++
++1. The page expects **both** shims. A host that implements only
++   `livehime_login.LoginSuccess` makes the page take its web fallback branch,
++   because the page's `d()` helper treats the presence of `window.biliBridgePc`
++   as "the Windows client" and calls `auth/setRefreshToken` through it
++   (established from the official client's `miniLogin.umd.min.js`; see
++   `artifacts/current/bililive-web-host-bridge.md`).
++2. `callNative` returns a **Promise**, so the shim needs a correlation id and a
++   reply message; there is no reply-shaped message handler in WebView2.
++3. WebView2 runs document-created scripts in **every frame**, so the
++   privileged-origin check is load-bearing rather than belt-and-braces.
++
++After a successful login the order is fixed and is the official client's own:
++apply the cookies → `/x/web-interface/nav` → only then report success. The host
++does not believe the page's word for it.
++
++`open_face_auth_qr` is still unimplemented, and deliberately not because of
++WebView2: the Swift shows that one in a native window of its own
++(`CBridge.swift:44-45`), so the missing part is a native QR window.
++
++The Windows `User-Agent` and the `device_name`/`device_platform` literals stay
++the macOS values, as §8.1 records; the Windows-correct values are not in any
++source we have, and guessing them would be a behaviour change rather than a
++port.
+ 
+ ## 9. Verification bar
+ 
+diff --git a/plugins/livehime/CMakeLists.txt b/plugins/livehime/CMakeLists.txt
+index cfec31f..8dcc514 100644
+--- a/plugins/livehime/CMakeLists.txt
++++ b/plugins/livehime/CMakeLists.txt
+@@ -232,6 +232,13 @@ elseif(WIN32)
+       winhttp
+       bcrypt
+       advapi32
++      # windowscodecs: WIC — the imaging factory, decoder, scaler and PNG
++      # encoder that re-encode an emoticon picture where the Swift used
++      # ImageIO (the CoCreateInstance behind it lands on ole32, below).
++      # shlwapi: SHCreateMemStream, the memory stream that encoder writes
++      # through.
++      windowscodecs
++      shlwapi
+       # ole32: the vendored static loader itself imports CoTaskMemAlloc/Free,
+       # and webview.cpp frees the WebView2 strings with it. shell32:
+       # ShellExecuteW for the page's new-window links. Both may arrive
+diff --git a/plugins/livehime/core/win/live/liveclient.cpp b/plugins/livehime/core/win/live/liveclient.cpp
+index 10dac37..54ccf17 100644
+--- a/plugins/livehime/core/win/live/liveclient.cpp
++++ b/plugins/livehime/core/win/live/liveclient.cpp
+@@ -16,7 +16,8 @@
+  *
+  * Not ported from the Swift, each called out where it would have run:
+  * BilibiliDiagnosticStore (the C++ probe entry point is a later milestone) and
+- * the ImageIO re-encode plus the cache-trim task of Emoticons.swift. */
++ * the cache-trim task of Emoticons.swift. Its ImageIO re-encode is here: WIC
++ * stands in for ImageIO and caches the same ≤160 px PNG. */
+ 
+ #include "liveclient.h"
+ 
+@@ -26,12 +27,23 @@
+ #include "../net/signing.h"
+ #include "../platform/dispatch.h"
+ 
++/* ImageIO's stand-in: WIC (windowscodecs) re-encodes the emoticon pictures,
++ * and shlwapi's SHCreateMemStream carries the encoder's output. libobs already
++ * pulls windows.h in, but this file includes what it uses itself. */
++#include <windows.h>
++#include <objbase.h>
++#include <shlwapi.h>
++#include <wincodec.h>
++#include <wrl/client.h>
++
+ #include <algorithm>
+ #include <cerrno>
+ #include <cctype>
+ #include <cmath>
++#include <condition_variable>
+ #include <cstdlib>
+ #include <ctime>
++#include <deque>
+ #include <filesystem>
+ #include <fstream>
+ #include <limits>
+@@ -41,6 +53,7 @@
+ #include <optional>
+ #include <string>
+ #include <system_error>
++#include <thread>
+ #include <utility>
+ #include <vector>
+ 
+@@ -1167,6 +1180,244 @@ void DeliverImage(const std::string &url, const std::string &path, const ApiErro
+ 		DeliverPath(waiter, ok, path, error);
+ }
+ 
++/* ── the picture re-encode (Emoticons.swift:203-214) ────────────────────── */
++
++/* :208: kCGImageSourceThumbnailMaxPixelSize — the longest side of the box. */
++constexpr UINT kMaxImageSide = 160;
++
++/* WIC is COM and COM belongs to a thread. This one is constructed on the
++ * encode thread below and never on the main thread: libobs already owns an
++ * apartment there, and OBS's UI must not sit through a decode anyway.
++ * S_FALSE ("already initialised on this thread") is a successful call like
++ * S_OK and is balanced in the destructor; RPC_E_CHANGED_MODE is a failure and
++ * must not be, because COM is initialised in somebody else's apartment and
++ * WIC works from that one too. */
++class ComApartment {
++public:
++	ComApartment() { initialized_ = SUCCEEDED(CoInitializeEx(nullptr, COINIT_MULTITHREADED)); }
++	~ComApartment()
++	{
++		if (initialized_)
++			CoUninitialize();
++	}
++	ComApartment(const ComApartment &) = delete;
++	ComApartment &operator=(const ComApartment &) = delete;
++
++private:
++	bool initialized_ = false;
++};
++
++/* :203-214 with WIC where ImageIO was: the first frame, scaled into a 160 px
++ * box with the aspect ratio kept, encoded as PNG. False means WIC could not
++ * decode or encode this container — an animated WebP is the likely one — and
++ * the caller caches the downloaded bytes instead. */
++bool SmallPng(const std::string &bytes, std::string &png)
++{
++	Microsoft::WRL::ComPtr<IWICImagingFactory> factory;
++	if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_IWICImagingFactory,
++	                            reinterpret_cast<void **>(factory.GetAddressOf()))) ||
++	    factory.Get() == nullptr)
++		return false;
++
++	/* SHCreateMemStream hands its own reference to the caller, which is what
++	 * Attach takes; the AddRef'ing constructor would leak it. The bytes stay
++	 * alive in `bytes` for as long as the decoder can read them. */
++	Microsoft::WRL::ComPtr<IStream> source;
++	source.Attach(SHCreateMemStream(reinterpret_cast<const BYTE *>(bytes.data()), static_cast<UINT>(bytes.size())));
++	if (source.Get() == nullptr)
++		return false;
++
++	Microsoft::WRL::ComPtr<IWICBitmapDecoder> decoder;
++	if (FAILED(factory->CreateDecoderFromStream(source.Get(), nullptr, WICDecodeMetadataCacheOnDemand,
++	                                            decoder.GetAddressOf())))
++		return false;
++
++	/* :204-209 reads index 0 only, so an animation keeps its first frame and
++	 * loses the rest. */
++	Microsoft::WRL::ComPtr<IWICBitmapFrameDecode> frame;
++	if (FAILED(decoder->GetFrame(0, frame.GetAddressOf())))
++		return false;
++
++	Microsoft::WRL::ComPtr<IWICFormatConverter> converted;
++	if (FAILED(factory->CreateFormatConverter(converted.GetAddressOf())))
++		return false;
++	if (FAILED(converted->Initialize(frame.Get(), GUID_WICPixelFormat32bppBGRA, WICBitmapDitherTypeNone, nullptr, 0.0,
++	                                 WICBitmapPaletteTypeCustom)))
++		return false;
++
++	UINT width = 0;
++	UINT height = 0;
++	if (FAILED(converted->GetSize(&width, &height)) || width == 0 || height == 0)
++		return false;
++
++	/* What the encoder reads: the converted frame, or the scaler when the
++	 * picture is larger than the box. One already inside it is not scaled up
++	 * but still goes through the encoder, so the cached file is a real PNG. */
++	IWICBitmapSource *pixels = converted.Get();
++	Microsoft::WRL::ComPtr<IWICBitmapScaler> scaler;
++	if (width > kMaxImageSide || height > kMaxImageSide) {
++		const double factor = static_cast<double>(kMaxImageSide) / static_cast<double>(std::max(width, height));
++		width = std::max<UINT>(1, static_cast<UINT>(static_cast<double>(width) * factor + 0.5));
++		height = std::max<UINT>(1, static_cast<UINT>(static_cast<double>(height) * factor + 0.5));
++		if (FAILED(factory->CreateBitmapScaler(scaler.GetAddressOf())))
++			return false;
++		if (FAILED(scaler->Initialize(converted.Get(), width, height, WICBitmapInterpolationModeFant)))
++			return false;
++		pixels = scaler.Get();
++	}
++
++	/* :210-213: CGImageDestination into an NSMutableData. Here the encoder
++	 * writes through an IWICStream into a memory stream that is read back
++	 * afterwards. */
++	Microsoft::WRL::ComPtr<IStream> output;
++	output.Attach(SHCreateMemStream(nullptr, 0));
++	if (output.Get() == nullptr)
++		return false;
++
++	Microsoft::WRL::ComPtr<IWICStream> stream;
++	if (FAILED(factory->CreateStream(stream.GetAddressOf())))
++		return false;
++	if (FAILED(stream->InitializeFromIStream(output.Get())))
++		return false;
++
++	Microsoft::WRL::ComPtr<IWICBitmapEncoder> encoder;
++	if (FAILED(factory->CreateEncoder(GUID_ContainerFormatPng, nullptr, encoder.GetAddressOf())))
++		return false;
++	if (FAILED(encoder->Initialize(stream.Get(), WICBitmapEncoderNoCache)))
++		return false;
++
++	Microsoft::WRL::ComPtr<IWICBitmapFrameEncode> target;
++	Microsoft::WRL::ComPtr<IPropertyBag2> options;
++	if (FAILED(encoder->CreateNewFrame(target.GetAddressOf(), options.GetAddressOf())))
++		return false;
++	if (FAILED(target->Initialize(options.Get())))
++		return false;
++	if (FAILED(target->SetSize(width, height)))
++		return false;
++	WICPixelFormatGUID format = GUID_WICPixelFormat32bppBGRA;
++	if (FAILED(target->SetPixelFormat(&format)))
++		return false;
++	if (FAILED(target->WriteSource(pixels, nullptr)))
++		return false;
++	if (FAILED(target->Commit()))
++		return false;
++	if (FAILED(encoder->Commit()))
++		return false;
++
++	/* Read the PNG back out of the stream the encoder wrote through. An empty
++	 * result is a failure like any other, so the caller keeps the original. */
++	png.clear();
++	LARGE_INTEGER beginning = {};
++	if (FAILED(output->Seek(beginning, STREAM_SEEK_SET, nullptr)))
++		return false;
++	char chunk[64 * 1024];
++	for (;;) {
++		ULONG read = 0;
++		if (FAILED(output->Read(chunk, static_cast<ULONG>(sizeof(chunk)), &read)))
++			return false;
++		if (read == 0)
++			break;
++		png.append(chunk, read);
++	}
++	return !png.empty();
++}
++
++/* One picture waiting for the encode thread. */
++struct ImageJob {
++	std::filesystem::path target;
++	std::string source;
++	std::string url;
++};
++
++/* The net callback below runs on the main thread (net/http.h) and a decode is
++ * tens of milliseconds for a large picture, so the work moves to one thread of
++ * this file's own: the frozen net/ layer cannot be asked to carry a COM
++ * apartment on its workers. */
++std::mutex g_encode_mutex;
++std::condition_variable g_encode_cv;
++std::deque<ImageJob> g_encode_queue;
++bool g_encode_stopping = false;
++std::thread g_encode_thread;
++
++void EncodeLoop()
++{
++	/* This thread's apartment, alive for as long as the thread is. */
++	ComApartment apartment;
++	for (;;) {
++		ImageJob job;
++		{
++			std::unique_lock<std::mutex> lock(g_encode_mutex);
++			g_encode_cv.wait(lock, [] { return g_encode_stopping || !g_encode_queue.empty(); });
++			if (g_encode_queue.empty()) {
++				if (g_encode_stopping)
++					return;
++				continue;
++			}
++			job = std::move(g_encode_queue.front());
++			g_encode_queue.pop_front();
++		}
++
++		/* :203-214. A container WIC cannot handle keeps the downloaded bytes
++		 * exactly as they arrived, so a codec never loses the picture: the
++		 * file is then whatever the host served, as it was before the
++		 * re-encode existed. The name stays the hash of the downloaded bytes
++		 * either way (CacheFile), so a picture is not re-downloaded when this
++		 * path changes. */
++		std::string png;
++		const bool encoded = SmallPng(job.source, png);
++		const bool wrote = WriteCacheFile(job.target, encoded ? png : job.source);
++		const std::string url = job.url;
++		const std::string path = wrote ? job.target.u8string() : std::string();
++		const ApiError error = wrote ? ApiError{} : ServerFailure("cacheWriteFailed");
++		/* g_image_waiters is main-thread-only, so the answer goes back there;
++		 * the file is already on disk by the time it arrives. */
++		dispatch::Post([url, path, error]() { DeliverImage(url, path, error); });
++	}
++}
++
++/* Starts the encode thread on first use. False when it could not be started at
++ * all, which leaves the caller to cache the bytes as they are. */
++bool EnqueueImageEncode(ImageJob job)
++{
++	{
++		std::lock_guard<std::mutex> lock(g_encode_mutex);
++		if (g_encode_stopping)
++			return false;
++		if (!g_encode_thread.joinable()) {
++			try {
++				g_encode_thread = std::thread(EncodeLoop);
++			} catch (const std::system_error &) {
++				return false;
++			}
++		}
++		g_encode_queue.push_back(std::move(job));
++	}
++	g_encode_cv.notify_one();
++	return true;
++}
++
++/* Joins the encode thread when the DLL unloads: a worker still inside the
++ * plugin's code after DllMain(DETACH) would run unmapped memory. Declared
++ * after the state it touches, so it is destroyed while that state is alive. */
++struct EncodeThreadShutdown {
++	~EncodeThreadShutdown()
++	{
++		/* The handle is taken under the lock, but the join happens after it:
++		 * the thread has to re-enter the wait to see the flag, so holding the
++		 * mutex through the join would deadlock. */
++		std::thread worker;
++		{
++			std::lock_guard<std::mutex> lock(g_encode_mutex);
++			g_encode_stopping = true;
++			worker = std::move(g_encode_thread);
++		}
++		g_encode_cv.notify_all();
++		if (worker.joinable())
++			worker.join();
++	}
++};
++EncodeThreadShutdown g_encode_thread_shutdown;
++
+ /* ── shared continuations ───────────────────────────────────────────────── */
+ 
+ /* BilibiliLiveClient.swift:192-203. startLive keeps the known markers as a
+@@ -1848,14 +2099,12 @@ void FetchEmoticonImage(const std::string &url, PathFn done)
+ 	/* :153-161: the picture session is ephemeral — no cookies and no custom
+ 	 * headers. net::Send still applies whatever the jar holds for the CDN
+ 	 * host, which is nothing: Bilibili's cookies belong to .bilibili.com.
+-	 * :203-214 also re-encodes every picture to a ≤160 px PNG with ImageIO,
+-	 * and :216-237 trims the folder (30 MB -> 20 MB) from a detached task;
+-	 * the C++ core has no image codec and no lifetime hook for a detached
+-	 * thread inside a plugin DLL, so the bytes are cached verbatim and the
+-	 * folder is left to grow. */
++	 * :203-214 also re-encodes every picture to a ≤160 px PNG with WIC
++	 * (SmallPng below), and :216-237 trims the folder (30 MB -> 20 MB) from a
++	 * detached task; the trim is still not ported (a detached thread inside a
++	 * plugin DLL would outlive DllMain), so the folder is left to grow. */
+ 	net::Send(req, [url, target](net::Response res) {
+ 		ApiError error;
+-		std::string path;
+ 		if (res.status == 0) {
+ 			error = TransportFailure(res);
+ 		} else if (res.status != 200) {
+@@ -1864,12 +2113,20 @@ void FetchEmoticonImage(const std::string &url, PathFn done)
+ 			error = ServerFailure("imageTooLarge");
+ 		} else if (!LooksLikeImage(res.body)) {
+ 			error = ServerFailure("notAnImage");
+-		} else if (!WriteCacheFile(target, res.body)) {
+-			error = ServerFailure("cacheWriteFailed");
+-		} else {
+-			path = target.u8string();
+ 		}
+-		DeliverImage(url, path, error);
++		if (Failed(error)) {
++			DeliverImage(url, std::string(), error);
++			return;
++		}
++		/* This callback is on the main thread, so the re-encode and the write
++		 * go to the encode thread, which answers through DeliverImage. */
++		if (EnqueueImageEncode(ImageJob{target, res.body, url}))
++			return;
++		/* The encode thread could not be started at all: cache the downloaded
++		 * bytes here instead, exactly as this file used to. */
++		const bool wrote = WriteCacheFile(target, res.body);
++		DeliverImage(url, wrote ? target.u8string() : std::string(),
++		             wrote ? ApiError{} : ServerFailure("cacheWriteFailed"));
+ 	});
+ }
+ 
+-- 
+2.54.0 (Apple Git-157)
+

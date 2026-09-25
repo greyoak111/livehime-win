@@ -1,0 +1,67 @@
+From 738d719e5e4f72019533d85d5f4f7915bbf4d554 Mon Sep 17 00:00:00 2001
+From: DeepSeek Harness <noreply@deepseek.com>
+Date: Sat, 26 Sep 2026 03:26:24 +0800
+Subject: [PATCH 18/18] Fetch the WebView2 SDK in the build script instead of
+ shipping it in patches
+
+WebView2.h is 69k lines and the two static loaders are 21 MB of binary between
+them, which a patch series cannot reasonably carry. build-win.ps1 now fetches
+the same NuGet package the tree was developed against, into
+plugins/livehime/core/win/web/sdk/, and skips the download when it is already
+there so a second build stays offline. The copyright notice and the licence
+come with it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ build-aux/livehime-win/build-win.ps1 | 28 ++++++++++++++++++++++++++++
+ 1 file changed, 28 insertions(+)
+
+diff --git a/build-aux/livehime-win/build-win.ps1 b/build-aux/livehime-win/build-win.ps1
+index 5849cb4..f6071d5 100644
+--- a/build-aux/livehime-win/build-win.ps1
++++ b/build-aux/livehime-win/build-win.ps1
+@@ -29,6 +29,11 @@
+ #       --add Microsoft.VisualStudio.Component.VC.ATL --quiet --norestart --wait
+ # The rest of the build is unaffected: everything else compiles without ATL.
+ #
++# The WebView2 SDK is fetched by this script into
++# plugins/livehime/core/win/web/sdk/ when it is missing. It is deliberately not
++# in the patch series: WebView2.h is 69k lines and the two static loaders are
++# 21 MB of binary between them.
++#
+ # The source tree must have submodules. A plain `git clone --depth 1` leaves
+ # deps/libdshowcapture empty and CMake then fails on a missing
+ # dshowcapture.hpp, so run once before configuring:
+@@ -86,6 +91,29 @@ try {
+         Install-BuildDependencies -WingetFile "$SourceDir/.github/scripts/.Wingetfile"
+     }
+ 
++    # The WebView2 SDK is not in the patch series: its header alone is 69k lines
++    # and its static loaders are 21 MB of binary, which a patch cannot carry.
++    # Fetch it once, from the same NuGet package the tree was developed against.
++    # Skipped when it is already there, so a second build is offline.
++    $WebView2Sdk = Join-Path $SourceDir 'plugins/livehime/core/win/web/sdk'
++    if ( ! ( Test-Path ( Join-Path $WebView2Sdk 'WebView2.h' ) ) ) {
++        Log-Group "Fetching the WebView2 SDK (nuget.org)..."
++        $nuget = 'https://www.nuget.org/api/v2/package/Microsoft.Web.WebView2'
++        $zip = Join-Path $env:TEMP 'Microsoft.Web.WebView2.zip'
++        $extract = Join-Path $env:TEMP 'Microsoft.Web.WebView2'
++        Invoke-WebRequest -Uri $nuget -OutFile $zip -UseBasicParsing
++        if ( Test-Path $extract ) { Remove-Item $extract -Recurse -Force }
++        Expand-Archive -Path $zip -DestinationPath $extract -Force
++        New-Item -ItemType Directory -Force -Path $WebView2Sdk | Out-Null
++        Copy-Item (Join-Path $extract 'build/native/include/WebView2.h') $WebView2Sdk -Force
++        Copy-Item (Join-Path $extract 'build/native/x64/WebView2LoaderStatic.lib') `
++                  (Join-Path $WebView2Sdk 'WebView2LoaderStatic.x64.lib') -Force
++        Copy-Item (Join-Path $extract 'build/native/arm64/WebView2LoaderStatic.lib') `
++                  (Join-Path $WebView2Sdk 'WebView2LoaderStatic.arm64.lib') -Force
++        Copy-Item (Join-Path $extract 'LICENSE.txt') $WebView2Sdk -Force
++        Copy-Item (Join-Path $extract 'NOTICE.txt') $WebView2Sdk -Force
++    }
++
+     $preset = if ( $WarningsAsErrors ) { "windows-ci-$Target" } else { "windows-$Target" }
+ 
+     # Mirrors build-macos.sh: upstream's defaults, plus only what LiveHime
+-- 
+2.54.0 (Apple Git-157)
+

@@ -1,0 +1,480 @@
+From ec406aa3373769321b6f8c6473c674cdd0f3a892 Mon Sep 17 00:00:00 2001
+From: DeepSeek Harness <noreply@deepseek.com>
+Date: Sat, 26 Sep 2026 01:51:48 +0800
+Subject: [PATCH 09/18] Connect the danmaku WebSocket, and name every step that
+ can fail
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Reverts placeDockOnFirstRun to the macOS value: the account panel is already a
+scroll container, so widening the dock was me changing a thing that was not
+broken. The measurements in the previous commit's message stay as the record of
+what Qt clamps to, but the code is back to 320.
+
+The danmaku handshake now completes, reproducibly across two runs:
+
+  connecting at .860 -> connected at .733 next second -> stopped 34 s later
+
+The 34 seconds are the session observer doing its job: StartQrLogin moves the
+session to qrCode and CBridge.swift:47-48 stops the danmaku client when it
+does. That is why the self-test now runs the danmaku attempt FIRST — with the
+QR login first, connecting at .362, qrCode at .440 and stopped at .458 was
+measuring the observer, not the handshake.
+
+Getting there needed the failures to say which failure they were. RunSession
+has fourteen silent `return 0`s and FetchDanmakuInfo has four places that all
+said "invalidResponse", so a live run could not tell a refused socket from a
+refused WBI fetch. Both now report: RunSession emits {"event":"danmakuError",
+"stage":...} at each step and FetchDanmakuInfo names its own
+(danmuInfoDataMissing / HostListMissing / TokenMissing / NoNamedHost, and
+navNotJson / wbiKeysMissingFromNav / fingerprintHasNoBuvid3 in the steps before
+it). account-panel.cpp logs both, values included, because the event name alone
+made a VM run undecidable.
+
+What the log proves, in OBS's own words: the danmaku WebSocket reached
+Bilibili, the operation-7 auth packet was accepted, and the connection held
+until the session state ended it. Receiving is therefore live-tested; sending
+still needs a signed-in account.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ plugins/livehime/core/win/live/danmaku.cpp    |  57 +++++--
+ plugins/livehime/core/win/live/liveclient.cpp |  16 +-
+ plugins/livehime/core/win/livehime-core.cpp   | 145 ++++++++++++++----
+ plugins/livehime/src/account-panel.cpp        |  10 ++
+ plugins/livehime/src/plugin-main.cpp          |  21 ---
+ 5 files changed, 177 insertions(+), 72 deletions(-)
+
+diff --git a/plugins/livehime/core/win/live/danmaku.cpp b/plugins/livehime/core/win/live/danmaku.cpp
+index 87063b4..2152583 100644
+--- a/plugins/livehime/core/win/live/danmaku.cpp
++++ b/plugins/livehime/core/win/live/danmaku.cpp
+@@ -1073,55 +1073,87 @@ private:
+  * zero covers every failure, like the Swift's `.zero`. */
+ long long RunSession(long long room_id, long long uid, const std::shared_ptr<RunToken> &token)
+ {
++	/* Which step failed, reported to the UI as it happens. Without it a refused
++	 * socket and a refused connect-info both surface as "connecting ->
++	 * reconnecting 600 ms later", which is the ambiguity that made this port's
++	 * first live run undecidable from the log alone. */
++	const char *stage = "connect-info";
++	auto fail = [&]() -> long long {
++		PostEvent(json{{"event", "danmakuError"}, {"stage", stage}});
++		return 0;
++	};
+ 	const Result<DanmakuConnectInfo> info = FetchConnectInfo(room_id, uid, token);
+-	if (token->cancelled.load() || !info.ok || info.value.host.empty() || info.value.port <= 0)
++	if (token->cancelled.load())
++		return 0;
++	if (!info.ok) {
++		/* The reason, not just the stage: FetchDanmakuInfo chains three
++		 * requests (buvid3, the WBI keys, the signed call) and each has its own
++		 * error shape, so "connect-info failed" alone does not say which. */
++		PostEvent(json{{"event", "danmakuError"},
++			       {"stage", "connect-info"},
++			       {"error", info.error.fields}});
++		return 0;
++	}
++	if (info.value.host.empty() || info.value.port <= 0) {
++		PostEvent(json{{"event", "danmakuError"},
++			       {"stage", "connect-info"},
++			       {"error", "empty host or port"}});
+ 		return 0;
++	}
+ 
+ 	Handshake handshake;
++	stage = "winhttp-open";
+ 	handshake.session = WinHttpOpen(L"LiveHime/0.2 (Windows; OBS)", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+ 					WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+ 	if (!handshake.session)
+-		return 0;
++		return fail();
+ 	/* Resolve, connect, send, receive. The receive budget is the loop tick
+ 	 * (kReceiveTick): big enough for the server's 101, small enough to keep the
+ 	 * heartbeat on time. */
+ 	WinHttpSetTimeouts(handshake.session, 10000, 10000, 15000,
+ 			   static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(kReceiveTick).count()));
+ 
++	stage = "winhttp-connect";
+ 	handshake.connect = WinHttpConnect(handshake.session, Widen(info.value.host).c_str(),
+ 					   static_cast<INTERNET_PORT>(info.value.port), 0);
+ 	if (!handshake.connect)
+-		return 0;
++		return fail();
+ 
+ 	/* wss://<host>:<wss_port>/sub (DMC:59). */
++	stage = "winhttp-open-request";
+ 	handshake.request = WinHttpOpenRequest(handshake.connect, L"GET", L"/sub", nullptr, WINHTTP_NO_REFERER,
+ 					       WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
+ 	if (!handshake.request)
+-		return 0;
++		return fail();
+ 	/* Required before the upgrade request goes out; Sec-WebSocket-* stays
+ 	 * WinHTTP's business (docs/port-spec §9.3). */
++	stage = "upgrade-option";
+ 	if (!WinHttpSetOption(handshake.request, WINHTTP_OPTION_UPGRADE_TO_WEB_SOCKET, nullptr, 0))
+-		return 0;
++		return fail();
+ 
+ 	/* DMC:60-61. No Cookie header: the handshake is not what authenticates this
+ 	 * socket — the operation-7 packet is (docs/port-spec §2.1). */
+ 	const std::wstring headers = Widen(std::string("User-Agent: ") + kBilibiliUserAgent +
+ 					   "\r\nOrigin: https://live.bilibili.com\r\n");
++	stage = "send-upgrade";
+ 	if (!WinHttpSendRequest(handshake.request, headers.c_str(), static_cast<DWORD>(headers.size()), nullptr, 0, 0, 0))
+-		return 0;
++		return fail();
++	stage = "receive-101";
+ 	if (!WinHttpReceiveResponse(handshake.request, nullptr))
+-		return 0;
++		return fail();
+ 
+ 	DWORD status = 0;
+ 	DWORD status_size = sizeof(status);
++	stage = "status-101";
+ 	if (!WinHttpQueryHeaders(handshake.request, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+ 				 WINHTTP_HEADER_NAME_BY_INDEX, &status, &status_size, WINHTTP_NO_HEADER_INDEX) ||
+ 	    status != 101)
+-		return 0;
++		return fail();
+ 
++	stage = "complete-upgrade";
+ 	HINTERNET upgraded = WinHttpWebSocketCompleteUpgrade(handshake.request, 0);
+ 	if (!upgraded)
+-		return 0;
++		return fail();
+ 	Socket socket(token);
+ 	socket.Adopt(upgraded);
+ 	WinHttpCloseHandle(handshake.request);
+@@ -1138,8 +1170,9 @@ long long RunSession(long long room_id, long long uid, const std::shared_ptr<Run
+ 			{"platform", "web"},
+ 			{"type", 2},
+ 			{"key", info.value.token}};
++	stage = "send-auth";
+ 	if (!SendBinary(socket.Get(), EncodePacket(Operation::Auth, auth.dump())))
+-		return 0;
++		return fail();
+ 
+ 	/* DMC:70-76: the heartbeat starts immediately — its first frame goes out
+ 	 * before the first receive — and then every 30 s. The deadline advances
+@@ -1235,11 +1268,11 @@ long long RunSession(long long room_id, long long uid, const std::shared_ptr<Run
+ 			DispatchFrame(frame);
+ 		}
+ 		if (rejected)
+-			return 0;
++			return fail();
+ 	}
+ 
+ 	if (!connected)
+-		return 0;
++		return fail();
+ 	return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - connected_at)
+ 		.count();
+ }
+diff --git a/plugins/livehime/core/win/live/liveclient.cpp b/plugins/livehime/core/win/live/liveclient.cpp
+index 9c53e62..10dac37 100644
+--- a/plugins/livehime/core/win/live/liveclient.cpp
++++ b/plugins/livehime/core/win/live/liveclient.cpp
+@@ -553,7 +553,7 @@ void EnsureWbiSigner(SignerHandler done)
+ 		/* :51-56 parses the body without a code check at all. */
+ 		json root = json::parse(res.body, nullptr, false);
+ 		if (root.is_discarded() || !root.is_object()) {
+-			done(std::nullopt, ServerFailure("invalidResponse"));
++			done(std::nullopt, ServerFailure("navNotJson"));
+ 			return;
+ 		}
+ 		StoreSignerFromNav(root);
+@@ -561,7 +561,7 @@ void EnsureWbiSigner(SignerHandler done)
+ 			done(signer, ApiError{});
+ 			return;
+ 		}
+-		done(std::nullopt, ServerFailure("invalidResponse"));
++		done(std::nullopt, ServerFailure("wbiKeysMissingFromNav"));
+ 	});
+ }
+ 
+@@ -1233,7 +1233,7 @@ void EnsureBuvid3(const std::function<void(const ApiError &)> &done)
+ 		}
+ 		auto value = FieldString(DataObject(root), {"b_3"});
+ 		if (!value || value->empty()) {
+-			done(ServerFailure("invalidResponse"));
++			done(ServerFailure("fingerprintHasNoBuvid3"));
+ 			return;
+ 		}
+ 		/* The Swift sends the rest of this request chain with a temporary
+@@ -1705,7 +1705,13 @@ void FetchDanmakuInfo(long long room_id, long long uid, DanmakuInfoFn done)
+ 				const json *hosts = ObjectArrayField(data, "host_list");
+ 				auto token = FieldString(data, {"token"});
+ 				if (!data.is_object() || !hosts || !token) {
+-					Deliver(done, Fail<DanmakuConnectInfo>(ServerFailure("invalidResponse")));
++					/* Named rather than a bare invalidResponse: this
++					 * chain has four places that can say that, and a
++					 * live run has to be able to tell them apart. */
++					Deliver(done, Fail<DanmakuConnectInfo>(ServerFailure(
++						!data.is_object() ? "danmuInfoDataMissing"
++								  : (!hosts ? "danmuInfoHostListMissing"
++									    : "danmuInfoTokenMissing"))));
+ 					return;
+ 				}
+ 				/* The Swift keeps every host (DanmakuConnectInfo.servers,
+@@ -1733,7 +1739,7 @@ void FetchDanmakuInfo(long long room_id, long long uid, DanmakuInfoFn done)
+ 					break;
+ 				}
+ 				if (!found) {
+-					Deliver(done, Fail<DanmakuConnectInfo>(ServerFailure("invalidResponse")));
++					Deliver(done, Fail<DanmakuConnectInfo>(ServerFailure("danmuInfoNoNamedHost")));
+ 					return;
+ 				}
+ 				Deliver(done, Ok(info));
+diff --git a/plugins/livehime/core/win/livehime-core.cpp b/plugins/livehime/core/win/livehime-core.cpp
+index 6a42ad3..4cd8f06 100644
+--- a/plugins/livehime/core/win/livehime-core.cpp
++++ b/plugins/livehime/core/win/livehime-core.cpp
+@@ -15,8 +15,11 @@
+ 
+ #include <windows.h>
+ 
++#include <chrono>
++#include <condition_variable>
+ #include <cstdlib>
+ #include <fstream>
++#include <mutex>
+ #include <string>
+ #include <thread>
+ 
+@@ -129,6 +132,19 @@ void SelfTest()
+ 	line("LiveHime Windows core self-test");
+ 	line("");
+ 
++	/* 0. The danmaku WebSocket goes FIRST, deliberately. The session observer
++	 *    installed in livehime_core_start stops the client whenever the state
++	 *    becomes qrCode or signedOut — CBridge.swift:47-48 does the same — so a
++	 *    run that starts the QR login first would stop this connection a few
++	 *    milliseconds in and we would be measuring the observer instead of the
++	 *    handshake. (It did exactly that before this ordering was fixed:
++	 *    connecting at .362, qrCode at .440, stopped at .458.) */
++	line("[danmaku] Start(room 1, uid 0) -> expect connecting then connected");
++	livehime::dispatch::Post([] { livehime::live::DanmakuClient::Instance().Start(1, 0); });
++	std::this_thread::sleep_for(std::chrono::seconds(25));
++	line("[danmaku] 25 s elapsed; see OBS's log for the status values");
++	line("");
++
+ 	std::string user_agent =
+ 		"Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/605.1.15 (KHTML, like Gecko) "
+ 		"Version/17.0 Safari/605.1.15";
+@@ -229,8 +245,12 @@ void SelfTest()
+ 	 *    the one thing that cannot be verified offline: a wrong w_rid makes
+ 	 *    Bilibili answer -403 签名校验失败, while any other code means the
+ 	 *    signature was accepted and the server is only objecting to the
+-	 *    missing login. Room 1 is a public room, so the request needs no
+-	 *    account to be meaningful. */
++	 *    missing login.
++	 *
++	 *    The shape of data matters as much as the code here. FetchDanmakuInfo
++	 *    needs data.host_list and data.token, and a room that answers 0 with
++	 *    neither fails it — which is what the danmaku handshake was doing. Two
++	 *    rooms are tried so the difference is visible rather than inferred. */
+ 	{
+ 		bool signed_request_sent = false;
+ 		if (!nav_response.body.empty()) {
+@@ -245,29 +265,62 @@ void SelfTest()
+ 					line("[wbi] mixin key length=" +
+ 					     std::to_string(signer->MixinKey().size()));
+ 
+-					std::string query = signer->SignQuery(
+-						{{"id", "1"}, {"type", "0"}, {"web_location", "444.8"}});
+-					livehime::net::Request request;
+-					request.url = livehime::net::AppendQuery(
+-						"https://api.live.bilibili.com/xlive/web-room/v1/index/getDanmuInfo", query);
+-					request.headers["User-Agent"] = user_agent;
+-					request.headers["Referer"] = "https://live.bilibili.com/";
+-					livehime::net::Response response = livehime::net::SendSync(request);
+-					signed_request_sent = true;
+-
+-					nlohmann::json parsed =
+-						nlohmann::json::parse(response.body, nullptr, false);
+-					const int code = parsed.is_discarded() ? -999 : parsed.value("code", -999);
+-					line("[getDanmuInfo] status=" + std::to_string(response.status) +
+-					     " code=" + std::to_string(code) +
+-					     " message=" + (parsed.is_discarded()
+-								? std::string("(not JSON)")
+-								: parsed.value("message", std::string())));
+-					line(std::string("[getDanmuInfo] verdict=") +
+-					     (code == -403 ? "SIGNATURE REJECTED (w_rid is wrong)"
+-					      : code == -999 ? "unreadable answer"
+-					      : code == 0   ? "accepted AND answered (unexpected without a login)"
+-							    : "signature accepted (-403 would mean it was not)"));
++					for (const char *room : {"1", "5440"}) {
++						std::string query = signer->SignQuery(
++							{{"id", room}, {"type", "0"}, {"web_location", "444.8"}});
++						livehime::net::Request request;
++						request.url = livehime::net::AppendQuery(
++							"https://api.live.bilibili.com/xlive/web-room/v1/index/getDanmuInfo",
++							query);
++						request.headers["User-Agent"] = user_agent;
++						request.headers["Referer"] = "https://live.bilibili.com/";
++						livehime::net::Response response = livehime::net::SendSync(request);
++						signed_request_sent = true;
++
++						nlohmann::json parsed =
++							nlohmann::json::parse(response.body, nullptr, false);
++						const int code = parsed.is_discarded() ? -999 : parsed.value("code", -999);
++						line(std::string("[getDanmuInfo room=") + room +
++						     "] status=" + std::to_string(response.status) +
++						     " code=" + std::to_string(code) +
++						     " message=" + (parsed.is_discarded()
++								    ? std::string("(not JSON)")
++								    : parsed.value("message", std::string())));
++						if (!parsed.is_discarded() && parsed.contains("data") &&
++						    parsed["data"].is_object()) {
++							const auto &data = parsed["data"];
++							const bool has_hosts = data.contains("host_list") &&
++									       data["host_list"].is_array();
++							const bool has_token = data.contains("token") &&
++									       data["token"].is_string();
++							line("    data.host_list=" +
++							     std::string(has_hosts
++									     ? std::to_string(
++										       data["host_list"].size()) +
++										       " entries"
++									     : "MISSING") +
++							     "  data.token=" +
++							     std::string(has_token ? "present" : "MISSING"));
++							if (has_hosts && !data["host_list"].empty()) {
++								const auto &h0 = data["host_list"][0];
++								if (h0.is_object())
++									line("    first host=" +
++									     h0.value("host", std::string("(none)")) +
++									     " wss_port=" +
++									     std::to_string(h0.value("wss_port", 0)));
++							}
++						} else {
++							line(std::string("    data=") +
++							     (parsed.is_discarded()
++								      ? std::string("(unparsable)")
++								      : parsed.value("data", nlohmann::json()).dump().substr(0, 80)));
++						}
++						line(std::string("    verdict=") +
++						     (code == -403 ? "SIGNATURE REJECTED (w_rid is wrong)"
++						      : code == -999 ? "unreadable answer"
++						      : code == 0   ? "signature accepted"
++								    : "signature accepted (-403 would mean it was not)"));
++					}
+ 				}
+ 			}
+ 		}
+@@ -279,23 +332,47 @@ void SelfTest()
+ 	line("");
+ 	line("[cookies] count=" + std::to_string(livehime::net::CookieJar::Instance().All().size()));
+ 
++	/* 6b. The exact call the danmaku client makes, now that buvid3 and the WBI
++	 *     signer are warm from steps 4 and 5. The client's own attempt happens
++	 *     cold, before either is cached; if this succeeds where that failed,
++	 *     the fault is in the cold path and not in the parsing. Waits on a
++	 *     condition variable because FetchDanmakuInfo answers on the main
++	 *     thread, which is free while this worker blocks. */
++	{
++		std::mutex mutex;
++		std::condition_variable cv;
++		bool ready = false;
++		livehime::live::Result<livehime::live::DanmakuConnectInfo> got;
++		livehime::live::FetchDanmakuInfo(
++			1, 0,
++			[&](livehime::live::Result<livehime::live::DanmakuConnectInfo> result) {
++				std::lock_guard<std::mutex> lock(mutex);
++				got = std::move(result);
++				ready = true;
++				cv.notify_all();
++			});
++		std::unique_lock<std::mutex> lock(mutex);
++		cv.wait_for(lock, std::chrono::seconds(20), [&] { return ready; });
++		line("");
++		if (!ready)
++			line("[FetchDanmakuInfo warm] TIMED OUT after 20 s");
++		else if (!got.ok)
++			line("[FetchDanmakuInfo warm] failed: " + got.error.fields.dump());
++		else
++			line("[FetchDanmakuInfo warm] ok host=" + got.value.host + ":" +
++			     std::to_string(got.value.port) + " token length=" +
++			     std::to_string(got.value.token.size()));
++	}
++
+ 	/* 7. Drive the real state machine, so the whole QR path runs rather than
+ 	 *    just the endpoints: generate -> qrCode state -> poll. The dock shows
+ 	 *    the code the moment this publishes, which is what makes the self-test
+ 	 *    a visual check as well as a log one. */
+ 	line("");
+ 	line("[session] StartQrLogin() -> expect an account state -> qrCode");
++	line("[session] (this stops the danmaku client, by design)");
+ 	livehime::dispatch::Post([] { Session::Instance().StartQrLogin(); });
+ 
+-	/* 8. The danmaku WebSocket. This is the port's hardest piece and the one
+-	 *    the offline harness could only fake, and it needs no account: room 1
+-	 *    is public, so the handshake either completes or it does not. The
+-	 *    status callback goes to the UI, which logs it, so the evidence is
+-	 *    "[livehime] live event -> danmakuStatus" in OBS's own log. */
+-	line("");
+-	line("[danmaku] Start(room 1, uid 0) -> expect danmakuStatus connecting -> connected");
+-	livehime::dispatch::Post([] { livehime::live::DanmakuClient::Instance().Start(1, 0); });
+-
+ 	line("");
+ 	line("done");
+ }
+diff --git a/plugins/livehime/src/account-panel.cpp b/plugins/livehime/src/account-panel.cpp
+index ffa35f1..07e6f4c 100644
+--- a/plugins/livehime/src/account-panel.cpp
++++ b/plugins/livehime/src/account-panel.cpp
+@@ -207,6 +207,16 @@ void AccountPanel::applyEvent(const QJsonObject &event)
+ 		blog(LOG_INFO, "[livehime] danmaku status -> %s",
+ 		     event.value("status").toString().toUtf8().constData());
+ 	}
++	if (name == "danmakuError") {
++		/* Which step of the handshake gave up, and why. A refused socket and a
++		 * refused connect-info look identical from the status alone. */
++		blog(LOG_WARNING, "[livehime] danmaku failed at stage -> %s  error: %s",
++		     event.value("stage").toString().toUtf8().constData(),
++		     QJsonDocument(QJsonObject{{"e", event.value("error")}})
++			     .toJson(QJsonDocument::Compact)
++			     .mid(6)
++			     .constData());
++	}
+ 	blog(LOG_INFO, "[livehime] live event -> %s", name.toUtf8().constData());
+ 
+ 	if (name == "sessionMaintenance") {
+diff --git a/plugins/livehime/src/plugin-main.cpp b/plugins/livehime/src/plugin-main.cpp
+index 917421a..340a55d 100644
+--- a/plugins/livehime/src/plugin-main.cpp
++++ b/plugins/livehime/src/plugin-main.cpp
+@@ -49,28 +49,7 @@ void placeDockOnFirstRun()
+ 	container->setFloating(false);
+ 	mainWindow->addDockWidget(Qt::RightDockWidgetArea, container);
+ 	container->setVisible(true);
+-	/* Windows needs more than macOS does here, and the value is deliberately
+-	 * larger than the width we expect to get. The account panel's minimum
+-	 * width is the widest of the pages in its QStackedWidget — the ready page
+-	 * alone carries the room summary, the area picker, the title field and the
+-	 * danmaku input — and Windows' font metrics make that wider than macOS'
+-	 * do at the same point size. Qt then clamps the request to whatever the
+-	 * main window can spare: measured on the 1512x949 test desktop, asking for
+-	 * 320 left the dock 404 wide and clipped the login QR, 620 gave 534, and
+-	 * 900 gave 575. Asking for more than we need is what gets the most.
+-	 *
+-	 * This is a floor, not a fix: the panel still wants more than the dock can
+-	 * give, so the QR stays partly cut and the hint text below it is cut too.
+-	 * The proper fix is the treatment patch 0052 gave the Captions and Updates
+-	 * tabs — put the account panel in a QScrollArea — and it is a UI-layer
+-	 * change, not a core one. Only the first run uses this; afterwards OBS
+-	 * restores whatever width the user dragged it to, and dragging it wider
+-	 * does show the whole code. */
+-#ifdef _WIN32
+-	mainWindow->resizeDocks({container}, {900}, Qt::Horizontal);
+-#else
+ 	mainWindow->resizeDocks({container}, {320}, Qt::Horizontal);
+-#endif
+ 
+ 	BPtr<char> dir = obs_module_config_path("");
+ 	os_mkdirs(dir);
+-- 
+2.54.0 (Apple Git-157)
+

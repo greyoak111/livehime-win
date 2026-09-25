@@ -1,0 +1,2452 @@
+From 1f7a3a800773c3bdd01dc1c10f7f581755acbda2 Mon Sep 17 00:00:00 2001
+From: DeepSeek Harness <noreply@deepseek.com>
+Date: Sat, 26 Sep 2026 02:20:41 +0800
+Subject: [PATCH 13/18] Add the WebView2 host and wire the five page entry
+ points to it
+
+webview.{h,cpp} is the C++ counterpart of WebLoginWindow.swift and
+BilibiliPageWindow.swift: the two JS shims the mini-login page expects, the
+cookie store, the COM plumbing and the page automation hooks. It routes every
+call to the OBS main thread, which libobs already put in an STA before plugins
+load, and it answers honestly when the Evergreen Runtime is missing rather than
+opening a window it cannot fill.
+
+CMakeLists picks the static loader by CMAKE_SYSTEM_PROCESSOR so both the x64 and
+arm64 presets link, and the four page entry points plus the two automation
+hooks now call into it. open_face_auth_qr still reports a pending state on
+purpose: the Swift shows that one in a native window of its own rather than in
+a web view, so WebView2 is not what is missing there.
+
+Does not compile yet: MSVC reports ApplyCookieBatch and CookieOperation used in
+LoginWindow before the file declares them (webview.cpp:1547-1555). The author
+has the exact errors and is fixing them; this commit is the wiring around it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ plugins/livehime/CMakeLists.txt             |   16 +
+ plugins/livehime/core/win/livehime-core.cpp |   49 +-
+ plugins/livehime/core/win/web/webview.cpp   | 2191 +++++++++++++++++++
+ plugins/livehime/core/win/web/webview.h     |   73 +
+ 4 files changed, 2310 insertions(+), 19 deletions(-)
+ create mode 100644 plugins/livehime/core/win/web/webview.cpp
+ create mode 100644 plugins/livehime/core/win/web/webview.h
+
+diff --git a/plugins/livehime/CMakeLists.txt b/plugins/livehime/CMakeLists.txt
+index 6bb42f8..74ce63f 100644
+--- a/plugins/livehime/CMakeLists.txt
++++ b/plugins/livehime/CMakeLists.txt
+@@ -133,6 +133,8 @@ elseif(WIN32)
+     core/win/live/liveclient.h
+     core/win/live/danmaku.cpp
+     core/win/live/danmaku.h
++    core/win/web/webview.cpp
++    core/win/web/webview.h
+   )
+ else()
+   message(FATAL_ERROR "livehime: unsupported platform (macOS and Windows only)")
+@@ -154,11 +156,25 @@ if(WIN32)
+   find_package(nlohmann_json 3.11 REQUIRED)
+   find_package(ZLIB REQUIRED)
+ 
++  # WebView2 (core/win/web/sdk/README.md): the header plus the static loader,
++  # picked by target architecture. Linking the static loader keeps livehime.dll
++  # a single file with nothing extra to ship; the Evergreen Runtime itself is a
++  # machine component the host probes for rather than bundles.
++  target_include_directories(livehime PRIVATE core/win/web/sdk)
++  if(CMAKE_SYSTEM_PROCESSOR MATCHES "ARM64|arm64|aarch64")
++    set(LIVEHIME_WEBVIEW2_LOADER core/win/web/sdk/WebView2LoaderStatic.arm64.lib)
++  else()
++    set(LIVEHIME_WEBVIEW2_LOADER core/win/web/sdk/WebView2LoaderStatic.x64.lib)
++  endif()
++  target_link_libraries(livehime PRIVATE "${LIVEHIME_WEBVIEW2_LOADER}")
++
+   # Vendored third-party code: qrcodegen is Project Nayuki's, MIT, byte-identical
+   # to the copy obs-deps ships for the macOS build (core/qr/LICENSE.txt). It is
+   # not ours to keep warning-clean, so the windows-ci-* presets' /WX must not
+   # fail the build on it.
+   set_source_files_properties(core/win/core/qr/qrcodegen.cpp PROPERTIES COMPILE_OPTIONS "/W0")
++  # WebView2.h is Microsoft's, 69k lines, and not ours to keep warning-clean.
++  set_source_files_properties(core/win/web/webview.cpp PROPERTIES COMPILE_OPTIONS "/W0")
+ endif()
+ 
+ target_link_libraries(
+diff --git a/plugins/livehime/core/win/livehime-core.cpp b/plugins/livehime/core/win/livehime-core.cpp
+index 21b709b..6743554 100644
+--- a/plugins/livehime/core/win/livehime-core.cpp
++++ b/plugins/livehime/core/win/livehime-core.cpp
+@@ -35,6 +35,7 @@
+ #include "net/http.h"
+ #include "net/signing.h"
+ #include "platform/dispatch.h"
++#include "web/webview.h"
+ 
+ using livehime::Emit;
+ using livehime::EmitEvent;
+@@ -46,12 +47,22 @@ namespace {
+ 
+ /* One reason string per unported area, so a log or a screenshot says which
+  * piece is still missing instead of a generic failure. */
+-constexpr const char *kPendingWebView =
+-	"The Bilibili login page needs the Windows web view, which this build does not have yet.";
+-constexpr const char *kPendingCover =
+-	"The cover manager needs the Windows web view, which this build does not have yet.";
+-constexpr const char *kPendingFaceAuth =
+-	"Face verification needs the Windows web view, which this build does not have yet.";
++/* The pages run in WebView2 now, so these are no longer "not implemented":
++ * they are what an entry point says when the host could not be created. The
++ * reason WebView2 gave is appended to whichever one applies. */
++constexpr const char *kPendingWebView = "The Bilibili login page could not be opened";
++constexpr const char *kPendingCover = "The cover manager could not be opened";
++constexpr const char *kPendingFaceAuth = "Face verification could not be opened";
++constexpr const char *kPendingFaceAuthQr =
++	"The face-verification QR window is not implemented in the Windows port yet.";
++
++/* One place where a host failure becomes the honest state the UI shows. */
++void EmitWebFailure(const char *what, const std::string &reason)
++{
++	Emit(json{{"state", "failed"},
++		  {"notice", "server"},
++		  {"detail", std::string(what) + ": " + reason}});
++}
+ 
+ void EmitUnsupportedEvent(const char *what)
+ {
+@@ -867,7 +878,7 @@ void livehime_core_sign_out(void)
+ 
+ void livehime_core_start_web_login(void)
+ {
+-	EmitPendingState(kPendingWebView);
++	livehime::web::OpenLogin([](const std::string &reason) { EmitWebFailure(kPendingWebView, reason); });
+ }
+ 
+ /* ── Live room ──────────────────────────────────────────────────────────── */
+@@ -934,19 +945,21 @@ void livehime_core_stop_live(void)
+ 
+ void livehime_core_open_face_auth(const char *voucher)
+ {
+-	(void)voucher;
+-	EmitPendingState(kPendingFaceAuth);
++	livehime::web::OpenFaceAuth(voucher ? voucher : "",
++				    [](const std::string &reason) { EmitWebFailure(kPendingFaceAuth, reason); });
+ }
+ 
+ void livehime_core_open_face_auth_qr(const char *url)
+ {
++	/* The Swift shows this one in a native window of its own rather than in a
++	 * web view (CBridge.swift:44-45), so WebView2 is not what is missing. */
+ 	(void)url;
+-	EmitPendingState(kPendingFaceAuth);
++	EmitPendingState(kPendingFaceAuthQr);
+ }
+ 
+ void livehime_core_open_cover_page(void)
+ {
+-	EmitPendingState(kPendingCover);
++	livehime::web::OpenCoverPage([](const std::string &reason) { EmitWebFailure(kPendingCover, reason); });
+ }
+ 
+ /* ── Captions (not in this milestone) ───────────────────────────────────── */
+@@ -978,18 +991,16 @@ void livehime_core_captions_stop(void)
+ 
+ void livehime_core_page_eval(const char *key, const char *script, livehime_page_result_callback done, void *context)
+ {
+-	(void)key;
+-	(void)script;
+-	if (done)
+-		done("{\"error\":\"no web view in this build\"}", context);
++	livehime::web::EvaluatePage(key ? key : "", script ? script : "",
++				    [done, context](const std::string &json) {
++					    if (done)
++						    done(json.c_str(), context);
++				    });
+ }
+ 
+ int livehime_core_page_click(const char *key, double x, double y)
+ {
+-	(void)key;
+-	(void)x;
+-	(void)y;
+-	return 0;
++	return livehime::web::ClickPage(key ? key : "", x, y) ? 1 : 0;
+ }
+ 
+ /* ── Updates (not in this milestone) ────────────────────────────────────── */
+diff --git a/plugins/livehime/core/win/web/webview.cpp b/plugins/livehime/core/win/web/webview.cpp
+new file mode 100644
+index 0000000..f5653f8
+--- /dev/null
++++ b/plugins/livehime/core/win/web/webview.cpp
+@@ -0,0 +1,2191 @@
++/* WebView2 host — the C++ counterpart of WebLoginWindow.swift and
++ * BilibiliPageWindow.swift. The interface and the threading rules are in
++ * webview.h; this file is the COM and window plumbing.
++ *
++ * What each page needs, and where it comes from:
++ *
++ *   mini-login page  window.browser before it loads (WebLoginWindow.swift:75-87),
++ *                    the livehime_login shim (AuthWebViewBridge.swift:33-42),
++ *                    the biliBridgePc shim after every navigation
++ *                    (AuthBridgeContract.swift:83-96), the cookie read-back
++ *                    (:178-195) and correspond/0 seeding (:166-174).
++ *   cover manager    a stand-in parent for its Cancel/Confirm messages
++ *                    (BilibiliPageWindow.swift:279-289) and the page log
++ *                    (:330-381).
++ *   face-auth page   the same log, a confirm button, and window.close()
++ *                    meaning "confirmed" (:215-220).
++ *
++ * Three WebView2 differences from WKWebView shape the code below, all of them
++ * from session-and-login.md §7.3:
++ *
++ *  12. Document-created scripts run in every frame; there is no
++ *      main-frame-only flag. Every injected script starts with a
++ *      `window.top === window` guard, and the host checks the origin of every
++ *      message it receives.
++ *  15. There is no with-reply message handler, so biliBridgePc.callNative gets
++ *      a correlation id and a Promise the shim resolves from the reply the
++ *      host posts back.
++ *  16. A web message carries no per-message main-frame flag, so the frame gate
++ *      lives in the shim and the origin gate lives here. */
++
++#include "webview.h"
++
++#include "auth/credentials.h"
++#include "auth/session.h"
++#include "core/emit.h"
++#include "net/cookies.h"
++#include "net/crypto.h"
++#include "net/http.h"
++#include "platform/dispatch.h"
++
++#include <windows.h>
++#include <objbase.h>
++#include <shellapi.h>
++#include <wrl.h>
++
++#pragma warning(push)
++/* The vendored WebView2.h is MIDL-generated (core/win/web/sdk/README.md); a
++ * generated header should not decide whether the presets' /WX build fails. */
++#pragma warning(disable : 4061 4062 4191 4265 4365 4471 4514 4710 4820)
++#include <WebView2.h>
++#pragma warning(pop)
++
++#include <algorithm>
++#include <cmath>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <ctime>
++#include <map>
++#include <memory>
++#include <string>
++#include <thread>
++#include <utility>
++#include <vector>
++
++using Microsoft::WRL::Callback;
++using Microsoft::WRL::ComPtr;
++using nlohmann::json;
++
++namespace livehime {
++namespace web {
++namespace {
++
++/* ── text ───────────────────────────────────────────────────────────────── */
++
++std::wstring Widen(const std::string &utf8)
++{
++	if (utf8.empty())
++		return {};
++	int length = MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(), static_cast<int>(utf8.size()), nullptr, 0);
++	std::wstring wide(static_cast<size_t>(length), L'\0');
++	MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(), static_cast<int>(utf8.size()), &wide[0], length);
++	return wide;
++}
++
++std::string Narrow(const std::wstring &wide)
++{
++	if (wide.empty())
++		return {};
++	int length =
++		WideCharToMultiByte(CP_UTF8, 0, wide.c_str(), static_cast<int>(wide.size()), nullptr, 0, nullptr, nullptr);
++	std::string utf8(static_cast<size_t>(length), '\0');
++	WideCharToMultiByte(CP_UTF8, 0, wide.c_str(), static_cast<int>(wide.size()), &utf8[0], length, nullptr, nullptr);
++	return utf8;
++}
++
++std::string LowerAscii(std::string value)
++{
++	for (char &character : value) {
++		if (character >= 'A' && character <= 'Z')
++			character = static_cast<char>(character - 'A' + 'a');
++	}
++	return value;
++}
++
++bool EndsWith(const std::string &value, const std::string &suffix)
++{
++	return value.size() >= suffix.size() &&
++	       value.compare(value.size() - suffix.size(), suffix.size(), suffix) == 0;
++}
++
++/* A JavaScript / JSON string literal for `value`: nlohmann's dumper escapes
++ * what JSON requires and leaves UTF-8 alone, which is also valid JavaScript.
++ * The Swift embedded literals the same way, through JSONSerialization with
++ * .fragmentsAllowed (WebLoginWindow.swift:170-171). */
++std::string JsString(const std::string &value)
++{
++	return json(value).dump();
++}
++
++std::string FormatHresult(HRESULT status)
++{
++	char text[16] = {};
++	std::snprintf(text, sizeof(text), "0x%08lX", static_cast<unsigned long>(status));
++	return text;
++}
++
++/* At most `limit` bytes of `value`, never cutting a UTF-8 sequence in half:
++ * nlohmann's dumper rejects invalid UTF-8. The Swift's `prefix(300)` counted
++ * characters; this is the closest byte-safe equivalent. */
++std::string TruncateUtf8(const std::string &value, size_t limit)
++{
++	if (value.size() <= limit)
++		return value;
++	size_t end = limit;
++	while (end > 0 && (static_cast<unsigned char>(value[end]) & 0xC0) == 0x80)
++		--end;
++	return value.substr(0, end);
++}
++
++/* String(describing:) for the payload values the auth bridge maps
++ * (AuthWebViewBridge.swift:57). Only the timestamp goes through this, but the
++ * mapping is the Swift's for every JSON type. */
++std::string SwiftDescribe(const json &value)
++{
++	if (value.is_string())
++		return value.get<std::string>();
++	if (value.is_null())
++		return "<null>";
++	if (value.is_boolean())
++		return value.get<bool>() ? "true" : "false";
++	return value.dump();
++}
++
++/* String($0.value, radix: 16) for every Unicode scalar of `text`, concatenated
++ * (WebLoginWindow.swift:168): lowercase and unpadded, so a scalar below 16 is
++ * one hex digit. Iterating code points rather than bytes is what makes the
++ * digest the Swift computes (session-and-login.md §4.8). */
++std::string ScalarHex(const std::string &text)
++{
++	std::string out;
++	size_t index = 0;
++	while (index < text.size()) {
++		const unsigned char lead = static_cast<unsigned char>(text[index]);
++		uint32_t scalar = lead;
++		size_t length = 1;
++		if (lead >= 0xF0) {
++			scalar = static_cast<uint32_t>(lead & 0x07);
++			length = 4;
++		} else if (lead >= 0xE0) {
++			scalar = static_cast<uint32_t>(lead & 0x0F);
++			length = 3;
++		} else if (lead >= 0xC0) {
++			scalar = static_cast<uint32_t>(lead & 0x1F);
++			length = 2;
++		}
++		if (index + length > text.size()) {
++			scalar = lead;
++			length = 1;
++		} else {
++			for (size_t extra = 1; extra < length; ++extra)
++				scalar = (scalar << 6) | (static_cast<unsigned char>(text[index + extra]) & 0x3Fu);
++		}
++		char digits[16] = {};
++		std::snprintf(digits, sizeof(digits), "%x", static_cast<unsigned int>(scalar));
++		out += digits;
++		index += length;
++	}
++	return out;
++}
++
++/* ── origin policy ──────────────────────────────────────────────────────── */
++
++/* The two policies the Swift kept separate, kept separate here: the login page
++ * accepts privileged callbacks only from the top-level official page
++ * (AuthBridgeContract.swift:3-9), while the hosted Bilibili pages accept their
++ * own diagnostics from any bilibili.com document
++ * (BilibiliPageWindow.swift:154-158). */
++struct Origin {
++	std::string scheme;
++	std::string host;
++	int port = 0;
++	bool valid = false;
++};
++
++Origin ParseOrigin(const std::string &uri)
++{
++	Origin origin;
++	const size_t scheme_end = uri.find("://");
++	if (scheme_end == std::string::npos)
++		return origin;
++	origin.scheme = LowerAscii(uri.substr(0, scheme_end));
++
++	const size_t begin = scheme_end + 3;
++	const size_t end = uri.find_first_of("/?#", begin);
++	std::string authority = uri.substr(begin, end == std::string::npos ? std::string::npos : end - begin);
++	const size_t userinfo = authority.rfind('@');
++	if (userinfo != std::string::npos)
++		authority.erase(0, userinfo + 1);
++
++	if (!authority.empty() && authority.front() == '[') {
++		const size_t close = authority.find(']');
++		if (close == std::string::npos)
++			return origin;
++		origin.host = LowerAscii(authority.substr(1, close - 1));
++		if (close + 1 < authority.size() && authority[close + 1] == ':')
++			origin.port = std::atoi(authority.c_str() + close + 2);
++	} else {
++		const size_t colon = authority.rfind(':');
++		if (colon == std::string::npos) {
++			origin.host = LowerAscii(authority);
++		} else {
++			origin.host = LowerAscii(authority.substr(0, colon));
++			origin.port = std::atoi(authority.c_str() + colon + 1);
++		}
++	}
++	origin.valid = !origin.host.empty();
++	return origin;
++}
++
++/* AuthBridgeContract.swift:6-9. */
++bool LoginOrigin(const Origin &origin)
++{
++	return origin.valid && origin.scheme == "https" && origin.host == "live.bilibili.com" &&
++	       (origin.port == 0 || origin.port == 443);
++}
++
++/* BilibiliPageWindow.swift:155-158 and isBilibili (:269-272). */
++bool PageOrigin(const Origin &origin)
++{
++	return origin.valid && origin.scheme == "https" &&
++	       (origin.host == "bilibili.com" || EndsWith(origin.host, ".bilibili.com"));
++}
++
++/* Scheme, host and port only. A document URI can carry tokens in its query
++ * string, and this text goes into the UI's log, which keeps host and path and
++ * never a query (BilibiliPageWindow.swift:13-14). */
++std::string OriginText(const Origin &origin)
++{
++	if (!origin.valid)
++		return "(unparsable source)";
++	std::string text = origin.scheme + "://" + origin.host;
++	if (origin.port != 0)
++		text += ":" + std::to_string(origin.port);
++	return text;
++}
++
++/* ── the login session's cookies ────────────────────────────────────────── */
++
++/* QRLogin.swift:7-8 SessionCredentials: the names that survive the filter, of
++ * which the first three are `requiredCookies` — what `isComplete` tests. The
++ * constructor drops empty values (:14-18), so a present-but-empty cookie does
++ * not count as present. */
++constexpr const char *kKeptCookies[] = {"SESSDATA", "bili_jct", "DedeUserID", "DedeUserID__ckMd5", "sid", "buvid3"};
++constexpr const char *kRequiredCookies[] = {"SESSDATA", "bili_jct", "DedeUserID"};
++constexpr const char *kCookieDomain = ".bilibili.com";
++
++using CookieMap = std::map<std::string, std::string>;
++
++bool KeptCookie(const std::string &name)
++{
++	for (const char *kept : kKeptCookies) {
++		if (name == kept)
++			return true;
++	}
++	return false;
++}
++
++bool IsComplete(const CookieMap &cookies)
++{
++	for (const char *required : kRequiredCookies) {
++		const auto found = cookies.find(required);
++		if (found == cookies.end() || found->second.empty())
++			return false;
++	}
++	return true;
++}
++
++/* AuthCookieBatch (AuthBridgeContract.swift:39-77). Control characters are
++ * the ASCII range here; Foundation's set also covers the Unicode Cf code
++ * points, which a cookie name or value cannot realistically carry. */
++bool HasControl(const std::string &value)
++{
++	for (const char raw : value) {
++		const unsigned char byte = static_cast<unsigned char>(raw);
++		if (byte < 0x20 || byte == 0x7F)
++			return true;
++	}
++	return false;
++}
++
++struct CookieOperation {
++	std::string name;
++	std::string value;
++	bool remove = false;
++};
++
++/* The whole batch is validated before anything is written
++ * (AuthBridgeContract.swift:39-40), and one bad item is one malformed_payload
++ * for the batch. Domain, path and secure are forced by the caller. */
++bool ParseCookieBatch(const json &payload, std::vector<CookieOperation> &operations)
++{
++	if (!payload.is_array() || payload.size() > 128)
++		return false;
++	const double now = static_cast<double>(std::time(nullptr));
++	for (const json &item : payload) {
++		if (!item.is_object())
++			return false;
++		const auto name = item.find("name");
++		const auto value = item.find("value");
++		if (name == item.end() || !name->is_string() || value == item.end() || !value->is_string())
++			return false;
++
++		CookieOperation operation;
++		operation.name = name->get<std::string>();
++		operation.value = value->get<std::string>();
++		if (operation.name.empty() || operation.name.size() > 256 || operation.value.size() > 16384)
++			return false;
++		if (HasControl(operation.name) || HasControl(operation.value))
++			return false;
++		if (operation.name.find(';') != std::string::npos || operation.name.find('=') != std::string::npos)
++			return false;
++
++		/* An expirationDate that is not a number is ignored, exactly as the
++		 * Swift's `as? NSNumber` ignores it; `remove` needs the expiry to be
++		 * past AND isExpiredRemove to be true (:65-70). */
++		const auto expiry = item.find("expirationDate");
++		if (expiry != item.end() && expiry->is_number()) {
++			const auto remove = item.find("isExpiredRemove");
++			operation.remove = expiry->get<double>() <= now && remove != item.end() &&
++					   remove->is_boolean() && remove->get<bool>();
++		}
++		operations.push_back(std::move(operation));
++	}
++	return true;
++}
++
++/* ── the credential blob ────────────────────────────────────────────────── */
++
++/* session.cpp's EncodeBlob is private to that file, and the web login has to
++ * persist before the session can verify the login (Swift SC:110-111 saves
++ * first, then emits verifying). The envelope therefore repeats that file's
++ * shape: CredentialStore.swift:26 version 2, SessionCredentials' Codable field
++ * names, and `savedAt` in seconds since 2001-01-01 (session-and-login.md
++ * §5.1). The blob is a secret: it goes to the vault and is never logged. */
++constexpr int kEnvelopeVersion = 2;
++constexpr long long kReferenceDateUnix = 978307200;
++
++std::string CredentialBlob(const CookieMap &cookies, const std::string &refresh_token)
++{
++	const json stored{{"cookies", cookies},
++			  {"refreshToken", refresh_token},
++			  {"savedAt", static_cast<long long>(std::time(nullptr)) - kReferenceDateUnix}};
++	return json{{"schemaVersion", kEnvelopeVersion}, {"credentials", stored}}.dump();
++}
++
++/* ── the device id the login page copies into a cookie ──────────────────── */
++
++/* WebLoginWindow.swift:74-87: a 32-hex-character id generated once per install
++ * and then reused, because the page writes it into a cookie the backend checks
++ * after verification. Windows has no UserDefaults; the registry is the
++ * platform's per-user, per-install store (session-and-login.md §7.4 row 27).
++ * Sign-out does not clear it (WebLoginWindow.swift:830). */
++constexpr const wchar_t *kSettingsKey = L"Software\\LiveHime";
++constexpr const wchar_t *kBuvidValue = L"buvid3";
++
++std::string DeviceBuvid3()
++{
++	std::wstring stored(64, L'\0');
++	DWORD size = static_cast<DWORD>(stored.size() * sizeof(wchar_t));
++	DWORD type = 0;
++	HKEY key = nullptr;
++	if (RegOpenKeyExW(HKEY_CURRENT_USER, kSettingsKey, 0, KEY_QUERY_VALUE, &key) == ERROR_SUCCESS) {
++		const LONG status =
++			RegQueryValueExW(key, kBuvidValue, nullptr, &type, reinterpret_cast<LPBYTE>(&stored[0]), &size);
++		RegCloseKey(key);
++		if (status == ERROR_SUCCESS && type == REG_SZ && size > sizeof(wchar_t)) {
++			stored.resize(size / sizeof(wchar_t));
++			while (!stored.empty() && stored.back() == L'\0')
++				stored.pop_back();
++			if (!stored.empty())
++				return Narrow(stored);
++		}
++	}
++
++	const std::vector<uint8_t> random = crypto::RandomBytes(16);
++	const std::string fresh = crypto::ToHex(random.data(), random.size());
++	if (RegCreateKeyExW(HKEY_CURRENT_USER, kSettingsKey, 0, nullptr, 0, KEY_SET_VALUE, nullptr, &key, nullptr) ==
++	    ERROR_SUCCESS) {
++		const std::wstring wide = Widen(fresh);
++		RegSetValueExW(key, kBuvidValue, 0, REG_SZ, reinterpret_cast<const BYTE *>(wide.c_str()),
++			       static_cast<DWORD>((wide.size() + 1) * sizeof(wchar_t)));
++		RegCloseKey(key);
++	}
++	return fresh;
++}
++
++/* ── a delay that lands back on the main thread ─────────────────────────── */
++
++/* The Swift used DispatchQueue.main.asyncAfter for the cookie read-back retry
++ * (WebLoginWindow.swift:190) and the cover toast (BilibiliPageWindow.swift:
++ * 171). Same shape as session.cpp's poll tick: a one-shot timer-queue timer
++ * whose callback only posts the continuation to the dispatch window. */
++HANDLE TimerQueue()
++{
++	static HANDLE queue = CreateTimerQueue();
++	return queue;
++}
++
++void CALLBACK DelayFired(PVOID parameter, BOOLEAN)
++{
++	std::unique_ptr<std::function<void()>> task(static_cast<std::function<void()> *>(parameter));
++	dispatch::Post([copy = *task]() { copy(); });
++}
++
++void ScheduleAfter(unsigned milliseconds, std::function<void()> task)
++{
++	auto *holder = new std::function<void()>(std::move(task));
++	HANDLE timer = nullptr;
++	if (!CreateTimerQueueTimer(&timer, TimerQueue(), &DelayFired, holder, milliseconds, 0, WT_EXECUTEONLYONCE)) {
++		delete holder;
++		return;
++	}
++}
++
++/* ── the throwaway profile a page lives in ──────────────────────────────── */
++
++/* WebLoginWindow.swift:43 and BilibiliPageWindow.swift:72 both use a
++ * .nonPersistent() store: nothing the page writes outlives its window. This
++ * SDK has no in-private switch, so the counterpart is a dedicated user-data
++ * folder under %TEMP% that is deleted when the window closes
++ * (session-and-login.md §7.3 row 11). The empty string means "could not be
++ * created": the host then fails honestly rather than letting WebView2 fall
++ * back to a folder next to obs64.exe. */
++std::wstring ProfileFolder()
++{
++	std::wstring temp(MAX_PATH, L'\0');
++	const DWORD length = GetTempPathW(static_cast<DWORD>(temp.size()), &temp[0]);
++	if (length == 0 || static_cast<size_t>(length) >= temp.size())
++		return {};
++	temp.resize(length);
++
++	std::wstring base = temp + L"LiveHime";
++	CreateDirectoryW(base.c_str(), nullptr);
++	base += L"\\webview";
++	CreateDirectoryW(base.c_str(), nullptr);
++
++	const std::vector<uint8_t> random = crypto::RandomBytes(8);
++	const std::wstring folder = base + L"\\" + Widen(crypto::ToHex(random.data(), random.size()));
++	CreateDirectoryW(folder.c_str(), nullptr);
++	return folder;
++}
++
++bool FolderExists(const std::wstring &folder)
++{
++	const DWORD attributes = GetFileAttributesW(folder.c_str());
++	return attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
++}
++
++bool DeleteTree(const std::wstring &folder)
++{
++	const std::wstring pattern = folder + L"\\*";
++	WIN32_FIND_DATAW data = {};
++	HANDLE find = FindFirstFileW(pattern.c_str(), &data);
++	if (find != INVALID_HANDLE_VALUE) {
++		do {
++			const std::wstring name = data.cFileName;
++			if (name == L"." || name == L"..")
++				continue;
++			const std::wstring child = folder + L"\\" + name;
++			if ((data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0)
++				DeleteTree(child);
++			else
++				DeleteFileW(child.c_str());
++		} while (FindNextFileW(find, &data));
++		FindClose(find);
++	}
++	return RemoveDirectoryW(folder.c_str()) != FALSE;
++}
++
++/* The browser process releases the profile asynchronously after the controller
++ * closes, so the removal retries for a few seconds on its own thread. A folder
++ * that stays behind is %TEMP%'s to clean up, not a failure the UI should hear
++ * about. */
++void DeleteFolder(const std::wstring &folder)
++{
++	if (folder.empty())
++		return;
++	std::thread([folder]() {
++		for (int attempt = 0; attempt < 25; ++attempt) {
++			if (DeleteTree(folder) || !FolderExists(folder))
++				return;
++			Sleep(200);
++		}
++	}).detach();
++}
++
++/* ── the scripts every page gets ────────────────────────────────────────── */
++
++/* WebLoginWindow.swift:75-87, statement for statement. appkey is the login
++ * appkey the official Windows client uses too (bililive-web-host-bridge.md:50)
++ * and the one startLive signs with; buvid3 is the per-install id above.
++ * device_name / device_platform stay the macOS literals the Swift used — the
++ * Windows-correct values are NOT IN SOURCE (session-and-login.md §7.4 row 28),
++ * and inventing them would be a behaviour change, not a port. */
++std::string BrowserScript()
++{
++	const json context{{"appkey", "aae92bc66f3edfab"},
++			   {"buvid3", DeviceBuvid3()},
++			   {"device_name", "macOS"},
++			   {"device_platform", "mac"}};
++	return "if (window.top === window) window.browser = Object.assign({}, window.browser || {}, " + context.dump() +
++	       ");";
++}
++
++/* AuthWebViewBridge.wkWebViewShim (AuthWebViewBridge.swift:33-42), verbatim
++ * except that webkit.messageHandlers becomes the WebView2 message channel and
++ * the frame guard is added: document-created scripts run in every frame, and
++ * the Swift asked for the main frame only (WebLoginWindow.swift:55-56). The
++ * four method names and the `method` / `data` / `width` / `height` keys are
++ * the page's own (session-and-login.md §4.4). */
++constexpr const char *kLoginShim = R"JS((() => {
++  if (window.top !== window || window.livehime_login) return;
++  const post = message => { try { window.chrome.webview.postMessage(message); } catch (e) {} };
++  window.livehime_login = {
++    LoginSuccess: data => post({method: 'LoginSuccess', data}),
++    Cancel: () => post({method: 'Cancel'}),
++    SecondaryValidationResult: () => post({method: 'SecondaryValidationResult'}),
++    SwitchLogin: (width, height) => post({method: 'SwitchLogin', width, height})
++  };
++})();
++)JS";
++
++/* AuthBridgeContract.nativeAuthBridgeScript (AuthBridgeContract.swift:83-96).
++ * WKWebView supplied the Promise through WKScriptMessageHandlerWithReply;
++ * WebView2 has no with-reply handler, so every call carries a correlation id
++ * and the shim resolves or rejects from the reply the host posts back
++ * (session-and-login.md §7.3 row 15). A pending Promise means "host handling
++ * finished", never "login is valid" (AuthBridgeContract.swift:81-82). */
++constexpr const char *kNativeBridgeShim = R"JS((() => {
++  if (window.top !== window || window.biliBridgePc) return;
++  const pending = new Map();
++  let next = 0;
++  window.chrome.webview.addEventListener('message', event => {
++    const data = event.data;
++    if (!data || typeof data !== 'object' || data.livehimeReply === undefined) return;
++    const entry = pending.get(data.livehimeReply);
++    if (!entry) return;
++    pending.delete(data.livehimeReply);
++    if (data.error) entry.reject(new Error(String(data.error)));
++    else entry.resolve({accepted: true});
++  });
++  window.biliBridgePc = {
++    callNative: (action, payload) => {
++      if (!['auth/setRefreshToken', 'auth/setCookies'].includes(action)) {
++        return Promise.reject(new Error('unsupported_action'));
++      }
++      if (window.top !== window) return Promise.reject(new Error('untrusted_origin'));
++      const id = ++next;
++      return new Promise((resolve, reject) => {
++        pending.set(id, {resolve, reject});
++        try {
++          window.chrome.webview.postMessage({livehimeCall: id, action, payload});
++        } catch (e) {
++          pending.delete(id);
++          reject(e);
++        }
++      });
++    }
++  };
++})();
++)JS";
++
++/* BilibiliPageWindow.coverHostScript (BilibiliPageWindow.swift:279-289): the
++ * cover manager reports Cancel and Confirm to the page that embeds it, and
++ * opened on its own it has no parent, so the host stands in for one. */
++constexpr const char *kCoverHostShim = R"JS((() => {
++  if (window.top !== window) return;
++  const host = {
++    postMessage(data) {
++      if (!data || data.type !== 'himeLiveCover') return;
++      window.chrome.webview.postMessage({kind: 'host', action: String(data.action || '')});
++    }
++  };
++  try { window.parent = host; } catch (e) {}
++})();
++)JS";
++
++/* BilibiliPageWindow.diagnosticsScript (BilibiliPageWindow.swift:330-381),
++ * with the WebKit handler replaced by the WebView2 channel and the frame guard
++ * the Swift got from forMainFrameOnly. Failed requests, page errors and toasts
++ * are reported; only a URL's host and path are kept, and a response body is
++ * read no further than the API code and message. */
++constexpr const char *kPageDiagnostics = R"JS((() => {
++  if (window.top !== window) return;
++  const send = message => {
++    try { window.chrome.webview.postMessage({kind: 'log', message: String(message).slice(0, 300)}); } catch (e) {}
++  };
++  const where = url => { try { const u = new URL(url, location.href); return u.host + u.pathname; } catch (e) { return String(url).split('?')[0]; } };
++  const important = url => /upload|\/Cover\/|UpdatePreLiveInfo/.test(url);
++  const result = body => (body && typeof body === 'object' && 'code' in body)
++    ? { ok: body.code === 0, text: ' code=' + body.code + (body.code !== 0 && (body.message || body.msg) ? ' ' + (body.message || body.msg) : '') }
++    : { ok: true, text: '' };
++  const open = XMLHttpRequest.prototype.open, sendXHR = XMLHttpRequest.prototype.send;
++  XMLHttpRequest.prototype.open = function (method, url) { this.__livehime = [method, String(url)]; return open.apply(this, arguments); };
++  XMLHttpRequest.prototype.send = function () {
++    this.addEventListener('loadend', () => {
++      const [method, url] = this.__livehime || ['?', ''];
++      let api = { ok: true, text: '' };
++      try { api = result(this.responseType === 'json' ? this.response : (this.responseType === '' || this.responseType === 'text') ? JSON.parse(this.responseText) : null); } catch (e) {}
++      if (this.status < 200 || this.status >= 300 || !api.ok || important(url)) send(`xhr ${method} ${where(url)} -> ${this.status}${api.text}`);
++    });
++    return sendXHR.apply(this, arguments);
++  };
++  const originalFetch = window.fetch;
++  window.fetch = function (input, init) {
++    const url = typeof input === 'string' ? input : (input && input.url) || '';
++    const method = (init && init.method) || (input && input.method) || 'GET';
++    return originalFetch.apply(this, arguments).then(response => {
++      if (!response.ok || important(url)) {
++        response.clone().json().then(body => send(`fetch ${method} ${where(url)} -> ${response.status}${result(body).text}`),
++                                     () => send(`fetch ${method} ${where(url)} -> ${response.status}`));
++      }
++      return response;
++    }, error => { send(`fetch ${method} ${where(url)} failed: ${error && error.message}`); throw error; });
++  };
++  window.addEventListener('error', event => {
++    const target = event.target;
++    if (target && target !== window && (target.src || target.href)) send('load failed ' + where(target.src || target.href));
++    else send('error ' + event.message);
++  }, true);
++  window.addEventListener('unhandledrejection', event => {
++    const reason = event.reason;
++    send('rejection ' + ((reason && (reason.message || reason.msg)) || reason));
++  });
++  let lastToast = '';
++  new MutationObserver(records => {
++    for (const record of records) for (const node of record.addedNodes) {
++      if (node.nodeType !== 1 || !/toast/i.test(node.className || '')) continue;
++      const text = (node.textContent || '').trim();
++      if (text && text !== lastToast) { lastToast = text; send('toast ' + text); }
++    }
++  }).observe(document, {childList: true, subtree: true});
++})();
++)JS";
++
++/* ── the pages ──────────────────────────────────────────────────────────── */
++
++/* WebLoginWindow.swift:17 — the same URL is a literal in the official client's
++ * bililive.dll (session-and-login.md §4.1). */
++constexpr const char *kLoginUrl = "https://live.bilibili.com/p/html/live-pc-blink/mini-login-v2/";
++
++/* BilibiliPages.cover (BilibiliPageWindow.swift:421-426). */
++constexpr const char *kCoverUrl = "https://live.bilibili.com/p/html/live-pc-blink/hime-live-cover/?pc_ui=680,566,0,1";
++
++/* BilibiliPages.faceAuth (BilibiliPageWindow.swift:401-417): the query items
++ * in that order, the voucher last and only when it is there. */
++std::string FaceAuthUrl(const std::string &voucher)
++{
++	std::string url = "https://live.bilibili.com/p/html/bilili-page-face-auth/index.html"
++			  "?is_live_webview=1&app_common=open&pc_ui=500,428,17181a,2";
++	if (!voucher.empty())
++		url += "&v_voucher=" + net::UrlEncode(voucher);
++	return url;
++}
++
++/* ── the window ─────────────────────────────────────────────────────────── */
++
++constexpr const wchar_t *kWindowClass = L"LiveHimeWebView2Window";
++constexpr int kStatusHeight = 30;
++constexpr int kConfirmWidth = 170;
++constexpr int kConfirmControlId = 1;
++
++LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam);
++
++/* Everything that differs between the three windows. An empty `status` means
++ * the window has no status line (the login window: WebLoginWindow.swift:47-66
++ * has no label); an empty `confirm` means no confirm button. */
++struct Chrome {
++	std::wstring title;
++	std::wstring status;
++	std::wstring ready;
++	std::wstring confirm;
++	int width = 0;
++	int height = 0;
++	bool resizable = false;
++	bool minimize = false;
++	bool fixed_size = false;
++	std::function<void()> on_close;
++	std::function<void()> on_confirm;
++};
++
++DWORD WindowStyle(const Chrome &chrome)
++{
++	/* The Swift's style masks, button for button:
++	 * login  [.titled, .closable, .miniaturizable]  (WebLoginWindow.swift:48)
++	 * pages  [.titled, .closable, .resizable]       (BilibiliPageWindow.swift:89) */
++	DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_CLIPCHILDREN;
++	if (chrome.resizable)
++		style |= WS_THICKFRAME;
++	if (chrome.minimize)
++		style |= WS_MINIMIZEBOX;
++	return style;
++}
++
++void RegisterWindowClass()
++{
++	static const bool once = []() {
++		WNDCLASSEXW definition = {};
++		definition.cbSize = sizeof(definition);
++		definition.lpfnWndProc = WindowProc;
++		definition.hInstance = GetModuleHandleW(nullptr);
++		definition.hCursor = LoadCursorW(nullptr, IDC_ARROW);
++		definition.hbrBackground = reinterpret_cast<HBRUSH>(static_cast<INT_PTR>(COLOR_BTNFACE + 1));
++		definition.lpszClassName = kWindowClass;
++		return RegisterClassExW(&definition) != 0;
++	}();
++	(void)once;
++}
++
++class HostWindow;
++
++/* One window per key, re-focused while it is open (WebLoginWindow.swift:26-32,
++ * BilibiliPageWindow.swift:54-60). Defined with the rest of the page code
++ * below. */
++void RegisterWindow(const std::string &key, const std::shared_ptr<HostWindow> &window);
++void UnregisterWindow(const HostWindow *window);
++
++class HostWindow : public std::enable_shared_from_this<HostWindow> {
++public:
++	HostWindow(std::string key, Chrome chrome) : key_(std::move(key)), chrome_(std::move(chrome)) {}
++	virtual ~HostWindow() = default;
++
++	HostWindow(const HostWindow &) = delete;
++	HostWindow &operator=(const HostWindow &) = delete;
++
++	/* Creates the window, then the WebView2 host inside it. */
++	void Start();
++	void BringToFront();
++	void Close();
++	/* The Swift's confirmTapped (BilibiliPageWindow.swift:135-139): close
++	 * first, then report. */
++	void Confirm();
++
++	const std::string &Key() const { return key_; }
++	bool Live() const { return hwnd_ != nullptr && !closing_ && !destroyed_; }
++
++	void Evaluate(const std::string &script, const PageResultFn &done);
++	bool Click(double x, double y);
++
++	LRESULT HandleMessage(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam);
++
++protected:
++	/* ── what the page in this window is ── */
++	virtual std::vector<std::string> DocumentScripts() const = 0;
++	virtual void Ready() = 0;
++	virtual bool Accepts(const Origin &origin) const = 0;
++	virtual void Message(const json &body, const Origin &origin) = 0;
++	/* True when the window takes the navigation itself instead of handing it
++	 * to the system browser (BilibiliPageWindow.swift:224-233). */
++	virtual bool NavigatesHere(const std::string &url)
++	{
++		(void)url;
++		return false;
++	}
++	virtual void NavigationFinished(bool success) { (void)success; }
++	virtual void CloseRequested() {}
++	virtual void HostFailed(const std::string &reason) { (void)reason; }
++
++	/* ── what the page may do with the host ── */
++	void Navigate(const std::string &url);
++	void Run(const std::string &script);
++	void ToPage(const json &object);
++	void SetStatus(const std::wstring &text);
++	void SetClientSize(double width, double height);
++	ICoreWebView2CookieManager *CookieManager() const { return cookies_.Get(); }
++	std::shared_ptr<HostWindow> Shared() { return shared_from_this(); }
++
++private:
++	void EnvironmentReady(HRESULT status, ICoreWebView2Environment *environment);
++	void ControllerReady(HRESULT status, ICoreWebView2Controller *controller);
++	void Layout();
++	void CenterWindow();
++
++	void OnMessage(ICoreWebView2WebMessageReceivedEventArgs *args);
++	void OnNavigationCompleted(ICoreWebView2NavigationCompletedEventArgs *args);
++	void OnScriptDialog(ICoreWebView2ScriptDialogOpeningEventArgs *args);
++	void OnNewWindowRequested(ICoreWebView2NewWindowRequestedEventArgs *args);
++	void FinishEval(const std::string &id, const std::string &json_text);
++	/* A host that could not be created: report, then tear down through the same
++	 * posted path a close takes, because both run inside WebView2 callbacks. */
++	void HostUnavailable(const std::string &reason);
++	void Teardown();
++
++	std::string key_;
++	Chrome chrome_;
++	HWND hwnd_ = nullptr;
++	HWND status_ = nullptr;
++	HWND confirm_ = nullptr;
++	std::wstring profile_;
++	bool closing_ = false;
++	bool destroyed_ = false;
++	bool shown_ = false;
++	ComPtr<ICoreWebView2Environment> environment_;
++	ComPtr<ICoreWebView2Controller> controller_;
++	ComPtr<ICoreWebView2> webview_;
++	ComPtr<ICoreWebView2CookieManager> cookies_;
++	std::map<std::string, PageResultFn> eval_;
++	unsigned next_eval_ = 0;
++};
++
++void HostWindow::Start()
++{
++	RegisterWindowClass();
++
++	const DWORD style = WindowStyle(chrome_);
++	RECT rect{0, 0, chrome_.width, chrome_.height};
++	AdjustWindowRectEx(&rect, style, FALSE, 0);
++	hwnd_ = CreateWindowExW(0, kWindowClass, chrome_.title.c_str(), style, CW_USEDEFAULT, CW_USEDEFAULT,
++				rect.right - rect.left, rect.bottom - rect.top, nullptr, nullptr, GetModuleHandleW(nullptr),
++				this);
++	if (!hwnd_) {
++		HostUnavailable("the window could not be created");
++		return;
++	}
++	CenterWindow();
++
++	if (!chrome_.status.empty()) {
++		status_ = CreateWindowExW(0, L"STATIC", chrome_.status.c_str(),
++					  WS_CHILD | WS_VISIBLE | SS_LEFT | SS_CENTERIMAGE, 0, 0, 10, 10, hwnd_, nullptr,
++					  GetModuleHandleW(nullptr), nullptr);
++		if (status_)
++			SendMessageW(status_, WM_SETFONT, reinterpret_cast<WPARAM>(GetStockObject(DEFAULT_GUI_FONT)), TRUE);
++		if (!chrome_.confirm.empty()) {
++			confirm_ = CreateWindowExW(0, L"BUTTON", chrome_.confirm.c_str(),
++						   WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, 0, 0, 10, 10, hwnd_,
++						   reinterpret_cast<HMENU>(static_cast<INT_PTR>(kConfirmControlId)),
++						   GetModuleHandleW(nullptr), nullptr);
++			if (confirm_)
++				SendMessageW(confirm_, WM_SETFONT,
++					     reinterpret_cast<WPARAM>(GetStockObject(DEFAULT_GUI_FONT)), TRUE);
++		}
++	}
++
++	profile_ = ProfileFolder();
++	if (profile_.empty()) {
++		HostUnavailable("the temporary WebView2 profile folder could not be created");
++		return;
++	}
++
++	/* CreateCoreWebView2EnvironmentWithOptions is asynchronous and reports
++	 * through the handler below, which runs on this thread once its message
++	 * loop pumps; waiting for it here would deadlock the UI thread
++	 * (session-and-login.md §7.3 row 11). A machine that has the loader but not
++	 * the Evergreen Runtime fails this call, and that failure is exactly what
++	 * the caller has to hear. */
++	const HRESULT started = CreateCoreWebView2EnvironmentWithOptions(
++		nullptr, profile_.c_str(), nullptr,
++		Callback<ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler>(
++			[self = Shared()](HRESULT status, ICoreWebView2Environment *environment) -> HRESULT {
++				self->EnvironmentReady(status, environment);
++				return S_OK;
++			})
++			.Get());
++	if (FAILED(started))
++		HostUnavailable("CreateCoreWebView2EnvironmentWithOptions failed (" + FormatHresult(started) + ")");
++}
++
++void HostWindow::EnvironmentReady(HRESULT status, ICoreWebView2Environment *environment)
++{
++	if (destroyed_)
++		return;
++	if (FAILED(status) || !environment) {
++		HostUnavailable("WebView2 environment creation failed (" + FormatHresult(status) + ")");
++		return;
++	}
++	environment_ = environment;
++
++	const HRESULT started = environment_->CreateCoreWebView2Controller(
++		hwnd_, Callback<ICoreWebView2CreateCoreWebView2ControllerCompletedHandler>(
++			       [self = Shared()](HRESULT result, ICoreWebView2Controller *controller) -> HRESULT {
++				       self->ControllerReady(result, controller);
++				       return S_OK;
++			       })
++			       .Get());
++	if (FAILED(started))
++		HostUnavailable("WebView2 controller creation failed (" + FormatHresult(started) + ")");
++}
++
++void HostWindow::ControllerReady(HRESULT status, ICoreWebView2Controller *controller)
++{
++	if (destroyed_)
++		return;
++	if (FAILED(status) || !controller) {
++		HostUnavailable("WebView2 controller creation failed (" + FormatHresult(status) + ")");
++		return;
++	}
++	controller_ = controller;
++	if (FAILED(controller_->get_CoreWebView2(&webview_)) || !webview_) {
++		HostUnavailable("WebView2 reported no web view for its controller");
++		return;
++	}
++
++	ComPtr<ICoreWebView2Settings> settings;
++	if (SUCCEEDED(webview_->get_Settings(&settings)) && settings) {
++		/* The host shows the script dialogs itself (WebLoginWindow.swift:
++		 * 220-234), which is what the default dialogs have to step aside for. */
++		settings->put_AreDefaultScriptDialogsEnabled(FALSE);
++		/* WKWebView was inspectable only in a ".dev" build
++		 * (BilibiliPageWindow.swift:84-86); a debug build is the closest
++		 * Windows equivalent of that switch. */
++#if defined(_DEBUG)
++		settings->put_AreDevToolsEnabled(TRUE);
++#else
++		settings->put_AreDevToolsEnabled(FALSE);
++#endif
++	}
++
++	/* The cookie manager arrived with ICoreWebView2_2, not with the first
++	 * interface the controller hands out. */
++	ComPtr<ICoreWebView2_2> later;
++	if (SUCCEEDED(webview_.As(&later)) && later)
++		later->get_CookieManager(&cookies_);
++
++	EventRegistrationToken token = {};
++	webview_->add_WebMessageReceived(
++		Callback<ICoreWebView2WebMessageReceivedEventHandler>(
++			[self = Shared()](ICoreWebView2 *, ICoreWebView2WebMessageReceivedEventArgs *args) -> HRESULT {
++				self->OnMessage(args);
++				return S_OK;
++			})
++			.Get(),
++		&token);
++	webview_->add_NavigationCompleted(
++		Callback<ICoreWebView2NavigationCompletedEventHandler>(
++			[self = Shared()](ICoreWebView2 *, ICoreWebView2NavigationCompletedEventArgs *args) -> HRESULT {
++				self->OnNavigationCompleted(args);
++				return S_OK;
++			})
++			.Get(),
++		&token);
++	webview_->add_ScriptDialogOpening(
++		Callback<ICoreWebView2ScriptDialogOpeningEventHandler>(
++			[self = Shared()](ICoreWebView2 *, ICoreWebView2ScriptDialogOpeningEventArgs *args) -> HRESULT {
++				self->OnScriptDialog(args);
++				return S_OK;
++			})
++			.Get(),
++		&token);
++	webview_->add_NewWindowRequested(
++		Callback<ICoreWebView2NewWindowRequestedEventHandler>(
++			[self = Shared()](ICoreWebView2 *, ICoreWebView2NewWindowRequestedEventArgs *args) -> HRESULT {
++				self->OnNewWindowRequested(args);
++				return S_OK;
++			})
++			.Get(),
++		&token);
++	webview_->add_WindowCloseRequested(
++		Callback<ICoreWebView2WindowCloseRequestedEventHandler>(
++			[self = Shared()](ICoreWebView2 *, IUnknown *) -> HRESULT {
++				self->CloseRequested();
++				return S_OK;
++			})
++			.Get(),
++		&token);
++
++	for (const std::string &script : DocumentScripts()) {
++		webview_->AddScriptToExecuteOnDocumentCreated(
++			Widen(script).c_str(),
++			Callback<ICoreWebView2AddScriptToExecuteOnDocumentCreatedCompletedHandler>(
++				[](HRESULT, LPCWSTR) -> HRESULT { return S_OK; })
++				.Get());
++	}
++
++	Layout();
++	/* The page decides whether this window has anything to show: a page window
++	 * with no stored login closes itself here (BilibiliPageWindow.swift:
++	 * 449-454 returns before a window exists), and a window that is already
++	 * closing is never shown at all. */
++	Ready();
++	if (!hwnd_ || closing_ || destroyed_)
++		return;
++	ShowWindow(hwnd_, SW_SHOWNORMAL);
++	UpdateWindow(hwnd_);
++	SetForegroundWindow(hwnd_);
++	shown_ = true;
++	controller_->MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC);
++}
++
++void HostWindow::Layout()
++{
++	if (!hwnd_)
++		return;
++	RECT client = {};
++	if (!GetClientRect(hwnd_, &client))
++		return;
++	const int status = status_ ? kStatusHeight : 0;
++	RECT bounds{0, 0, client.right, client.bottom - status};
++	if (bounds.bottom < 0)
++		bounds.bottom = 0;
++	if (controller_)
++		controller_->put_Bounds(bounds);
++	if (status_) {
++		int width = client.right - (confirm_ ? kConfirmWidth + 8 : 0);
++		if (width < 0)
++			width = 0;
++		MoveWindow(status_, 0, client.bottom - status, width, status, TRUE);
++		if (confirm_)
++			MoveWindow(confirm_, client.right - kConfirmWidth - 4, client.bottom - status + 2, kConfirmWidth,
++				   status - 4, TRUE);
++	}
++}
++
++void HostWindow::CenterWindow()
++{
++	/* The Swift centered every window (NSWindow.center()); Windows' cascade
++	 * would put each page somewhere else on the desktop. */
++	RECT window = {};
++	if (!GetWindowRect(hwnd_, &window))
++		return;
++	MONITORINFO info = {};
++	info.cbSize = sizeof(info);
++	const HMONITOR monitor = MonitorFromWindow(hwnd_, MONITOR_DEFAULTTOPRIMARY);
++	if (!monitor || !GetMonitorInfoW(monitor, &info))
++		return;
++	const int width = window.right - window.left;
++	const int height = window.bottom - window.top;
++	const int x = info.rcWork.left + ((info.rcWork.right - info.rcWork.left) - width) / 2;
++	const int y = info.rcWork.top + ((info.rcWork.bottom - info.rcWork.top) - height) / 2;
++	SetWindowPos(hwnd_, nullptr, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
++}
++
++void HostWindow::BringToFront()
++{
++	if (!hwnd_)
++		return;
++	ShowWindow(hwnd_, SW_SHOWNORMAL);
++	SetForegroundWindow(hwnd_);
++}
++
++void HostWindow::Close()
++{
++	/* The Swift's window.close() → windowWillClose. WebView2 does not support
++	 * tearing its objects down from inside one of its own callbacks (its
++	 * threading model: callbacks run serially and must not be re-entered), so
++	 * the teardown is posted and runs after that callback returns. */
++	if (closing_ || destroyed_)
++		return;
++	closing_ = true;
++	if (!dispatch::Post([self = Shared()]() { self->Teardown(); }))
++		Teardown();
++}
++
++void HostWindow::Confirm()
++{
++	if (closing_ || destroyed_)
++		return;
++	Close();
++	if (chrome_.on_confirm)
++		chrome_.on_confirm();
++}
++
++void HostWindow::HostUnavailable(const std::string &reason)
++{
++	if (destroyed_)
++		return;
++	HostFailed(reason);
++	Close();
++}
++
++void HostWindow::Teardown()
++{
++	if (destroyed_)
++		return;
++	destroyed_ = true;
++
++	/* Release COM before the HWND: closing the controller stops the page, and
++	 * dropping the web view releases the handlers that hold a shared_ptr to
++	 * this object. */
++	if (controller_)
++		controller_->Close();
++	webview_.Reset();
++	cookies_.Reset();
++	controller_.Reset();
++	environment_.Reset();
++
++	if (hwnd_) {
++		DestroyWindow(hwnd_);
++		hwnd_ = nullptr;
++	}
++	status_ = nullptr;
++	confirm_ = nullptr;
++
++	UnregisterWindow(this);
++	DeleteFolder(profile_);
++
++	/* A test hook that is still waiting gets an answer rather than a hang. The
++	 * key is already free, so a caller that opens the page again from here gets
++	 * a new window. */
++	for (auto &pending : eval_) {
++		if (pending.second)
++			pending.second("{\"error\":\"the page closed\"}");
++	}
++	eval_.clear();
++
++	/* Exactly like BilibiliPageWindow.windowWillClose (:145-150). A window that
++	 * never appeared was never closed by anyone, so it reports nothing. */
++	if (shown_ && chrome_.on_close)
++		chrome_.on_close();
++}
++
++void HostWindow::Navigate(const std::string &url)
++{
++	if (!webview_)
++		return;
++	webview_->Navigate(Widen(url).c_str());
++}
++
++void HostWindow::Run(const std::string &script)
++{
++	if (!webview_)
++		return;
++	webview_->ExecuteScript(Widen(script).c_str(),
++				Callback<ICoreWebView2ExecuteScriptCompletedHandler>(
++					[](HRESULT, LPCWSTR) -> HRESULT { return S_OK; })
++					.Get());
++}
++
++void HostWindow::ToPage(const json &object)
++{
++	if (!webview_)
++		return;
++	webview_->PostWebMessageAsJson(Widen(object.dump()).c_str());
++}
++
++void HostWindow::SetStatus(const std::wstring &text)
++{
++	if (status_)
++		SetWindowTextW(status_, text.c_str());
++}
++
++void HostWindow::SetClientSize(double width, double height)
++{
++	if (!hwnd_)
++		return;
++	RECT rect{0, 0, static_cast<LONG>(width), static_cast<LONG>(height)};
++	AdjustWindowRectEx(&rect, WindowStyle(chrome_), FALSE, 0);
++	SetWindowPos(hwnd_, nullptr, 0, 0, rect.right - rect.left, rect.bottom - rect.top,
++		     SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
++	Layout();
++}
++
++LRESULT HostWindow::HandleMessage(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam)
++{
++	switch (message) {
++	case WM_SIZE:
++		Layout();
++		return 0;
++	case WM_WINDOWPOSCHANGED:
++		if (controller_)
++			controller_->NotifyParentWindowPositionChanged();
++		break;
++	case WM_SETFOCUS:
++		if (controller_)
++			controller_->MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC);
++		return 0;
++	case WM_GETMINMAXINFO:
++		/* The login window's contentMinSize (WebLoginWindow.swift:64). */
++		if (chrome_.fixed_size) {
++			auto *info = reinterpret_cast<MINMAXINFO *>(lparam);
++			RECT smallest{0, 0, chrome_.width, chrome_.height};
++			AdjustWindowRectEx(&smallest, WindowStyle(chrome_), FALSE, 0);
++			info->ptMinTrackSize.x = smallest.right - smallest.left;
++			info->ptMinTrackSize.y = smallest.bottom - smallest.top;
++			return 0;
++		}
++		break;
++	case WM_COMMAND:
++		if (LOWORD(wparam) == kConfirmControlId && HIWORD(wparam) == BN_CLICKED) {
++			Confirm();
++			return 0;
++		}
++		break;
++	case WM_CLOSE:
++		Close();
++		return 0; /* the teardown destroys the window */
++	case WM_DESTROY:
++		hwnd_ = nullptr;
++		status_ = nullptr;
++		confirm_ = nullptr;
++		return 0;
++	default:
++		break;
++	}
++	return DefWindowProcW(hwnd, message, wparam, lparam);
++}
++
++LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam)
++{
++	if (message == WM_NCCREATE) {
++		auto *create = reinterpret_cast<CREATESTRUCTW *>(lparam);
++		SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(create->lpCreateParams));
++	}
++	auto *window = reinterpret_cast<HostWindow *>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
++	/* Messages that arrive before WM_NCCREATE (and after the window is gone)
++	 * have no host yet. */
++	if (!window)
++		return DefWindowProcW(hwnd, message, wparam, lparam);
++	return window->HandleMessage(hwnd, message, wparam, lparam);
++}
++
++void HostWindow::OnMessage(ICoreWebView2WebMessageReceivedEventArgs *args)
++{
++	LPWSTR source_text = nullptr;
++	if (FAILED(args->get_Source(&source_text)) || !source_text)
++		return;
++	const std::string source = Narrow(source_text);
++	CoTaskMemFree(source_text);
++	const Origin origin = ParseOrigin(source);
++
++	/* Privileged callbacks are accepted only from our own official page; a
++	 * document-created shim also lives in third-party frames (geetest, the
++	 * passport redirect), so this is the gate that keeps them unprivileged
++	 * (AuthBridgeContract.swift:3-9, session-and-login.md §7.3 row 16).
++	 *
++	 * A rejected message gets no reply, and cannot: PostWebMessageAsJson
++	 * addresses the top-level document, never the frame that called, so the
++	 * Swift's `replyHandler(nil, untrusted_origin)` has no WebView2 counterpart.
++	 * The rejection is reported instead, because a silent drop is exactly the
++	 * behaviour the Windows build has to be able to show in its log. */
++	if (!Accepts(origin)) {
++		EmitEvent("pageLog", json{{"page", key_},
++					  {"message", "rejected a bridge message from " + OriginText(origin) +
++							      " (untrusted_origin)"}});
++		return;
++	}
++
++	LPWSTR json_text = nullptr;
++	if (FAILED(args->get_WebMessageAsJson(&json_text)) || !json_text)
++		return;
++	const std::string payload = Narrow(json_text);
++	CoTaskMemFree(json_text);
++
++	const json body = json::parse(payload, nullptr, false);
++	if (body.is_discarded() || !body.is_object())
++		return;
++
++	/* The eval reply is the host's own channel, so it is routed before the
++	 * page's messages. */
++	const auto eval = body.find("livehimeEval");
++	if (eval != body.end() && eval->is_string()) {
++		const std::string id = eval->get<std::string>();
++		const auto result = body.find("json");
++		const auto reported_ok = body.find("ok");
++		const bool ok = reported_ok != body.end() && reported_ok->is_boolean() && reported_ok->get<bool>();
++		if (ok && result != body.end() && result->is_string()) {
++			FinishEval(id, result->get<std::string>());
++		} else {
++			std::string error = "the script did not report a result";
++			const auto reported = body.find("error");
++			if (reported != body.end() && reported->is_string())
++				error = reported->get<std::string>();
++			FinishEval(id, std::string("{\"error\":") + json(error).dump() + "}");
++		}
++		return;
++	}
++
++	Message(body, origin);
++}
++
++void HostWindow::OnNavigationCompleted(ICoreWebView2NavigationCompletedEventArgs *args)
++{
++	BOOL success = FALSE;
++	if (FAILED(args->get_IsSuccess(&success)))
++		success = FALSE;
++	NavigationFinished(success != FALSE);
++}
++
++void HostWindow::OnScriptDialog(ICoreWebView2ScriptDialogOpeningEventArgs *args)
++{
++	COREWEBVIEW2_SCRIPT_DIALOG_KIND kind = COREWEBVIEW2_SCRIPT_DIALOG_KIND_ALERT;
++	args->get_Kind(&kind);
++	std::wstring text;
++	LPWSTR message = nullptr;
++	if (SUCCEEDED(args->get_Message(&message)) && message) {
++		text = message;
++		CoTaskMemFree(message);
++	}
++
++	/* The Swift showed a sheet from its delegate callback; WebView2 forbids
++	 * running a modal loop inside one of its event handlers, so the dialog is
++	 * deferred: the handler returns, the box is shown from the message queue,
++	 * and the deferral is completed with the answer. */
++	ComPtr<ICoreWebView2Deferral> deferral;
++	if (FAILED(args->GetDeferral(&deferral)) || !deferral) {
++		args->Accept(); /* nothing can be shown; dismissing is the honest answer */
++		return;
++	}
++	ComPtr<ICoreWebView2ScriptDialogOpeningEventArgs> dialog = args;
++	const bool confirm = kind == COREWEBVIEW2_SCRIPT_DIALOG_KIND_CONFIRM;
++	const bool unhandled = kind == COREWEBVIEW2_SCRIPT_DIALOG_KIND_PROMPT ||
++			       kind == COREWEBVIEW2_SCRIPT_DIALOG_KIND_BEFOREUNLOAD;
++	ScheduleAfter(0, [dialog, deferral, confirm, unhandled, text, self = Shared()]() {
++		if (unhandled) {
++			/* The Swift had no panel for a prompt and no beforeunload
++			 * delegate; accepting dismisses the dialog so the page is never
++			 * left waiting on it. */
++			dialog->Accept();
++			deferral->Complete();
++			return;
++		}
++		/* WebLoginWindow.swift:220-234. The confirm buttons are the system's
++		 * 确定 / 取消 on a Chinese Windows, which is where the Swift's fixed
++		 * titles came from. */
++		const UINT flags = confirm ? MB_OKCANCEL | MB_ICONQUESTION | MB_SETFOREGROUND
++					   : MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND;
++		const int answer = MessageBoxW(self->hwnd_, text.c_str(), confirm ? L"确定" : L"提示", flags);
++		if (!confirm || answer == IDOK)
++			dialog->Accept();
++		deferral->Complete();
++	});
++}
++
++void HostWindow::OnNewWindowRequested(ICoreWebView2NewWindowRequestedEventArgs *args)
++{
++	std::string url;
++	LPWSTR uri = nullptr;
++	if (SUCCEEDED(args->get_Uri(&uri)) && uri) {
++		url = Narrow(uri);
++		CoTaskMemFree(uri);
++	}
++	/* WebView2 must never open a window of its own for these pages. */
++	args->put_Handled(TRUE);
++	if (url.empty())
++		return;
++	if (NavigatesHere(url)) {
++		Navigate(url);
++		return;
++	}
++	const Origin origin = ParseOrigin(url);
++	if (origin.scheme != "https" && origin.scheme != "http")
++		return;
++	/* "Forgot password", the user agreement and the privacy policy belong in
++	 * the user's browser (WebLoginWindow.swift:210-218). */
++	ShellExecuteW(nullptr, L"open", Widen(url).c_str(), nullptr, nullptr, SW_SHOWNORMAL);
++}
++
++void HostWindow::FinishEval(const std::string &id, const std::string &json_text)
++{
++	const auto found = eval_.find(id);
++	if (found == eval_.end())
++		return; /* already answered, or the reply raced the teardown */
++	const PageResultFn done = std::move(found->second);
++	eval_.erase(found);
++	done(json_text);
++}
++
++void HostWindow::Evaluate(const std::string &script, const PageResultFn &done)
++{
++	if (!done)
++		return;
++	if (!webview_) {
++		done("{\"error\":\"the page is not ready\"}");
++		return;
++	}
++
++	const std::string id = std::to_string(++next_eval_);
++	/* BilibiliPageWindow.evaluate (BilibiliPageWindow.swift:241-251) runs the
++	 * script as an async function body and answers with JSON.stringify of its
++	 * value. ExecuteScript cannot await a Promise, so the body reports its
++	 * result over the web-message channel instead, keyed by the id above. */
++	const std::string wrapped = "(async () => {\n"
++				    "  let payload;\n"
++				    "  try {\n"
++				    "    const value = await (async () => { " +
++				    script +
++				    " })();\n"
++				    "    payload = {livehimeEval: " +
++				    JsString(id) +
++				    ", ok: true, json: JSON.stringify(value === undefined ? null : value)};\n"
++				    "  } catch (e) {\n"
++				    "    payload = {livehimeEval: " +
++				    JsString(id) +
++				    ", ok: false, error: String((e && (e.message || e)) || e)};\n"
++				    "  }\n"
++				    "  try { window.chrome.webview.postMessage(payload); } catch (e) {}\n"
++				    "})();";
++
++	eval_[id] = done;
++	webview_->ExecuteScript(
++		Widen(wrapped).c_str(),
++		Callback<ICoreWebView2ExecuteScriptCompletedHandler>(
++			[self = Shared(), id](HRESULT status, LPCWSTR result) -> HRESULT {
++				(void)result;
++				if (FAILED(status)) {
++					/* The script never ran — a syntax error in the
++					 * caller's body, for instance. The async wrapper above
++					 * cannot report that case, so it is reported here. */
++					self->FinishEval(id, std::string("{\"error\":") +
++								  JsString("the script did not run (" +
++									   FormatHresult(status) + ")") +
++								  "}");
++				}
++				return S_OK;
++			})
++			.Get());
++}
++
++bool HostWindow::Click(double x, double y)
++{
++	if (!Live() || !webview_)
++		return false;
++	if (!std::isfinite(x) || !std::isfinite(y))
++		return false;
++
++	/* BilibiliPageWindow.click (BilibiliPageWindow.swift:255-267) sends a real
++	 * mouse click at page coordinates "so the page sees a user gesture". The
++	 * Windows counterpart of a real click is OS input: Chromium accepts input
++	 * that arrived through the input queue as trusted, and gives a synthetic
++	 * DOM event no user activation. */
++	SetForegroundWindow(hwnd_);
++	SetFocus(hwnd_);
++	POINT point{static_cast<LONG>(x), static_cast<LONG>(y)};
++	if (!ClientToScreen(hwnd_, &point))
++		return false;
++	if (!SetCursorPos(point.x, point.y))
++		return false;
++
++	INPUT input[2] = {};
++	input[0].type = INPUT_MOUSE;
++	input[0].mi.dwFlags = MOUSEEVENTF_LEFTDOWN;
++	input[1].type = INPUT_MOUSE;
++	input[1].mi.dwFlags = MOUSEEVENTF_LEFTUP;
++	return SendInput(2, input, static_cast<int>(sizeof(INPUT))) == 2;
++}
++
++/* ── the login window ───────────────────────────────────────────────────── */
++
++/* WebLoginWindow.swift:47-48: 820 x 460, titled, closable, miniaturizable,
++ * not resizable. */
++Chrome LoginChrome()
++{
++	Chrome chrome;
++	chrome.title = L"哔哩哔哩登录";
++	chrome.width = 820;
++	chrome.height = 460;
++	chrome.minimize = true;
++	chrome.fixed_size = true;
++	return chrome;
++}
++
++class LoginWindow final : public HostWindow {
++public:
++	explicit LoginWindow(FailureFn failed) : HostWindow("login", LoginChrome()), failed_(std::move(failed)) {}
++
++protected:
++	std::vector<std::string> DocumentScripts() const override
++	{
++		/* The two document-start scripts of WebLoginWindow.swift:53-56. The
++		 * frame guard each of them carries is WebView2's price for having no
++		 * main-frame-only injection (session-and-login.md §7.3 row 12). */
++		return {BrowserScript(), kLoginShim};
++	}
++
++	void Ready() override { Navigate(kLoginUrl); }
++
++	bool Accepts(const Origin &origin) const override { return LoginOrigin(origin); }
++
++	void Message(const json &body, const Origin &origin) override;
++
++	void NavigationFinished(bool success) override
++	{
++		if (!success)
++			return;
++		/* WebLoginWindow.swift:199-206: after every finished navigation the
++		 * (idempotent) native bridge goes in, then one cookie probe — a
++		 * third-party (QQ / WeChat / Weibo) login or a verification step comes
++		 * back to the page already signed in without calling LoginSuccess. */
++		Run(kNativeBridgeShim);
++		CollectCookies(0, 1);
++	}
++
++	void HostFailed(const std::string &reason) override
++	{
++		if (failed_)
++			failed_(reason);
++	}
++
++private:
++	/* The livehime_login channel (WebLoginWindow.swift:98-108). */
++	void LoginSuccess(const json &payload);
++	void SeedCookies(const std::string &token, const std::string &timestamp);
++	/* The biliBridgePc channel (WebLoginWindow.swift:110-135). */
++	void CallNative(const json &body, long long id);
++	void ApplyCookieBatch(const json &payload, long long id);
++	void ReplyWithId(long long id, const std::string &error);
++
++	void CollectCookies(int attempt, int attempts);
++	void CookiesRead(HRESULT status, ICoreWebView2CookieList *list, int attempt, int attempts);
++	void Finish(const CookieMap &cookies);
++	void Resize(const json &body);
++
++	FailureFn failed_;
++	std::string refresh_token_;
++	bool completed_ = false;
++};
++
++void LoginWindow::Message(const json &body, const Origin &origin)
++{
++	(void)origin; /* the caller already checked it */
++	const auto call = body.find("livehimeCall");
++	if (call != body.end()) {
++		/* The shim always numbers its calls; a call without an id has no
++		 * answer to send and nothing to do. */
++		if (!call->is_number())
++			return;
++		CallNative(body, static_cast<long long>(call->get<double>()));
++		return;
++	}
++
++	const auto method = body.find("method");
++	if (method == body.end() || !method->is_string())
++		return;
++	const std::string name = method->get<std::string>();
++	if (name == "LoginSuccess") {
++		const auto data = body.find("data");
++		LoginSuccess(data == body.end() ? json::object() : *data);
++	} else if (name == "Cancel") {
++		Close();
++	} else if (name == "SecondaryValidationResult") {
++		/* The page redirected back after verification; the cookie jar is
++		 * already authenticated at this point (WebLoginWindow.swift:153-156). */
++		CollectCookies(0, 20);
++	} else if (name == "SwitchLogin") {
++		Resize(body);
++	}
++	/* Anything else is ignored (WebLoginWindow.swift:106). */
++}
++
++void LoginWindow::LoginSuccess(const json &payload)
++{
++	/* WebLoginWindow.dictionary (:137-143): the payload may be an object or a
++	 * JSON string; anything else is empty. */
++	json fields = json::object();
++	if (payload.is_object()) {
++		fields = payload;
++	} else if (payload.is_string()) {
++		const json parsed = json::parse(payload.get<std::string>(), nullptr, false);
++		if (parsed.is_object())
++			fields = parsed;
++	}
++
++	/* LoginResult field mapping (AuthWebViewBridge.swift:51-61). */
++	std::string token;
++	for (const char *name : {"refresh_token", "refreshToken", "token"}) {
++		const auto found = fields.find(name);
++		if (found != fields.end() && found->is_string()) {
++			token = found->get<std::string>();
++			break;
++		}
++	}
++	if (!token.empty()) {
++		refresh_token_ = token;
++		/* AuthWebViewBridge.swift:57 maps the timestamp through
++		 * String(describing:) whenever the key is there, and only then does
++		 * WebLoginWindow.swift:150 seed correspond/0. */
++		const auto timestamp = fields.find("timestamp");
++		if (timestamp != fields.end())
++			SeedCookies(token, SwiftDescribe(*timestamp));
++	}
++	CollectCookies(0, 20);
++}
++
++void LoginWindow::SeedCookies(const std::string &token, const std::string &timestamp)
++{
++	/* WebLoginWindow.swift:166-174. The double encoding is deliberate and
++	 * load-bearing: the marker's Unicode scalars become unpadded lowercase hex
++	 * text, and SHA-256 runs over that ASCII hex, not over the marker. */
++	const std::string marker = "set_" + timestamp + "_" + token;
++	const std::string digest = crypto::Sha256Hex(ScalarHex(marker));
++	const std::string url = "https://www.bilibili.com/correspond/0/" + digest;
++	Run("(() => { const f=document.createElement('iframe'); f.style.display='none'; f.src=" + JsString(url) +
++	    "; document.body.appendChild(f); })();");
++}
++
++/* NativeAuthRequest.parse (AuthBridgeContract.swift:18-37) on the WebView2
++ * channel. A call that cannot be taken is answered with the contract's own
++ * error literal, never with a fabricated acceptance. */
++void LoginWindow::CallNative(const json &body, long long id)
++{
++	std::string action;
++	const auto named = body.find("action");
++	if (named != body.end() && named->is_string())
++		action = named->get<std::string>();
++	const auto given = body.find("payload");
++	const json payload = given == body.end() ? json() : *given;
++
++	if (action == "auth/setRefreshToken") {
++		json fields = json::object();
++		if (payload.is_object()) {
++			fields = payload;
++		} else if (payload.is_string()) {
++			const json parsed = json::parse(payload.get<std::string>(), nullptr, false);
++			if (parsed.is_object())
++				fields = parsed;
++		}
++		if (fields.empty()) {
++			ReplyWithId(id, "malformed_payload");
++			return;
++		}
++		/* .login(object) → bridge.loginSuccess(object) (WebLoginWindow.swift:
++		 * 117-120), then the acknowledgement. */
++		LoginSuccess(fields);
++		ReplyWithId(id, "");
++		return;
++	}
++
++	if (action == "auth/setCookies") {
++		ApplyCookieBatch(payload, id);
++		return;
++	}
++	ReplyWithId(id, "unsupported_action");
++}
++
++void LoginWindow::ApplyCookieBatch(const json &payload, long long id)
++{
++	std::vector<CookieOperation> operations;
++	if (!ParseCookieBatch(payload, operations)) {
++		ReplyWithId(id, "malformed_payload");
++		return;
++	}
++
++	ICoreWebView2CookieManager *manager = CookieManager();
++	if (!manager) {
++		/* Unreachable while the page is running: a page implies a controller
++		 * and its cookie manager. No reply is the honest answer — the three
++		 * literals the contract has are about the payload and the action, and
++		 * neither is the trouble here. */
++		return;
++	}
++	for (const CookieOperation &operation : operations) {
++		ComPtr<ICoreWebView2Cookie> cookie;
++		if (FAILED(manager->CreateCookie(Widen(operation.name).c_str(), Widen(operation.value).c_str(),
++						 L".bilibili.com", L"/", &cookie)) ||
++		    !cookie)
++			continue;
++		cookie->put_IsSecure(TRUE);
++		if (operation.remove)
++			manager->DeleteCookie(cookie.Get());
++		else
++			manager->AddOrUpdateCookie(cookie.Get());
++	}
++
++	/* WebLoginWindow.swift:121-128 acknowledges only after every write. The
++	 * read-back is the one round trip that puts the reply behind those writes
++	 * in the browser process's queue. */
++	manager->GetCookies(nullptr, Callback<ICoreWebView2GetCookiesCompletedHandler>(
++					     [self = std::static_pointer_cast<LoginWindow>(Shared()), id](
++						     HRESULT, ICoreWebView2CookieList *) -> HRESULT {
++						     self->ReplyWithId(id, "");
++						     return S_OK;
++					     })
++					     .Get());
++}
++
++void LoginWindow::ReplyWithId(long long id, const std::string &error)
++{
++	json message{{"livehimeReply", id}};
++	if (error.empty())
++		message["accepted"] = true; /* {"accepted": true} (WebLoginWindow.swift:120) */
++	else
++		message["error"] = error;
++	ToPage(message);
++}
++
++void LoginWindow::CollectCookies(int attempt, int attempts)
++{
++	if (completed_ || closing_ || destroyed_)
++		return;
++	ICoreWebView2CookieManager *manager = CookieManager();
++	if (!manager)
++		return;
++	manager->GetCookies(nullptr, Callback<ICoreWebView2GetCookiesCompletedHandler>(
++					     [self = std::static_pointer_cast<LoginWindow>(Shared()), attempt, attempts](
++						     HRESULT status, ICoreWebView2CookieList *list) -> HRESULT {
++						     self->CookiesRead(status, list, attempt, attempts);
++						     return S_OK;
++					     })
++					     .Get());
++}
++
++void LoginWindow::CookiesRead(HRESULT status, ICoreWebView2CookieList *list, int attempt, int attempts)
++{
++	if (completed_ || closing_ || destroyed_)
++		return;
++
++	/* WebLoginWindow.swift:180-184: every cookie whose domain ends in
++	 * bilibili.com, keyed by name, then put through SessionCredentials' filter
++	 * (QRLogin.swift:14-20). */
++	CookieMap cookies;
++	if (SUCCEEDED(status) && list) {
++		UINT32 count = 0;
++		list->get_Count(&count);
++		for (UINT32 index = 0; index < count; ++index) {
++			ComPtr<ICoreWebView2Cookie> cookie;
++			if (FAILED(list->GetValueAtIndex(index, &cookie)) || !cookie)
++				continue;
++			std::string name;
++			std::string domain;
++			std::string value;
++			LPWSTR text = nullptr;
++			if (SUCCEEDED(cookie->get_Name(&text)) && text) {
++				name = Narrow(text);
++				CoTaskMemFree(text);
++				text = nullptr;
++			}
++			if (SUCCEEDED(cookie->get_Domain(&text)) && text) {
++				domain = Narrow(text);
++				CoTaskMemFree(text);
++				text = nullptr;
++			}
++			if (SUCCEEDED(cookie->get_Value(&text)) && text) {
++				value = Narrow(text);
++				CoTaskMemFree(text);
++			}
++			if (!EndsWith(domain, "bilibili.com"))
++				continue;
++			if (KeptCookie(name) && !value.empty())
++				cookies[name] = value;
++		}
++	}
++
++	if (IsComplete(cookies)) {
++		Finish(cookies);
++		return;
++	}
++	/* Cookies can arrive shortly after the success callback: 20 attempts,
++	 * 0.3 s apart (WebLoginWindow.swift:189-192). Out of attempts the window
++	 * simply stays open — the Swift gave up the same silent way. */
++	if (attempt + 1 < attempts) {
++		ScheduleAfter(300, [self = std::static_pointer_cast<LoginWindow>(Shared()), attempt, attempts]() {
++			self->CollectCookies(attempt + 1, attempts);
++		});
++	}
++}
++
++void LoginWindow::Finish(const CookieMap &cookies)
++{
++	completed_ = true;
++
++	/* The core's HTTP layer reads its cookies from the jar, so the login's
++	 * cookies go there first (CONTRACT §7). session.cpp's Verify then applies
++	 * the same credentials from the stored envelope, which sets the same
++	 * values. */
++	net::CookieJar &jar = net::CookieJar::Instance();
++	jar.Clear();
++	for (const auto &cookie : cookies)
++		jar.Set(kCookieDomain, cookie.first, cookie.second);
++
++	/* SessionCoordinator.swift:110-111 persists before it verifies, and a
++	 * refused save is failed(keychain) rather than a login. session.cpp's
++	 * persist hook is private to that file, so the failure object is built
++	 * here in the shape that file publishes. */
++	const bool saved = auth::CredentialStore::Instance().Save(CredentialBlob(cookies, refresh_token_));
++
++	/* The Swift closed the window after handing the credentials over
++	 * (WebLoginWindow.swift:186-188). */
++	Close();
++
++	if (!saved) {
++		Emit(json{{"state", "failed"},
++			  {"notice", auth::NoticeRaw(auth::Notice::Keychain)},
++			  {"detail", "the Windows credential store refused to save the login"}});
++		return;
++	}
++
++	/* Then the session verifies it: cookies into the jar, `verifying`,
++	 * Bilibili's nav check, the room lookup, and only then `ready`
++	 * (session-and-login.md §8.2 steps 6-11). Nothing here reports success on
++	 * the page's word. */
++	auth::Session::Instance().Retry();
++}
++
++void LoginWindow::Resize(const json &body)
++{
++	/* AuthWebViewBridge.switchLogin (:71-74) drops non-finite and non-positive
++	 * sizes; WebLoginWindow.swift:160 clamps the rest. */
++	double width = 0;
++	double height = 0;
++	const auto requested_width = body.find("width");
++	if (requested_width != body.end() && requested_width->is_number())
++		width = requested_width->get<double>();
++	const auto requested_height = body.find("height");
++	if (requested_height != body.end() && requested_height->is_number())
++		height = requested_height->get<double>();
++	if (!std::isfinite(width) || !std::isfinite(height) || width <= 0 || height <= 0)
++		return;
++	SetClientSize(std::max(820.0, std::min(width, 1200.0)), std::max(460.0, std::min(height, 900.0)));
++}
++
++/* ── the Bilibili pages ─────────────────────────────────────────────────── */
++
++struct PageOptions {
++	std::string key;
++	std::string url;
++	std::wstring title;
++	std::wstring loading;
++	std::wstring ready;
++	std::wstring confirm;
++	int width = 0;
++	int height = 0;
++	bool cover_host = false;
++	bool close_confirms = false;
++	std::function<void()> on_close;
++	std::function<void()> on_confirm;
++};
++
++Chrome PageChrome(const PageOptions &options)
++{
++	Chrome chrome;
++	chrome.title = options.title;
++	chrome.status = options.loading;
++	chrome.ready = options.ready;
++	chrome.confirm = options.confirm;
++	chrome.width = options.width;
++	chrome.height = options.height;
++	chrome.resizable = true;
++	chrome.on_close = options.on_close;
++	chrome.on_confirm = options.on_confirm;
++	return chrome;
++}
++
++class PageWindow final : public HostWindow {
++public:
++	explicit PageWindow(PageOptions options)
++		: HostWindow(options.key, PageChrome(options)), options_(std::move(options))
++	{
++	}
++
++protected:
++	std::vector<std::string> DocumentScripts() const override
++	{
++		/* BilibiliPageWindow.swift:74-81. The WebKit compatibility script of
++		 * :300-325 does not come along: it works around two WebKit bugs (a
++		 * garbage-collected file input, a query on a blob: URL) that the
++		 * Windows client's Chromium never had, and these pages were written for
++		 * Chromium. */
++		std::vector<std::string> scripts{kPageDiagnostics};
++		if (options_.cover_host)
++			scripts.push_back(kCoverHostShim);
++		return scripts;
++	}
++
++	void Ready() override { SeedCookies(); }
++
++	bool Accepts(const Origin &origin) const override { return PageOrigin(origin); }
++
++	bool NavigatesHere(const std::string &url) override { return PageOrigin(ParseOrigin(url)); }
++
++	void Message(const json &body, const Origin &origin) override;
++
++	void NavigationFinished(bool success) override
++	{
++		/* BilibiliPageWindow.swift:182-192. */
++		SetStatus(success ? options_.ready : L"页面加载失败，请关闭后重试");
++	}
++
++	void CloseRequested() override
++	{
++		/* The page's own window.close() (BilibiliPageWindow.swift:215-220). */
++		if (options_.close_confirms)
++			Confirm();
++		else
++			Close();
++	}
++
++private:
++	void SeedCookies();
++	void Log(const std::string &message);
++
++	PageOptions options_;
++};
++
++void PageWindow::Message(const json &body, const Origin &origin)
++{
++	(void)origin; /* the caller already checked it */
++	/* BilibiliPageWindow.userContentController (:154-178). */
++	const auto kind = body.find("kind");
++	if (kind == body.end() || !kind->is_string())
++		return;
++	const std::string what = kind->get<std::string>();
++	if (what == "log") {
++		std::string message;
++		const auto text = body.find("message");
++		if (text != body.end() && text->is_string())
++			message = text->get<std::string>();
++		Log(TruncateUtf8(message, 300));
++	} else if (what == "host" && options_.cover_host) {
++		std::string action;
++		const auto value = body.find("action");
++		if (value != body.end() && value->is_string())
++			action = value->get<std::string>();
++		Log("host " + action);
++		if (action == "cancel") {
++			Close();
++		} else if (action == "confirm") {
++			/* Leave the page's "uploaded, awaiting review" toast readable
++			 * (BilibiliPageWindow.swift:169-171). */
++			SetStatus(L"封面已提交，等待哔哩哔哩审核");
++			ScheduleAfter(1500, [self = Shared()]() { self->Confirm(); });
++		}
++	}
++}
++
++void PageWindow::Log(const std::string &message)
++{
++	EmitEvent("pageLog", json{{"page", options_.key}, {"message", message}});
++}
++
++void PageWindow::SeedCookies()
++{
++	/* BilibiliPageWindow.load (:122-133): the session's cookies are copied
++	 * into the page's own store, then the page loads. The jar is the C++
++	 * counterpart of `coordinator.credentials` — session.cpp fills it before it
++	 * publishes `verifying` and clears it wherever a login goes away. */
++	const auto cookies = net::CookieJar::Instance().All();
++	if (cookies.empty()) {
++		/* The Swift's `guard let credentials … else { return }`: there is no
++		 * account to show this page for. The window was never shown, so it also
++		 * reports no close (Teardown checks shown_). */
++		Close();
++		return;
++	}
++
++	ICoreWebView2CookieManager *manager = CookieManager();
++	if (!manager) {
++		Navigate(options_.url);
++		return;
++	}
++	for (const auto &cookie : cookies) {
++		ComPtr<ICoreWebView2Cookie> created;
++		if (FAILED(manager->CreateCookie(Widen(cookie.first).c_str(), Widen(cookie.second).c_str(),
++						 L".bilibili.com", L"/", &created)) ||
++		    !created)
++			continue;
++		created->put_IsSecure(TRUE);
++		manager->AddOrUpdateCookie(created.Get());
++	}
++
++	/* AddOrUpdateCookie has no completion handler, so the read-back is the only
++	 * round trip that proves the writes reached the browser process; the page
++	 * is loaded from that answer and never before it
++	 * (session-and-login.md §7.3 row 17). An answer that failed still loads the
++	 * page: the cookies were issued, and a page that ends up signed out is
++	 * visible to the user, which beats a window that never loads. */
++	const std::string url = options_.url;
++	manager->GetCookies(nullptr, Callback<ICoreWebView2GetCookiesCompletedHandler>(
++					     [self = std::static_pointer_cast<PageWindow>(Shared()), url](
++						     HRESULT, ICoreWebView2CookieList *) -> HRESULT {
++						     self->Navigate(url);
++						     return S_OK;
++					     })
++					     .Get());
++}
++
++/* ── the open windows ───────────────────────────────────────────────────── */
++
++std::map<std::string, std::shared_ptr<HostWindow>> g_windows;
++
++void RegisterWindow(const std::string &key, const std::shared_ptr<HostWindow> &window)
++{
++	g_windows[key] = window;
++}
++
++void UnregisterWindow(const HostWindow *window)
++{
++	for (auto entry = g_windows.begin(); entry != g_windows.end(); ++entry) {
++		if (entry->second.get() == window) {
++			g_windows.erase(entry);
++			return;
++		}
++	}
++}
++
++std::shared_ptr<HostWindow> FindWindow(const std::string &key)
++{
++	const auto found = g_windows.find(key);
++	return found == g_windows.end() ? nullptr : found->second;
++}
++
++bool FocusOpenWindow(const std::string &key)
++{
++	const std::shared_ptr<HostWindow> window = FindWindow(key);
++	if (!window || !window->Live())
++		return false;
++	window->BringToFront();
++	return true;
++}
++
++/* ── the pages, on the main thread and only where they can be hosted ────── */
++
++FailureFn Defaulted(FailureFn failed)
++{
++	if (!failed)
++		failed = [](const std::string &reason) { (void)reason; };
++	return failed;
++}
++
++void ReportFailure(const FailureFn &failed, const std::string &reason)
++{
++	if (failed)
++		failed(reason);
++}
++
++void OpenLoginWindow(const FailureFn &failed)
++{
++	std::string reason;
++	if (!Available(&reason)) {
++		ReportFailure(failed, reason);
++		return;
++	}
++	if (FocusOpenWindow("login"))
++		return;
++	const std::shared_ptr<HostWindow> window = std::make_shared<LoginWindow>(failed);
++	RegisterWindow("login", window);
++	window->Start();
++}
++
++void OpenCoverWindow(const FailureFn &failed)
++{
++	std::string reason;
++	if (!Available(&reason)) {
++		ReportFailure(failed, reason);
++		return;
++	}
++	if (FocusOpenWindow("cover"))
++		return;
++
++	/* BilibiliPages.cover (BilibiliPageWindow.swift:421-426). */
++	PageOptions options;
++	options.key = "cover";
++	options.url = kCoverUrl;
++	options.title = L"直播间封面";
++	options.loading = L"正在载入哔哩哔哩封面管理…";
++	options.ready = L"封面修改后可能需要哔哩哔哩审核";
++	options.width = 1080;
++	options.height = 680;
++	options.cover_host = true;
++	options.on_close = []() { EmitEvent("coverWindowClosed"); };
++
++	const std::shared_ptr<HostWindow> window = std::make_shared<PageWindow>(std::move(options));
++	RegisterWindow("cover", window);
++	window->Start();
++}
++
++void OpenFaceAuthWindow(const std::string &voucher, const FailureFn &failed)
++{
++	std::string reason;
++	if (!Available(&reason)) {
++		ReportFailure(failed, reason);
++		return;
++	}
++	if (FocusOpenWindow("faceAuth"))
++		return;
++
++	/* BilibiliPages.faceAuth (:401-417). */
++	PageOptions options;
++	options.key = "faceAuth";
++	options.url = FaceAuthUrl(voucher);
++	options.title = L"哔哩哔哩开播身份验证";
++	options.loading = L"正在载入哔哩哔哩官方验证页面…";
++	options.ready = L"请按页面提示完成验证，然后点击「验证完成，重试开播」";
++	options.confirm = L"验证完成，重试开播";
++	options.width = 560;
++	options.height = 640;
++	options.close_confirms = true;
++	options.on_confirm = []() { EmitEvent("faceAuthRetry"); };
++	/* The page closes itself when verification ends, and that means "retry
++	 * Go live" (pageClose: .confirm, :415-417). */
++
++	const std::shared_ptr<HostWindow> window = std::make_shared<PageWindow>(std::move(options));
++	RegisterWindow("faceAuth", window);
++	window->Start();
++}
++
++/* Runs `task` on the main thread; `failed` hears when there is no main thread
++ * to run it on. */
++void OnMain(const std::function<void()> &task, const FailureFn &failed)
++{
++	if (dispatch::OnMainThread()) {
++		task();
++		return;
++	}
++	if (!dispatch::Post(task))
++		ReportFailure(failed, "the main thread is not available");
++}
++
++} // namespace
++
++/* ── the interface webview.h declares ───────────────────────────────────── */
++
++bool Available(std::string *reason)
++{
++	static const std::string missing = "the WebView2 Evergreen Runtime is not installed on this machine";
++	static const bool present = []() {
++		LPWSTR version = nullptr;
++		const HRESULT status = GetAvailableCoreWebView2BrowserVersionString(nullptr, &version);
++		const bool found = SUCCEEDED(status) && version != nullptr && *version != L'\0';
++		if (version)
++			CoTaskMemFree(version);
++		return found;
++	}();
++	if (!present && reason)
++		*reason = missing;
++	return present;
++}
++
++void OpenLogin(FailureFn failed)
++{
++	FailureFn report = Defaulted(std::move(failed));
++	OnMain([report]() { OpenLoginWindow(report); }, report);
++}
++
++void OpenCoverPage(FailureFn failed)
++{
++	FailureFn report = Defaulted(std::move(failed));
++	OnMain([report]() { OpenCoverWindow(report); }, report);
++}
++
++void OpenFaceAuth(const std::string &voucher, FailureFn failed)
++{
++	FailureFn report = Defaulted(std::move(failed));
++	OnMain([voucher, report]() { OpenFaceAuthWindow(voucher, report); }, report);
++}
++
++void EvaluatePage(const std::string &key, const std::string &script, PageResultFn done)
++{
++	if (!done)
++		return;
++	if (!dispatch::OnMainThread()) {
++		/* The automation vendor waits for `done` on its own thread
++		 * (automation.cpp:371-385), so posting is how a caller that is not on
++		 * the main thread still gets its answer there. */
++		if (!dispatch::Post([key, script, done]() { EvaluatePage(key, script, done); }))
++			done("{\"error\":\"the main thread is not available\"}");
++		return;
++	}
++	const std::shared_ptr<HostWindow> window = FindWindow(key);
++	if (!window) {
++		/* BilibiliPageWindow.page_eval (BilibiliPageWindow.swift:559-566). */
++		done("{\"error\":\"page not open\"}");
++		return;
++	}
++	window->Evaluate(script, done);
++}
++
++bool ClickPage(const std::string &key, double x, double y)
++{
++	/* This hook answers synchronously and injects OS input rather than
++	 * touching COM, so a call from anywhere but the main thread reports "not
++	 * clicked" instead of queueing a click the caller can no longer see. */
++	if (!dispatch::OnMainThread())
++		return false;
++	const std::shared_ptr<HostWindow> window = FindWindow(key);
++	if (!window)
++		return false; /* BilibiliPageWindow.swift:573 */
++	return window->Click(x, y);
++}
++
++} // namespace web
++} // namespace livehime
+diff --git a/plugins/livehime/core/win/web/webview.h b/plugins/livehime/core/win/web/webview.h
+new file mode 100644
+index 0000000..467a5dd
+--- /dev/null
++++ b/plugins/livehime/core/win/web/webview.h
+@@ -0,0 +1,73 @@
++/* WebView2 host for the three Bilibili pages the core shows.
++ *
++ * Replaces the three WKWebView hosts of the macOS core:
++ *   WebLoginWindow.swift    the official password / SMS login page
++ *   BilibiliPageWindow.swift the cover manager and the pre-live face
++ *                           verification page
++ *
++ * The pages are Bilibili's own; this module supplies what a browser host has
++ * to supply: the two JS shims the mini-login page expects, the cookie store,
++ * the window/COM plumbing, and the diagnostics the Windows build is verified
++ * through (CONTRACT §9).
++ *
++ * Threading. WebView2 is COM and apartment-threaded ("must run on a Single
++ * Threaded Apartments thread ... All callbacks occur on that thread", Edge's
++ * threading model). Every function here marshals to the OBS main thread — the
++ * UI thread, which libobs already put in an STA before plugins load
++ * (libobs/obs-windows.c:1232-1240) and the thread the C interface promises its
++ * callbacks on (CONTRACT §2) — with dispatch::Post, and creates the
++ * environment, the controller and every other COM object there. Nothing here
++ * touches COM from a worker thread.
++ *
++ * The Evergreen Runtime is a machine-wide component, not something the plugin
++ * bundles (core/win/web/sdk/README.md); Available() answers whether this
++ * machine has it before an entry point promises anything. */
++
++#pragma once
++
++#include <functional>
++#include <string>
++
++namespace livehime {
++namespace web {
++
++/* Reports why a page host could not be created. The entry point appends the
++ * reason to its own honest failure message; `reason` is diagnostic text (the
++ * missing runtime, an HRESULT), never anything the page supplied. */
++using FailureFn = std::function<void(const std::string &reason)>;
++
++/* True when this machine has the WebView2 Evergreen Runtime; the answer is
++ * cached for the process lifetime, because it is a machine component and not
++ * something a running OBS can acquire.
++ *
++ * The probe is the loader's own synchronous runtime check
++ * (GetAvailableCoreWebView2BrowserVersionString). CreateCoreWebView2EnvironmentWithOptions
++ * cannot be used for this test: it is asynchronous and its completion only runs
++ * from this thread's message loop, so waiting for it inside an entry point
++ * would deadlock the UI thread. A runtime that is present but fails to produce
++ * an environment is reported by the Open*() functions through their failure
++ * callback, with the HRESULT, so no window is ever pretended open. When this
++ * returns false, `reason` (when given) says why. */
++bool Available(std::string *reason = nullptr);
++
++/* livehime_core_start_web_login: the official password / SMS page. On success
++ * the login is persisted and verified exactly like a QR login. */
++void OpenLogin(FailureFn failed);
++
++/* livehime_core_open_cover_page / livehime_core_open_face_auth. Both need a
++ * signed-in account: like the Swift's `guard let credentials` they do nothing
++ * at all when there is no login to seed the page with. The face-auth page
++ * emits {"event":"faceAuthRetry"} when the user confirms; the cover manager
++ * emits {"event":"coverWindowClosed"} when it closes. */
++void OpenCoverPage(FailureFn failed);
++void OpenFaceAuth(const std::string &voucher, FailureFn failed);
++
++/* livehime_core_page_eval / livehime_core_page_click, the automation hooks.
++ * The keys are the Swift's: "cover", "faceAuth". `done` runs on the main
++ * thread with the JSON of the script's return value, or {"error":...}. */
++using PageResultFn = std::function<void(const std::string &json)>;
++void EvaluatePage(const std::string &key, const std::string &script, PageResultFn done);
++bool ClickPage(const std::string &key, double x, double y);
++
++} // namespace web
++} // namespace livehime
+-- 
+2.54.0 (Apple Git-157)
+

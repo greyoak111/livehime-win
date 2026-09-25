@@ -1,7 +1,8 @@
-From 2588d14139db01d5e45800e0656e1ec9cb25f946 Mon Sep 17 00:00:00 2001
+From 97d53d3fe6e3811ac8f6e1534c2773c9347ddaa4 Mon Sep 17 00:00:00 2001
 From: greyoak111 <greyoak111@users.noreply.github.com>
 Date: Fri, 25 Sep 2026 23:41:06 +0800
-Subject: [PATCH 3/3] Fix the two compile errors the first Windows build found
+Subject: [PATCH 03/18] Fix the two compile errors the first Windows build
+ found
 
 plugins/livehime/src/update-page.cpp included CoreFoundation/CoreFoundation.h
 unconditionally; UpdatePage::currentVersion() read CFBundleShortVersionString
@@ -16,6 +17,8 @@ from C4005 into C2220. Both that file and window-native.cpp now guard the
 macros.
 
 version.lib is linked for GetFileVersionInfoW/VerQueryValueW.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
  plugins/livehime/CMakeLists.txt        |  7 ++--
  plugins/livehime/src/update-page.cpp   | 55 ++++++++++++++++++++++++++

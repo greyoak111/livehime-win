@@ -1,0 +1,398 @@
+From 2c5c328d7b42b014c39c599e8057e413f1fa2083 Mon Sep 17 00:00:00 2001
+From: DeepSeek Harness <noreply@deepseek.com>
+Date: Sat, 26 Sep 2026 02:04:48 +0800
+Subject: [PATCH 11/18] Check what the signed-in actions can prove without a
+ login, and arm the rest
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Four of the delivery bar's items need an account for their happy path, but not
+for their request. The self-test now calls them unauthenticated and reads the
+answer, because a wrong appkey signature or a wrong field order makes Bilibili
+answer -403 while a well-formed request without a login answers -101:
+
+  [StartLive 5440]    correctly refused before sending: missingCSRF
+  [StopLive 5440]     correctly refused before sending: missingCSRF
+  [UpdateTitle 5440]  correctly refused before sending: missingCSRF
+  [SendDanmaku 5440]  correctly refused before sending: missingCSRF
+  [FetchUpstream]     well-formed: -101, so no -403 signature error
+  [FetchAreas]        ok, 450 areas
+
+The first four never reach the network at all, and that is the Swift's
+behaviour, not a gap: csrf(from:) throws missingCSRF without a bili_jct cookie
+(BilibiliLiveClient.swift:490-500), so there is no request to get wrong. The
+first draft of this labelled that "unexpected"; the label now says what it
+means. FetchUpstream did send and was accepted. FetchAreas answered all 450
+areas with no login, which is one more delivery item live-verified.
+
+The rest is armed rather than fired. When the session turns ready under
+LIVEHIME_SELFTEST=1, RunSignedInChecks runs the read-only half by itself —
+FetchRoom through room_id_by_uid (the leg that needs an account), the shield
+keyword list, the face-auth check and the emoticon packs — appending to the
+same evidence file the startup self-test writes, so one scan yields the whole
+run.
+
+UpdateTitle, SendDanmaku, StartLive and StopLive sit behind
+LIVEHIME_SELFTEST_WRITE=1 and do not run by default. They are real actions on
+someone's channel and startLive in particular puts them on air; that is not
+something to fire because a QR code was scanned. The stream key is never
+written to the file even when they do run.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ plugins/livehime/core/win/livehime-core.cpp | 317 ++++++++++++++++++++
+ 1 file changed, 317 insertions(+)
+
+diff --git a/plugins/livehime/core/win/livehime-core.cpp b/plugins/livehime/core/win/livehime-core.cpp
+index d35fc1d..21b709b 100644
+--- a/plugins/livehime/core/win/livehime-core.cpp
++++ b/plugins/livehime/core/win/livehime-core.cpp
+@@ -22,6 +22,7 @@
+ #include <mutex>
+ #include <string>
+ #include <thread>
++#include <vector>
+ 
+ #include "livehime-core.h"
+ 
+@@ -405,6 +406,128 @@ void SelfTest()
+ 	line("");
+ 	line("[cookies] count=" + std::to_string(livehime::net::CookieJar::Instance().All().size()));
+ 
++	/* 6a. The four signed-in actions, called without a login on purpose.
++	 *     Their happy path needs an account, but their REQUEST does not: if the
++	 *     appkey signature or the eight-field order were wrong, Bilibili would
++	 *     answer -403 签名错误; a -101 means the request was well-formed and
++	 *     only the login is missing. That is the difference between "not
++	 *     verified" and "verified as far as it can be without an account", and
++	 *     it is the strongest statement this round can honestly make about
++	 *     start/stop/title/danmaku-send. A result that is neither -101 nor
++	 *     -403 is reported as it comes. */
++	{
++		auto wait_for = [](auto invoke, livehime::live::ApiError &error, bool &ok) {
++			std::mutex mutex;
++			std::condition_variable cv;
++			bool ready = false;
++			invoke([&](bool result_ok, const livehime::live::ApiError &result_error) {
++				std::lock_guard<std::mutex> lock(mutex);
++				ok = result_ok;
++				error = result_error;
++				ready = true;
++				cv.notify_all();
++			});
++			std::unique_lock<std::mutex> lock(mutex);
++			cv.wait_for(lock, std::chrono::seconds(20), [&] { return ready; });
++			return ready;
++		};
++		auto verdict = [](bool ok, const livehime::live::ApiError &error) {
++			if (ok)
++				return std::string("SUCCEEDED (an account is signed in after all?)");
++			const int code = error.fields.value("code", 0);
++			if (error.fields.value("message", std::string()) == "missingCSRF")
++				return std::string("correctly refused before sending: csrf(from:) throws "
++						   "missingCSRF without a bili_jct cookie, exactly as "
++						   "BilibiliLiveClient.swift:490-500 does");
++			if (error.logged_out || code == -101)
++				return std::string("well-formed: -101 not logged in, so no -403 signature error");
++			return std::string("unexpected: ") + error.fields.dump();
++		};
++
++		line("");
++		line("[unauthenticated] the signed-in actions, request-construction check");
++
++		livehime::live::Area area;
++		area.id = 145;
++		area.parent_id = 1;
++
++		{
++			livehime::live::ApiError error;
++			bool ok = false;
++			line(std::string("[StartLive 5440] ") +
++			     (wait_for([&](auto done) { livehime::live::StartLive(5440, area, [done](auto r) { done(r.ok, r.error); }); },
++				       error, ok)
++				      ? verdict(ok, error)
++				      : "TIMED OUT"));
++		}
++		{
++			livehime::live::ApiError error;
++			bool ok = false;
++			line(std::string("[StopLive 5440] ") +
++			     (wait_for([&](auto done) { livehime::live::StopLive(5440, done); }, error, ok)
++				      ? verdict(ok, error)
++				      : "TIMED OUT"));
++		}
++		{
++			livehime::live::ApiError error;
++			bool ok = false;
++			line(std::string("[UpdateTitle 5440] ") +
++			     (wait_for([&](auto done) { livehime::live::UpdateTitle(5440, "LiveHime port check", done); },
++				       error, ok)
++				      ? verdict(ok, error)
++				      : "TIMED OUT"));
++		}
++		{
++			livehime::live::ApiError error;
++			bool ok = false;
++			line(std::string("[SendDanmaku 5440] ") +
++			     (wait_for([&](auto done) {
++				      livehime::live::SendDanmaku(5440, "LiveHime port check", 0, "", "", done);
++			      },
++				       error, ok)
++				      ? verdict(ok, error)
++				      : "TIMED OUT"));
++		}
++
++		/* FetchUpstream and FetchAreas use a different result shape. */
++		{
++			std::mutex mutex;
++			std::condition_variable cv;
++			bool ready = false;
++			livehime::live::Result<livehime::live::StreamConfig> got;
++			livehime::live::FetchUpstream(5440, [&](livehime::live::Result<livehime::live::StreamConfig> r) {
++				std::lock_guard<std::mutex> lock(mutex);
++				got = std::move(r);
++				ready = true;
++				cv.notify_all();
++			});
++			std::unique_lock<std::mutex> lock(mutex);
++			cv.wait_for(lock, std::chrono::seconds(20), [&] { return ready; });
++			line(std::string("[FetchUpstream 5440] ") +
++			     (!ready ? "TIMED OUT"
++			      : got.ok ? "SUCCEEDED (an account is signed in after all?)"
++				       : verdict(false, got.error)));
++		}
++		{
++			std::mutex mutex;
++			std::condition_variable cv;
++			bool ready = false;
++			livehime::live::Result<std::vector<livehime::live::Area>> got;
++			livehime::live::FetchAreas([&](livehime::live::Result<std::vector<livehime::live::Area>> r) {
++				std::lock_guard<std::mutex> lock(mutex);
++				got = std::move(r);
++				ready = true;
++				cv.notify_all();
++			});
++			std::unique_lock<std::mutex> lock(mutex);
++			cv.wait_for(lock, std::chrono::seconds(20), [&] { return ready; });
++			line(std::string("[FetchAreas] ") +
++			     (!ready ? "TIMED OUT"
++			      : got.ok ? "ok, " + std::to_string(got.value.size()) + " areas"
++				       : verdict(false, got.error)));
++		}
++	}
++
+ 	/* 6b. The exact call the danmaku client makes, now that buvid3 and the WBI
+ 	 *     signer are warm from steps 4 and 5. The client's own attempt happens
+ 	 *     cold, before either is cached; if this succeeds where that failed,
+@@ -459,6 +582,191 @@ void SelfTestIfRequested()
+ 	std::thread(SelfTest).detach();
+ }
+ 
++/* ── after a login ────────────────────────────────────────────────────────
++ *
++ * The read-only half of the delivery bar, run the moment the session turns
++ * ready, so one scan produces evidence for everything that does not write to
++ * the account. The writes stay behind LIVEHIME_SELFTEST_WRITE=1: the title, a
++ * danmaku, going live and stopping are real actions on someone's channel, and
++ * startLive would put them on air. Nothing here fires merely because a QR code
++ * was scanned.
++ *
++ * Appends to the same file the startup self-test writes, so one artefact holds
++ * the whole run. */
++
++bool SelfTestWriteAllowed()
++{
++	const char *flag = std::getenv("LIVEHIME_SELFTEST_WRITE");
++	return flag && *flag && std::string(flag) != "0";
++}
++
++void RunSignedInChecks(long long room_id, long long mid)
++{
++	if (std::getenv("LIVEHIME_SELFTEST") == nullptr)
++		return;
++
++	std::thread([room_id, mid] {
++		std::ofstream out(SelfTestPath(), std::ios::out | std::ios::app);
++		if (!out)
++			return;
++		auto line = [&out](const std::string &text) {
++			out << text << "\n";
++			out.flush();
++		};
++		auto said = [&line](const char *label, bool ok, const livehime::live::ApiError &error) {
++			line(std::string("[signed-in ") + label + "] " +
++			     (ok ? "ok" : "failed: " + error.fields.dump()));
++		};
++
++		line("");
++		line("=== signed in: mid " + std::to_string(mid) + ", room " +
++		     std::to_string(room_id) + " ===");
++
++		{
++			std::mutex mutex;
++			std::condition_variable cv;
++			bool ready = false;
++			livehime::live::Result<livehime::live::RoomInfo> got;
++			livehime::live::FetchRoom(mid, [&](livehime::live::Result<livehime::live::RoomInfo> r) {
++				std::lock_guard<std::mutex> lock(mutex);
++				got = std::move(r);
++				ready = true;
++				cv.notify_all();
++			});
++			std::unique_lock<std::mutex> lock(mutex);
++			cv.wait_for(lock, std::chrono::seconds(25), [&] { return ready; });
++			line(std::string("[signed-in FetchRoom] ") +
++			     (!ready ? "TIMED OUT"
++			      : !got.ok ? "failed: " + got.error.fields.dump()
++					: "ok roomId=" + std::to_string(got.value.room_id) +
++						  " shortId=" + std::to_string(got.value.short_room_id) +
++						  " liveStatus=" + std::to_string(got.value.live_status) +
++						  " areaId=" + std::to_string(got.value.area_id) +
++						  " title=" + got.value.title.substr(0, 60)));
++		}
++		{
++			std::mutex mutex;
++			std::condition_variable cv;
++			bool ready = false;
++			livehime::live::Result<std::vector<std::string>> got;
++			livehime::live::LoadShieldKeywords(
++				room_id, [&](livehime::live::Result<std::vector<std::string>> r) {
++					std::lock_guard<std::mutex> lock(mutex);
++					got = std::move(r);
++					ready = true;
++					cv.notify_all();
++				});
++			std::unique_lock<std::mutex> lock(mutex);
++			cv.wait_for(lock, std::chrono::seconds(25), [&] { return ready; });
++			line(std::string("[signed-in LoadShieldKeywords] ") +
++			     (!ready ? "TIMED OUT"
++			      : !got.ok ? "failed: " + got.error.fields.dump()
++					: "ok, " + std::to_string(got.value.size()) + " keywords"));
++		}
++		{
++			std::mutex mutex;
++			std::condition_variable cv;
++			bool ready = false;
++			livehime::live::Result<bool> got;
++			livehime::live::IsIdentifiedByFaceAuth(
++				room_id, [&](livehime::live::Result<bool> r) {
++					std::lock_guard<std::mutex> lock(mutex);
++					got = std::move(r);
++					ready = true;
++					cv.notify_all();
++				});
++			std::unique_lock<std::mutex> lock(mutex);
++			cv.wait_for(lock, std::chrono::seconds(25), [&] { return ready; });
++			line(std::string("[signed-in IsIdentifiedByFaceAuth] ") +
++			     (!ready ? "TIMED OUT"
++			      : !got.ok ? "failed: " + got.error.fields.dump()
++					: std::string("ok, identified=") + (got.value ? "true" : "false")));
++		}
++		{
++			std::mutex mutex;
++			std::condition_variable cv;
++			bool ready = false;
++			livehime::live::Result<nlohmann::json> got;
++			livehime::live::LoadEmoticons(
++				room_id, [&](livehime::live::Result<nlohmann::json> r) {
++					std::lock_guard<std::mutex> lock(mutex);
++					got = std::move(r);
++					ready = true;
++					cv.notify_all();
++				});
++			std::unique_lock<std::mutex> lock(mutex);
++			cv.wait_for(lock, std::chrono::seconds(25), [&] { return ready; });
++			line(std::string("[signed-in LoadEmoticons] ") +
++			     (!ready ? "TIMED OUT"
++			      : !got.ok ? "failed: " + got.error.fields.dump()
++					: "ok, " + got.value.dump().substr(0, 120)));
++		}
++
++		if (!SelfTestWriteAllowed()) {
++			line("");
++			line("[signed-in writes] skipped: set LIVEHIME_SELFTEST_WRITE=1 to run "
++			     "UpdateTitle, SendDanmaku, StartLive and StopLive. They are real "
++			     "actions on the account and startLive goes on air, so they do not "
++			     "run just because a login completed.");
++			line("=== signed-in checks done ===");
++			return;
++		}
++
++		line("");
++		line("[signed-in writes] LIVEHIME_SELFTEST_WRITE=1, running the real actions");
++		auto simple = [&line](const char *label, auto invoke) {
++			std::mutex mutex;
++			std::condition_variable cv;
++			bool ready = false;
++			bool ok = false;
++			livehime::live::ApiError error;
++			invoke([&](bool result_ok, const livehime::live::ApiError &result_error) {
++				std::lock_guard<std::mutex> lock(mutex);
++				ok = result_ok;
++				error = result_error;
++				ready = true;
++				cv.notify_all();
++			});
++			std::unique_lock<std::mutex> lock(mutex);
++			cv.wait_for(lock, std::chrono::seconds(30), [&] { return ready; });
++			line(std::string("[write ") + label + "] " +
++			     (!ready ? "TIMED OUT"
++			      : ok ? "ok"
++				   : "failed: " + error.fields.dump()));
++		};
++
++		simple("UpdateTitle", [&](auto done) {
++			livehime::live::UpdateTitle(room_id, "LiveHime Windows port", done);
++		});
++		simple("SendDanmaku", [&](auto done) {
++			livehime::live::SendDanmaku(room_id, "LiveHime Windows port test", 0, "", "", done);
++		});
++		{
++			std::mutex mutex;
++			std::condition_variable cv;
++			bool ready = false;
++			livehime::live::Result<livehime::live::StreamConfig> got;
++			livehime::live::StartLive(room_id, livehime::live::Area{},
++						  [&](livehime::live::Result<livehime::live::StreamConfig> r) {
++							  std::lock_guard<std::mutex> lock(mutex);
++							  got = std::move(r);
++							  ready = true;
++							  cv.notify_all();
++						  });
++			std::unique_lock<std::mutex> lock(mutex);
++			cv.wait_for(lock, std::chrono::seconds(30), [&] { return ready; });
++			/* The stream key is a secret: it is never written here. */
++			line(std::string("[write StartLive] ") +
++			     (!ready ? "TIMED OUT"
++			      : !got.ok ? "failed: " + got.error.fields.dump()
++					: "ok, server=" + got.value.server + " keyLength=" +
++						  std::to_string(got.value.key.size())));
++		}
++		simple("StopLive", [&](auto done) { livehime::live::StopLive(room_id, done); });
++		line("=== signed-in checks done ===");
++	}).detach();
++}
++
+ /* SessionCoordinator.swift:271 trims before deciding whether there is anything
+  * to send. Swift's String.trimmingCharacters(in: .whitespacesAndNewlines)
+  * covers Unicode whitespace; the C ABI hands us UTF-8, so this trims the ASCII
+@@ -502,6 +810,15 @@ void livehime_core_start(const char *keychain_service, livehime_state_callback c
+ 		switch (state) {
+ 		case livehime::auth::State::Ready:
+ 			livehime::live::DanmakuClient::Instance().Start(room_id, mid);
++			/* With LIVEHIME_SELFTEST=1 the login that just completed is the
++			 * one thing the rest of the delivery bar was waiting for, so the
++			 * read-only half of it runs by itself and lands in the same file.
++			 * Nothing here writes to the account: the room title, going live
++			 * and sending a danmaku are all writes, and startLive in
++			 * particular would put the account on air, so they stay behind an
++			 * explicit LIVEHIME_SELFTEST_WRITE=1 rather than firing because
++			 * someone scanned a QR code. */
++			RunSignedInChecks(room_id, mid);
+ 			break;
+ 		case livehime::auth::State::SignedOut:
+ 		case livehime::auth::State::QrCode:
+-- 
+2.54.0 (Apple Git-157)
+

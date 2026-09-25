@@ -1,0 +1,5273 @@
+From 10c6c6b1e23524fc8f2279b90aa5667c22907f9f Mon Sep 17 00:00:00 2001
+From: DeepSeek Harness <noreply@deepseek.com>
+Date: Sat, 26 Sep 2026 01:11:45 +0800
+Subject: [PATCH 06/18] Implement the Windows core: session, live API, danmaku,
+ QR login
+
+Replaces the stub's 35 {"event":"unsupported"} answers with the real thing,
+ported from core/Sources/LiveHimeCore. The Qt UI shell is unchanged and was
+already complete; this is the layer it was calling into.
+
+  auth/session      the SessionState machine and its seven notices
+  auth/qrlogin      generate/poll, the 1500 ms sleep-then-poll, three codes
+  live/liveclient   nav, room fallback chain, areas, start/stop, title,
+                    danmaku servers, emoticons, moderation
+  live/danmaku      WinHTTP WebSocket, the 16-byte header, zlib bodies,
+                    heartbeat, backoff, all thirteen room event kinds
+  core/qr           qrcodegen (MIT) plus a zlib PNG writer for the login code
+
+The foundation from the previous commit carries it: WinHTTP under net/, BCrypt
+under net/crypto, the WBI and pc_link signers, and Credential Manager.
+
+Deliberate deviations, each with the reason in the code: danmaku negotiates
+protover 2 because brotli is in neither Windows nor obs-deps (version 3 is a
+named failure, never a silent drop); the WebSocket read accumulates across
+fragments where URLSession handed over whole messages; the credential store
+falls back to a DPAPI file above Credential Manager's 2560-byte cap.
+
+A self-test runs with LIVEHIME_SELFTEST=1 and writes what it observed to
+%LOCALAPPDATA%\LiveHime\selftest.txt, because a Windows core otherwise has no
+way to prove its network stack without a human driving the dock. Verified in
+the VM against the real Bilibili: nav answers 200/-101 with the WBI keys
+present, qrcode/generate answers 200/0 with a scannable URL, and driving
+StartQrLogin() puts a rendered QR code in the dock.
+
+Known, and not hidden: the dock's QR page is wider than the 404 px the dock is
+given on Windows, so the code is clipped; brotli, WebView2 (web login, cover,
+face auth), captions and the update checker are still pending.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ docs/port-spec/CONTRACT.md                    |   39 +-
+ plugins/livehime/CMakeLists.txt               |    2 +
+ plugins/livehime/core/win/auth/qrlogin.cpp    |  467 ++++
+ plugins/livehime/core/win/auth/qrlogin.h      |   72 +
+ plugins/livehime/core/win/auth/session.cpp    |  840 ++++++++
+ plugins/livehime/core/win/auth/session.h      |   25 +
+ plugins/livehime/core/win/core/qr/qr_png.cpp  |   15 +-
+ plugins/livehime/core/win/live/danmaku.cpp    | 1388 ++++++++++++
+ plugins/livehime/core/win/live/danmaku.h      |    8 +
+ plugins/livehime/core/win/live/liveclient.cpp | 1889 +++++++++++++++++
+ plugins/livehime/core/win/livehime-core.cpp   |  227 +-
+ 11 files changed, 4950 insertions(+), 22 deletions(-)
+ create mode 100644 plugins/livehime/core/win/auth/qrlogin.cpp
+ create mode 100644 plugins/livehime/core/win/auth/qrlogin.h
+ create mode 100644 plugins/livehime/core/win/auth/session.cpp
+ create mode 100644 plugins/livehime/core/win/live/danmaku.cpp
+ create mode 100644 plugins/livehime/core/win/live/liveclient.cpp
+
+diff --git a/docs/port-spec/CONTRACT.md b/docs/port-spec/CONTRACT.md
+index 3526d8d..21e7d29 100644
+--- a/docs/port-spec/CONTRACT.md
++++ b/docs/port-spec/CONTRACT.md
+@@ -250,19 +250,54 @@ OBS started pushing; only Bilibili's own answer counts.
+ ```
+ core/win/
+   livehime-core.cpp          the 35 extern "C" entry points (replaces the stub)
++  core/emit.{h,cpp}          JSON with sorted keys, matching JSONSerialization
++  core/qr/                   qrcodegen (vendored, MIT) + a zlib PNG writer
+   platform/dispatch.{h,cpp}  main-thread marshalling
+   net/http.{h,cpp}           WinHTTP
+   net/cookies.{h,cpp}        cookie jar
+   net/crypto.{h,cpp}         BCrypt hashing
+   net/signing.{h,cpp}        WBI + pc_link
+-  auth/credentials.{h,cpp}   Credential Manager
++  auth/credentials.{h,cpp}   Credential Manager, with a DPAPI file overflow
+   auth/session.{h,cpp}       SessionState machine + notices
+   auth/qrlogin.{h,cpp}       QR generate/poll
+   live/liveclient.{h,cpp}    nav, room, areas, start/stop, title, upstream
+   live/danmaku.{h,cpp}       WinHTTP WebSocket + protocol
+-  web/webview.{h,cpp}        WebView2 host (login, cover, face auth)
+ ```
+ 
++### 8.1 Deliberate deviations from the Swift
++
++Each of these is a conscious difference, not an oversight. They are listed here
++so a later reader can find them without diffing two languages.
++
++| What | Swift | Windows | Why |
++|---|---|---|---|
++| danmaku `protover` | `3` (brotli) | `2` (zlib) | Neither Windows nor obs-deps ships brotli; the server honours the requested version and the Swift decoder already implements 2. Flipping back to 3 is a one-line change once brotli is vendored. |
++| WS read buffering | drops a packet split across reads | accumulates across reads | `WinHttpWebSocketReceive` returns fragments where `URLSession` returned whole messages. Buffering is strictly more correct; complete packets behave identically. |
++| credential storage | Keychain item | Credential Manager, DPAPI file when the blob exceeds 2560 bytes | Credential Manager has `CRED_MAX_CREDENTIAL_BLOB_SIZE`; a Bilibili session is not length-bounded. |
++| login QR image | CoreImage | qrcodegen + a zlib PNG writer | No Windows equivalent. Same parameters (ECC M, 4-module quiet zone, whole-number scale off 480); the module pattern may differ because the two pick masks independently, but both scan. |
++| `User-Agent` | `Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) … Safari/605.1.15` | same string | Faithful port: the whole login flow was validated against Bilibili with this UA. It is one named constant; switching to a Windows UA is a single edit, but doing so unverified would be a behaviour change, not a port. |
++
++### 8.2 Deferred: the web view
++
++`start_web_login`, `open_cover_page`, `open_face_auth`, `open_face_auth_qr`,
++`page_eval` and `page_click` need WebView2. The Evergreen Runtime is already
++present on the target VM (154.0.4258.37) but the **SDK is not vendored**: it is
++a ~10k-line `WebView2.h` plus a loader library, and it serves the secondary
++paths only — QR login, which is the primary one, does not touch it.
++
++Until then those six entry points emit an honest `failed` state or an
++`{"error": …}` page result naming the missing web view. They do not claim
++success.
++
++The spec for when it lands is `session-and-login.md` §3: the page is
++`https://live.bilibili.com/p/html/live-pc-blink/mini-login-v2`; the host must
++inject a `window.biliBridgePc.callNative` shim forwarding
++`auth/setRefreshToken` and `auth/setCookies`, because a shim that only
++implements `livehime_login.LoginSuccess` makes the page take its web fallback
++branch (established from the official client's `miniLogin.umd.min.js`, see
++`artifacts/current/bililive-web-host-bridge.md`).
++
++
+ ## 9. Verification bar
+ 
+ A change is only "done" when the Windows VM shows it:
+diff --git a/plugins/livehime/CMakeLists.txt b/plugins/livehime/CMakeLists.txt
+index ce147e5..6bb42f8 100644
+--- a/plugins/livehime/CMakeLists.txt
++++ b/plugins/livehime/CMakeLists.txt
+@@ -127,6 +127,8 @@ elseif(WIN32)
+     core/win/auth/credentials.h
+     core/win/auth/session.cpp
+     core/win/auth/session.h
++    core/win/auth/qrlogin.cpp
++    core/win/auth/qrlogin.h
+     core/win/live/liveclient.cpp
+     core/win/live/liveclient.h
+     core/win/live/danmaku.cpp
+diff --git a/plugins/livehime/core/win/auth/qrlogin.cpp b/plugins/livehime/core/win/auth/qrlogin.cpp
+new file mode 100644
+index 0000000..e093b95
+--- /dev/null
++++ b/plugins/livehime/core/win/auth/qrlogin.cpp
+@@ -0,0 +1,467 @@
++/* QR login requests — the C++ counterpart of QRLogin.swift (the requests half).
++ *
++ * The Swift used an ephemeral URLSession with cookies disabled (QR:57,127-133)
++ * and read the login cookies by hand off the poll response: the Set-Cookie
++ * headers first, then the query items of the cross-domain `url` in the body as
++ * a fallback (QR:88-99). This does the same over net::Send, and hands the
++ * cookies back as a Credentials value instead of touching a cookie store.
++ *
++ * Note for the caller: net/http.h applies the process cookie jar to every
++ * request and there is no opt-out in its interface, so these two calls carry
++ * whatever the jar holds. session.cpp clears the jar before starting a QR
++ * round, which is what makes them cookie-less in practice, as the Swift's were
++ * (session-and-login.md §3.2 "no shared cookie jar").
++ *
++ * Every callback runs on the main thread via net::Send, exactly once. */
++
++#include "qrlogin.h"
++
++#include "../net/http.h"
++
++#include <nlohmann/json.hpp>
++
++#include <cctype>
++#include <map>
++#include <string>
++#include <vector>
++
++namespace livehime {
++namespace auth {
++namespace {
++
++using nlohmann::json;
++
++/* QRLogin.swift:47-51. */
++constexpr const char *kGenerateUrl = "https://passport.bilibili.com/x/passport-login/web/qrcode/generate";
++constexpr const char *kPollUrl = "https://passport.bilibili.com/x/passport-login/web/qrcode/poll";
++constexpr const char *kSource = "live_pc";
++constexpr const char *kReferer = "https://live.bilibili.com/";
++/* QRLogin.swift:134 BilibiliWeb.userAgent, sent verbatim: the passport
++ * endpoints see the same client the macOS build is. CONTRACT §8.1 records this
++ * as the deliberate port decision — the whole login flow was validated against
++ * Bilibili with this UA. */
++constexpr const char *kUserAgent =
++	"Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15";
++/* QRLogin.swift:109 request.timeoutInterval = 12. */
++constexpr int kTimeoutMs = 12000;
++
++/* QRLogin.swift:8 keptCookies. */
++constexpr const char *kKeptCookies[] = {"SESSDATA", "bili_jct", "DedeUserID", "DedeUserID__ckMd5", "sid", "buvid3"};
++
++bool IsKeptCookie(const std::string &name)
++{
++	for (const char *kept : kKeptCookies) {
++		if (name == kept)
++			return true;
++	}
++	return false;
++}
++
++bool HasCookie(const std::map<std::string, std::string> &cookies, const char *name)
++{
++	return cookies.find(name) != cookies.end();
++}
++
++std::string Trim(const std::string &text)
++{
++	const size_t begin = text.find_first_not_of(" \t\r\n");
++	if (begin == std::string::npos)
++		return {};
++	const size_t end = text.find_last_not_of(" \t\r\n");
++	return text.substr(begin, end - begin + 1);
++}
++
++int HexDigit(char c)
++{
++	if (c >= '0' && c <= '9')
++		return c - '0';
++	if (c >= 'a' && c <= 'f')
++		return c - 'a' + 10;
++	if (c >= 'A' && c <= 'F')
++		return c - 'A' + 10;
++	return -1;
++}
++
++std::string LowerAscii(const std::string &text)
++{
++	std::string out = text;
++	for (char &c : out)
++		c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
++	return out;
++}
++
++/* True when `text` starts a fresh "name=value" pair, which is what makes a
++ * comma in a Set-Cookie line a cookie boundary. "Expires=Wed, 21 Oct …" does
++ * not: its comma is followed by " 21 Oct …", and a name that is one of the
++ * cookie attributes never starts a cookie either — the reading
++ * HTTPCookie.cookies(withResponseHeaderFields:) gave the Swift (QR:91). */
++bool StartsCookiePair(const std::string &text)
++{
++	const size_t begin = text.find_first_not_of(" \t");
++	if (begin == std::string::npos)
++		return false;
++	const size_t equals = text.find('=', begin);
++	if (equals == std::string::npos)
++		return false;
++
++	const std::string name = LowerAscii(text.substr(begin, equals - begin));
++	if (name.empty())
++		return false;
++	for (const char c : name) {
++		if (!std::isalnum(static_cast<unsigned char>(c)) && c != '_' && c != '-' && c != '.')
++			return false;
++	}
++	for (const char *attribute :
++	     {"expires", "path", "domain", "max-age", "samesite", "secure", "httponly", "comment", "version"}) {
++		if (name == attribute)
++			return false;
++	}
++	return true;
++}
++
++/* URLComponents.queryItems percent-decodes its values (QR:95). A '+' stays a
++ * '+': this is a URL query, not a form body. */
++std::string PercentDecode(const std::string &text)
++{
++	std::string out;
++	out.reserve(text.size());
++	for (size_t i = 0; i < text.size(); ++i) {
++		if (text[i] == '%' && i + 2 < text.size()) {
++			const int high = HexDigit(text[i + 1]);
++			const int low = HexDigit(text[i + 2]);
++			if (high >= 0 && low >= 0) {
++				out += static_cast<char>((high << 4) | low);
++				i += 2;
++				continue;
++			}
++		}
++		out += text[i];
++	}
++	return out;
++}
++
++/* ── error shapes ───────────────────────────────────────────────────────── */
++
++/* CONTRACT §4.3. session.cpp reads `kind` to choose the SessionNotice:
++ * "network" is a network failure, everything else a server one — the Swift's
++ * notice(for:) (SC:423-435) only distinguished those two plus missingRoom and
++ * a rejected login. */
++
++live::ApiError NetworkFailure(const std::string &message)
++{
++	live::ApiError error;
++	error.fields = json{{"kind", "network"}, {"message", message}};
++	error.logged_out = false;
++	return error;
++}
++
++live::ApiError ServerFailure(const std::string &message)
++{
++	live::ApiError error;
++	error.fields = json{{"kind", "server"}, {"message", message}};
++	error.logged_out = false;
++	return error;
++}
++
++live::ApiError HttpFailure(long status)
++{
++	live::ApiError error;
++	error.fields = json{{"kind", "http"}, {"code", status}};
++	error.logged_out = false;
++	return error;
++}
++
++live::ApiError ApiFailure(int code, const std::string &message)
++{
++	live::ApiError error;
++	error.fields = json{{"kind", "api"}, {"code", code}, {"message", message}};
++	error.logged_out = false;
++	return error;
++}
++
++/* ── response reading ───────────────────────────────────────────────────── */
++
++std::string TextField(const json &object, const char *key)
++{
++	const auto field = object.find(key);
++	if (field == object.end() || !field->is_string())
++		return {};
++	return field->get<std::string>();
++}
++
++/* QRLogin.swift:105-121 `get`, the whole ladder: transport, HTTP status, JSON
++ * envelope, then the envelope's own `code`. */
++bool ReadRoot(const net::Response &response, json &root, live::ApiError &error)
++{
++	if (response.status == 0 || !response.error.empty()) {
++		error = NetworkFailure(response.error.empty() ? "no response" : response.error);
++		return false;
++	}
++	if (!response.Ok()) {
++		error = HttpFailure(response.status);
++		return false;
++	}
++
++	/* allow_exceptions = false: malformed JSON is a discarded value, which is
++	 * the Swift's `try? JSONSerialization` branch. */
++	root = json::parse(response.body, nullptr, false);
++	if (root.is_discarded() || !root.is_object()) {
++		error = ServerFailure("invalidResponse");
++		return false;
++	}
++	const auto code = root.find("code");
++	if (code == root.end() || !code->is_number()) {
++		error = ServerFailure("invalidResponse");
++		return false;
++	}
++	const int value = code->get<int>();
++	if (value != 0) {
++		error = ApiFailure(value, TextField(root, "message"));
++		return false;
++	}
++	return true;
++}
++
++/* One Set-Cookie line per '\n' (net/http joins repeats that way); within a line
++ * only a comma that starts a new pair separates cookies, so neither the comma
++ * in "Expires=Wed, 21 Oct …" nor one inside a value ends the cookie. The value
++ * is kept verbatim: cookies are opaque bytes. */
++void AbsorbSetCookies(const std::string &header, std::map<std::string, std::string> &cookies)
++{
++	size_t line_start = 0;
++	for (;;) {
++		const size_t eol = header.find('\n', line_start);
++		const std::string line =
++			header.substr(line_start, eol == std::string::npos ? std::string::npos : eol - line_start);
++		if (!line.empty()) {
++			std::vector<std::string> fragments;
++			std::string fragment;
++			for (const char c : line) {
++				if (c == ',') {
++					fragments.push_back(fragment);
++					fragment.clear();
++				} else {
++					fragment += c;
++				}
++			}
++			fragments.push_back(fragment);
++
++			std::vector<std::string> cookies_on_line;
++			for (const auto &part : fragments) {
++				if (!cookies_on_line.empty() && !StartsCookiePair(part))
++					cookies_on_line.back() += "," + part;
++				else
++					cookies_on_line.push_back(part);
++			}
++			for (const auto &cookie : cookies_on_line) {
++				const size_t semi = cookie.find(';');
++				const std::string pair =
++					semi == std::string::npos ? cookie : cookie.substr(0, semi);
++				const size_t equals = pair.find('=');
++				if (equals == std::string::npos)
++					continue;
++				const std::string name = Trim(pair.substr(0, equals));
++				if (!name.empty())
++					cookies[name] = Trim(pair.substr(equals + 1));
++			}
++		}
++		if (eol == std::string::npos)
++			return;
++		line_start = eol + 1;
++	}
++}
++
++/* The body's cross-domain url repeats the cookies as query items; a name the
++ * headers already carried wins (QR:95-99). */
++void AbsorbCrossDomain(const std::string &url, std::map<std::string, std::string> &cookies)
++{
++	const size_t question = url.find('?');
++	if (question == std::string::npos)
++		return;
++
++	const std::string query = url.substr(question + 1);
++	size_t start = 0;
++	for (;;) {
++		const size_t amp = query.find('&', start);
++		const std::string pair = query.substr(start, amp == std::string::npos ? std::string::npos : amp - start);
++		const size_t equals = pair.find('=');
++		if (equals != std::string::npos) {
++			const std::string name = PercentDecode(pair.substr(0, equals));
++			const std::string value = PercentDecode(pair.substr(equals + 1));
++			if (!name.empty() && cookies.find(name) == cookies.end())
++				cookies[name] = value;
++		}
++		if (amp == std::string::npos)
++			return;
++		start = amp + 1;
++	}
++}
++
++/* QRLogin.swift:88-103: collect, keep the six names, require the three. */
++bool CredentialsFrom(const json &data, const net::Response &response, Credentials &out, live::ApiError &error)
++{
++	std::map<std::string, std::string> cookies;
++	AbsorbSetCookies(response.Header("set-cookie"), cookies);
++
++	const std::string cross_domain = TextField(data, "url");
++	if (!cross_domain.empty())
++		AbsorbCrossDomain(cross_domain, cookies);
++
++	Credentials credentials;
++	for (const auto &cookie : cookies) {
++		/* QRLogin.swift:15 — only keptCookies survive, and an empty value is
++		 * not a cookie. */
++		if (!cookie.second.empty() && IsKeptCookie(cookie.first))
++			credentials.cookies[cookie.first] = cookie.second;
++	}
++	credentials.refresh_token = TextField(data, "refresh_token");
++
++	if (!credentials.Complete()) {
++		error = ServerFailure("incompleteCredentials");
++		return false;
++	}
++	out = credentials;
++	return true;
++}
++
++net::Request QrRequest(const std::string &url)
++{
++	net::Request request;
++	request.method = "GET";
++	request.url = url;
++	request.headers["Referer"] = kReferer;
++	request.headers["User-Agent"] = kUserAgent;
++	request.timeout_ms = kTimeoutMs;
++	return request;
++}
++
++} // namespace
++
++bool Credentials::Complete() const
++{
++	return HasCookie(cookies, "SESSDATA") && HasCookie(cookies, "bili_jct") && HasCookie(cookies, "DedeUserID");
++}
++
++long long Credentials::Mid() const
++{
++	const auto cookie = cookies.find("DedeUserID");
++	if (cookie == cookies.end())
++		return 0;
++	try {
++		return std::stoll(cookie->second);
++	} catch (...) {
++		/* Not a number: the Swift's `Int64.init` returned nil. */
++		return 0;
++	}
++}
++
++std::string Credentials::Csrf() const
++{
++	const auto cookie = cookies.find("bili_jct");
++	return cookie == cookies.end() ? std::string() : cookie->second;
++}
++
++std::string Credentials::CookieHeader() const
++{
++	std::string header;
++	for (const auto &cookie : cookies) {
++		if (cookie.second.empty())
++			continue;
++		if (!header.empty())
++			header += "; ";
++		header += cookie.first + "=" + cookie.second;
++	}
++	return header;
++}
++
++void GenerateQr(QrGenerateFn done)
++{
++	net::Send(QrRequest(std::string(kGenerateUrl) + "?source=" + kSource), [done](net::Response response) {
++		if (!done)
++			return;
++
++		json root;
++		live::ApiError error;
++		if (!ReadRoot(response, root, error)) {
++			done(false, std::string(), std::string(), error);
++			return;
++		}
++
++		/* QRLogin.swift:63-65: both fields must be present and non-empty. */
++		const auto data = root.find("data");
++		if (data == root.end() || !data->is_object()) {
++			done(false, std::string(), std::string(), ServerFailure("invalidResponse"));
++			return;
++		}
++		const std::string url = TextField(*data, "url");
++		const std::string key = TextField(*data, "qrcode_key");
++		if (url.empty() || key.empty()) {
++			done(false, std::string(), std::string(), ServerFailure("invalidResponse"));
++			return;
++		}
++		done(true, url, key, live::ApiError{});
++	});
++}
++
++void PollQr(const std::string &key, QrPollFn done)
++{
++	const std::string url = std::string(kPollUrl) + "?qrcode_key=" + net::UrlEncode(key) + "&source=" + kSource;
++	net::Send(QrRequest(url), [done](net::Response response) {
++		if (!done)
++			return;
++
++		QrPollResult result;
++		json root;
++		if (!ReadRoot(response, root, result.error)) {
++			result.kind = QrPoll::Failed;
++			done(result);
++			return;
++		}
++
++		/* QRLogin.swift:74-82. */
++		const auto data = root.find("data");
++		if (data == root.end() || !data->is_object()) {
++			result.kind = QrPoll::Failed;
++			result.error = ServerFailure("invalidResponse");
++			done(result);
++			return;
++		}
++		const auto code = data->find("code");
++		if (code == data->end() || !code->is_number()) {
++			result.kind = QrPoll::Failed;
++			result.error = ServerFailure("invalidResponse");
++			done(result);
++			return;
++		}
++
++		const int value = code->get<int>();
++		switch (value) {
++		case 86101:
++			result.kind = QrPoll::WaitingForScan;
++			break;
++		case 86090:
++			result.kind = QrPoll::Scanned;
++			break;
++		case 86038:
++			result.kind = QrPoll::Expired;
++			break;
++		case 0:
++			/* The poll's own message is not read on success; the cookies are
++			 * the answer (QR:81). */
++			if (CredentialsFrom(*data, response, result.credentials, result.error)) {
++				result.kind = QrPoll::Succeeded;
++			} else {
++				result.kind = QrPoll::Failed;
++			}
++			break;
++		default:
++			result.kind = QrPoll::Failed;
++			result.error = ApiFailure(value, TextField(*data, "message"));
++			break;
++		}
++		done(result);
++	});
++}
++
++} // namespace auth
++} // namespace livehime
+diff --git a/plugins/livehime/core/win/auth/qrlogin.h b/plugins/livehime/core/win/auth/qrlogin.h
+new file mode 100644
+index 0000000..03c9573
+--- /dev/null
++++ b/plugins/livehime/core/win/auth/qrlogin.h
+@@ -0,0 +1,72 @@
++/* QR login — the C++ counterpart of QRLogin.swift.
++ *
++ * QRLogin.swift holds two things: the two passport requests (generate/poll)
++ * and SessionCredentials, the cookie set they produce. Both live here, because
++ * session.cpp is the only caller and the state machine that owns the polling
++ * cadence, the regeneration count and the expiry notice stays there — exactly
++ * as SessionCoordinator.swift owns it on macOS. */
++
++#pragma once
++
++#include <functional>
++#include <map>
++#include <string>
++
++#include "live/liveclient.h"
++
++namespace livehime {
++namespace auth {
++
++/* QRLogin.swift:6-27. The cookie map iterates name-ascending, which is the
++ * order `cookieHeader` produces by sorting (QR:24-26); only the six names in
++ * keptCookies (QR:8) get in, because the constructor filters them (QR:15), and
++ * an empty value counts as absent. Values are secrets: never log this. */
++struct Credentials {
++	std::map<std::string, std::string> cookies;
++	std::string refresh_token;
++	/* Unix seconds. SessionCredentials.savedAt (QR:13) is never read back by
++	 * either platform; session.cpp stamps it when the blob is written. */
++	long long saved_at = 0;
++
++	/* QRLogin.swift:20 — SESSDATA, bili_jct and DedeUserID are all required. */
++	bool Complete() const;
++	/* QRLogin.swift:21-22. `Mid`/`Csrf`/`CookieHeader` are the rest of the
++	 * SessionCredentials surface the macOS tests pin (QR:24-26,
++	 * SessionCoordinatorTests.swift:131); on Windows the wire path is the
++	 * process cookie jar, which session.cpp fills from this map. */
++	long long Mid() const;
++	std::string Csrf() const;
++	/* "DedeUserID=…; SESSDATA=…; bili_jct=…" (QR:24-26). */
++	std::string CookieHeader() const;
++};
++
++/* QRLogin.swift:29-34, plus the failure arm the Swift modelled as the separate
++ * QRLoginError enum (QR:36-42). */
++enum class QrPoll {
++	WaitingForScan, /* data.code 86101 */
++	Scanned,        /* 86090 */
++	Expired,        /* 86038 */
++	Succeeded,      /* 0 */
++	Failed,         /* invalidResponse / api / incompleteCredentials / network / http */
++};
++
++struct QrPollResult {
++	QrPoll kind = QrPoll::WaitingForScan;
++	Credentials credentials; /* Succeeded only */
++	live::ApiError error;    /* Failed only, already shaped like CONTRACT §4.3 */
++};
++
++/* `ok` is false when no code could be obtained; `url` is what the QR image
++ * encodes and `key` is what the poll needs. */
++using QrGenerateFn =
++	std::function<void(bool ok, const std::string &url, const std::string &key, const live::ApiError &error)>;
++using QrPollFn = std::function<void(const QrPollResult &result)>;
++
++/* GET /x/passport-login/web/qrcode/generate?source=live_pc (QRLogin.swift:61-67). */
++void GenerateQr(QrGenerateFn done);
++/* GET /x/passport-login/web/qrcode/poll?qrcode_key=<key>&source=live_pc
++ * (QRLogin.swift:69-84). */
++void PollQr(const std::string &key, QrPollFn done);
++
++} // namespace auth
++} // namespace livehime
+diff --git a/plugins/livehime/core/win/auth/session.cpp b/plugins/livehime/core/win/auth/session.cpp
+new file mode 100644
+index 0000000..349bddd
+--- /dev/null
++++ b/plugins/livehime/core/win/auth/session.cpp
+@@ -0,0 +1,840 @@
++/* Login state machine — the C++ counterpart of SessionCoordinator.swift.
++ *
++ * Two rules from the Swift shape everything below.
++ *
++ *  - Only an explicit "not logged in" from Bilibili returns to signedOut
++ *    (SC:21-25): identity answering -101, or `isLogin` false. Every other
++ *    problem — transport, HTTP status, a missing room — stays in `failed` with
++ *    the stored login kept, so an outage never throws the user back to the
++ *    login screen (SC:405-414).
++ *  - Every continuation carries a generation token instead of the Swift's
++ *    cancelled Task. Stop(), a new QR round, sign-out and MarkSignedOut all
++ *    retire the token; a continuation whose token is stale returns without
++ *    touching the state, which is the `guard !Task.isCancelled` the Swift
++ *    scattered through qrLogin/verify (SC:353, 365-369, 389, 401, 406).
++ *
++ * All of it runs on the main thread: the entry points by contract (CONTRACT
++ * §2), the continuations because net::Send and the poll tick come back through
++ * dispatch::Post. The generation is therefore plain state, not an atomic. */
++
++#include "session.h"
++
++#include "credentials.h"
++#include "qrlogin.h"
++
++#include "../core/emit.h"
++#include "../core/qr/qr_png.h"
++#include "../net/cookies.h"
++#include "../platform/dispatch.h"
++
++#include <windows.h>
++
++#include <ctime>
++#include <functional>
++#include <memory>
++#include <mutex>
++#include <string>
++#include <utility>
++
++namespace livehime {
++namespace auth {
++namespace {
++
++using nlohmann::json;
++
++/* ── constants read out of the Swift ────────────────────────────────────── */
++
++/* SessionCoordinator.swift:86-87 defaults: one poll every 1.5 s, and at most
++ * two automatic regenerations — so the third expiry gives up (SC:375-378,
++ * pinned by SessionCoordinatorTests.swift:134-141). */
++constexpr int kPollIntervalMs = 1500;
++constexpr int kMaxAutoRefresh = 2;
++
++/* Bilibili's login cookies belong to the whole domain, and CONTRACT §7 expects
++ * them on api.bilibili.com, api.live.bilibili.com and passport alike. The jar
++ * strips the leading dot and matches subdomains (net/cookies.cpp:196-210). */
++constexpr const char *kCookieDomain = ".bilibili.com";
++
++/* CredentialStore.swift:26 CredentialEnvelope.currentVersion. */
++constexpr int kEnvelopeVersion = 2;
++
++constexpr const char *kSaveFailedDetail = "the Windows credential store refused to save the login";
++constexpr const char *kRemoveFailedDetail = "the Windows credential store refused to remove the login";
++
++/* Core Foundation's reference date. Swift's JSONEncoder writes a Date as
++ * seconds since 2001-01-01 by default (session-and-login.md §5.1); nothing
++ * reads `savedAt` back on either platform, but the persisted number keeps the
++ * shape the macOS build wrote. */
++constexpr long long kReferenceDateUnix = 978307200;
++
++/* ── one delayed main-thread call ───────────────────────────────────────── */
++
++/* The Swift polled with `try await Task.sleep(for: pollInterval)`. Nothing in
++ * the foundation delays a callback, so a one-shot timer-queue timer does, and
++ * the callback only posts the tick back to the main thread. At most one tick is
++ * ever outstanding: a flow schedules the next one after the previous one ran,
++ * and Retire() drops the pending one before a new flow starts, so a stopped
++ * round can neither keep polling nor run someone else's tick. */
++std::mutex g_tick_mutex;
++std::unique_ptr<std::function<void()>> g_tick;
++HANDLE g_tick_timer = nullptr;
++
++HANDLE TimerQueue()
++{
++	static HANDLE queue = CreateTimerQueue();
++	return queue;
++}
++
++void CALLBACK TickFired(PVOID, BOOLEAN)
++{
++	std::function<void()> tick;
++	{
++		std::lock_guard<std::mutex> lock(g_tick_mutex);
++		g_tick_timer = nullptr; /* one-shot: the handle is spent either way */
++		if (!g_tick)
++			return;
++		tick = std::move(*g_tick);
++		g_tick.reset();
++	}
++	dispatch::Post([tick]() { tick(); });
++}
++
++void ScheduleTick(unsigned milliseconds, std::function<void()> tick)
++{
++	{
++		std::lock_guard<std::mutex> lock(g_tick_mutex);
++		g_tick = std::make_unique<std::function<void()>>(std::move(tick));
++	}
++
++	HANDLE timer = nullptr;
++	if (!CreateTimerQueueTimer(&timer, TimerQueue(), &TickFired, nullptr, milliseconds, 0, WT_EXECUTEONLYONCE)) {
++		std::lock_guard<std::mutex> lock(g_tick_mutex);
++		g_tick.reset();
++		return;
++	}
++
++	/* Remember the handle only while the tick is still ours: a very short
++	 * interval could have fired between the two locks, and then the handle is
++	 * already spent. */
++	std::lock_guard<std::mutex> lock(g_tick_mutex);
++	if (g_tick)
++		g_tick_timer = timer;
++}
++
++void CancelTick()
++{
++	HANDLE timer = nullptr;
++	{
++		std::lock_guard<std::mutex> lock(g_tick_mutex);
++		g_tick.reset();
++		timer = g_tick_timer;
++		g_tick_timer = nullptr;
++	}
++	/* A tick that already left the queue frees itself in TickFired; this only
++	 * stops one that has not run yet. Deleting an already-fired handle fails
++	 * harmlessly. */
++	if (timer)
++		DeleteTimerQueueTimer(TimerQueue(), timer, INVALID_HANDLE_VALUE);
++}
++
++/* ── state ──────────────────────────────────────────────────────────────── */
++
++/* Bumped by every entry point that changes what should happen next. A
++ * continuation whose token no longer matches returns without touching the
++ * state, which is the Swift's `guard !Task.isCancelled`. */
++unsigned g_generation = 0;
++
++/* Retires the running continuations, and the poll tick still waiting on the
++ * timer queue with them. */
++unsigned Retire()
++{
++	CancelTick();
++	return ++g_generation;
++}
++
++/* What the last emitted {"state": …} was, so a repeat is dropped the way the
++ * Swift's `didSet { if state != oldValue }` dropped it (SC:65-67). `known`
++ * starts false, which is what lets CBridge's unconditional first publish
++ * (CB:156) come out even though the state is already signedOut. */
++enum class Phase { SignedOut, QrCode, Verifying, Ready, Failed };
++
++Phase g_phase = Phase::SignedOut;
++Notice g_notice = Notice::None;
++std::string g_detail;
++bool g_known = false;
++
++/* The fields of the last `ready` object, for the same comparison. */
++long long g_ready_mid = 0;
++std::string g_ready_username;
++live::RoomInfo g_ready_room;
++
++/* SessionCoordinator.credentials: in-memory only. The credential blob is the
++ * durable copy, and it is never logged. */
++Credentials g_credentials;
++bool g_persist_ok = false;
++
++/* The QR code being polled, and how many times it has been replaced. */
++std::string g_qr_url;
++std::string g_qr_key;
++int g_qr_refreshes = 0;
++
++/* What the last qrCode object said, so `scanned` is reported once per code
++ * (SC:373-374 assigns the same state again; the didSet drops it). */
++std::string g_qr_published_url;
++bool g_qr_published_scanned = false;
++
++/* ── the credential blob ────────────────────────────────────────────────── */
++
++/* CredentialStore.swift:25-35: a versioned envelope around SessionCredentials.
++ * The field names are that type's Codable names, so a blob written here reads
++ * like the one macOS wrote. The blob is a secret: it is never logged, and only
++ * a save failure is reported. */
++std::string EncodeBlob(const Credentials &credentials)
++{
++	json cookies = json::object();
++	for (const auto &cookie : credentials.cookies)
++		cookies[cookie.first] = cookie.second;
++
++	const json stored{{"cookies", cookies},
++			  {"refreshToken", credentials.refresh_token},
++			  {"savedAt", credentials.saved_at}};
++	return json{{"schemaVersion", kEnvelopeVersion}, {"credentials", stored}}.dump();
++}
++
++enum class StoredKind { None, Current, Legacy };
++
++struct StoredSession {
++	StoredKind kind = StoredKind::None;
++	Credentials credentials;
++};
++
++/* CredentialStore.swift:37-51 decodeStoredCredentials, with one difference the
++ * platform forces: the legacy branch's WebKit cookie import does not exist on
++ * Windows, so a legacy record can only reach the "needs login" outcome. Its
++ * `type`/`sessdata` split is therefore not decoded. */
++StoredSession DecodeBlob(const std::string &blob)
++{
++	StoredSession stored;
++
++	const json root = json::parse(blob, nullptr, false);
++	if (root.is_discarded() || !root.is_object())
++		return stored; /* unknown data is signed out, not a crash (CS:48-50) */
++
++	const auto version = root.find("schemaVersion");
++	const auto credentials = root.find("credentials");
++	if (version != root.end() && version->is_number_integer() && version->get<int>() == kEnvelopeVersion &&
++	    credentials != root.end() && credentials->is_object()) {
++		stored.kind = StoredKind::Current;
++		const auto cookies = credentials->find("cookies");
++		if (cookies != credentials->end() && cookies->is_object()) {
++			for (auto cookie = cookies->begin(); cookie != cookies->end(); ++cookie) {
++				if (cookie.value().is_string())
++					stored.credentials.cookies[cookie.key()] = cookie.value().get<std::string>();
++			}
++		}
++		const auto token = credentials->find("refreshToken");
++		if (token != credentials->end() && token->is_string())
++			stored.credentials.refresh_token = token->get<std::string>();
++		const auto saved_at = credentials->find("savedAt");
++		if (saved_at != credentials->end() && saved_at->is_number())
++			stored.credentials.saved_at = static_cast<long long>(saved_at->get<double>());
++		return stored;
++	}
++
++	/* CredentialStore.swift:43-46: v0.1.2's {"type":…,"refreshToken":…}, where
++	 * a non-empty refreshToken is what makes it a login. */
++	const auto legacy = root.find("refreshToken");
++	if (legacy != root.end() && legacy->is_string() && !legacy->get<std::string>().empty()) {
++		stored.kind = StoredKind::Legacy;
++		stored.credentials.refresh_token = legacy->get<std::string>();
++	}
++	return stored;
++}
++
++/* CredentialStore::Load cannot tell "nothing stored" from "the read failed"
++ * (its interface returns one bool), so both arrive here as StoredKind::None.
++ * The Swift could distinguish them and reported a failed read as
++ * failed(keychain) (SC:340-342). */
++StoredSession LoadStoredSession()
++{
++	std::string blob;
++	if (!CredentialStore::Instance().Load(blob) || blob.empty())
++		return StoredSession{};
++	return DecodeBlob(blob);
++}
++
++/* ── error mapping ──────────────────────────────────────────────────────── */
++
++/* SessionCoordinator.notice(for:) (SC:423-435). The Swift's transport/network
++ * cases are the only ones that are not "server"; a rejected login is handled
++ * before this is ever consulted. */
++Notice NoticeFor(const live::ApiError &error)
++{
++	const std::string kind = error.Kind();
++	if (kind == "noLiveRoom")
++		return Notice::NoLiveRoom;
++	if (kind == "network")
++		return Notice::Network;
++	return Notice::Server;
++}
++
++/* The Swift put "\(error)" in `detail`. There is no C++ equivalent of a Swift
++ * error description, and CONTRACT §4.3 guarantees the error fields carry no
++ * cookies or tokens, so the message (or the fields themselves) is the detail. */
++std::string DetailFor(const live::ApiError &error)
++{
++	const auto message = error.fields.find("message");
++	if (message != error.fields.end() && message->is_string() && !message->get<std::string>().empty())
++		return message->get<std::string>();
++	return error.fields.dump();
++}
++
++/* ── cookies ────────────────────────────────────────────────────────────── */
++
++/* A request in the Swift carried exactly SessionCredentials.cookieHeader, so
++ * the jar is replaced rather than added to: without this, a cookie from an
++ * earlier session would ride along with the new one. */
++void ApplyCredentials(const Credentials &credentials)
++{
++	net::CookieJar &jar = net::CookieJar::Instance();
++	jar.Clear();
++	for (const auto &cookie : credentials.cookies)
++		jar.Set(kCookieDomain, cookie.first, cookie.second);
++}
++
++/* The Swift's `credentials = nil` plus `try? store.remove()`: the local login
++ * is gone either way (SC:320-324, SC:407-410). */
++void DropSession()
++{
++	g_credentials = Credentials{};
++	CredentialStore::Instance().Clear();
++	net::CookieJar::Instance().Clear();
++}
++
++/* ── the flow, shared by restore, retry and the QR success path ─────────── */
++
++/* Publish*() is private to Session, so these helpers reach it through the
++ * lambdas Session::Start installs — the counterpart of the CoreBridge that
++ * `livehime_core_start` creates before any other entry point can run
++ * (CB:144-158). Stop() clears them, which is `CoreBridge.shared = nil`. */
++struct Hooks {
++	std::function<void(const std::string &url, bool scanned)> qr;
++	std::function<void()> verifying;
++	std::function<void(long long mid, const std::string &username, const live::RoomInfo &room)> ready;
++	std::function<void(Notice notice, const std::string &detail)> failed;
++	std::function<void(Notice notice)> signed_out;
++	/* SC:380-381 saves before verifying; false means failed(keychain) is out. */
++	std::function<bool(const Credentials &credentials)> persist;
++};
++
++Hooks g_hooks;
++
++/* SessionCoordinator.verify (SC:395-415), shared by all three entry points
++ * that can end up with credentials. */
++void Verify(Credentials saved, unsigned token)
++{
++	/* CONTRACT §7's order: apply cookies, then nav, then the room. */
++	ApplyCredentials(saved);
++	g_credentials = std::move(saved);
++	g_hooks.verifying();
++
++	live::FetchIdentity([token](live::Result<live::Identity> identity) {
++		if (token != g_generation)
++			return;
++		if (!identity.ok) {
++			if (identity.error.logged_out) {
++				DropSession();
++				g_hooks.signed_out(Notice::SessionExpired);
++				return;
++			}
++			g_hooks.failed(NoticeFor(identity.error), DetailFor(identity.error));
++			return;
++		}
++		/* SC:399: `guard identity.isLogin else { throw .notLoggedIn }`. */
++		if (!identity.value.logged_in) {
++			DropSession();
++			g_hooks.signed_out(Notice::SessionExpired);
++			return;
++		}
++		/* BilibiliControlClient.swift:81-85: nav without a positive mid is
++		 * invalidResponse, which the Swift mapped to failed(server) — not to a
++		 * sign-out — and the room lookup must not be attempted with it. */
++		if (identity.value.mid <= 0) {
++			g_hooks.failed(Notice::Server, "invalidResponse: nav reported no mid");
++			return;
++		}
++
++		const long long mid = identity.value.mid;
++		const std::string username = identity.value.username;
++		live::FetchRoom(mid, [token, mid, username](live::Result<live::RoomInfo> room) {
++			if (token != g_generation)
++				return;
++			if (!room.ok) {
++				if (room.error.logged_out) {
++					DropSession();
++					g_hooks.signed_out(Notice::SessionExpired);
++					return;
++				}
++				/* SC:411-413: everything else stays failed with the login
++				 * kept — a missing room included (SC:425-426). */
++				g_hooks.failed(NoticeFor(room.error), DetailFor(room.error));
++				return;
++			}
++			/* SC:402-403: identity AND room are both known before ready. */
++			g_hooks.ready(mid, username, room.value);
++		});
++	});
++}
++
++void RequestQr(unsigned token);
++void PollOnce(unsigned token);
++
++/* SC:366-367: ask for a code, show it, then poll it. */
++void RequestQr(unsigned token)
++{
++	GenerateQr([token](bool ok, const std::string &url, const std::string &key, const live::ApiError &error) {
++		if (token != g_generation)
++			return;
++		if (!ok) {
++			g_hooks.failed(NoticeFor(error), DetailFor(error));
++			return;
++		}
++
++		g_qr_url = url;
++		g_qr_key = key;
++		g_hooks.qr(url, false);
++		ScheduleTick(kPollIntervalMs, [token]() { PollOnce(token); });
++	});
++}
++
++/* SC:368-385: the poll loop. Each answer either keeps waiting, reports the
++ * scan, replaces the code, gives up, or hands the session to verify. */
++void PollOnce(unsigned token)
++{
++	const std::string key = g_qr_key;
++	PollQr(key, [token](const QrPollResult &result) {
++		if (token != g_generation)
++			return;
++
++		switch (result.kind) {
++		case QrPoll::WaitingForScan:
++			/* SC:371-372: nothing to say yet. */
++			break;
++		case QrPoll::Scanned:
++			/* SC:373-374: the same code, now scanned once. PublishQr drops
++			 * the repeat if the server says it again. */
++			g_hooks.qr(g_qr_url, true);
++			break;
++		case QrPoll::Expired:
++			/* SC:375-378: not the first two expiries — replace the code;
++			 * after kMaxAutoRefresh of them, give up with qrExpired. */
++			if (g_qr_refreshes >= kMaxAutoRefresh) {
++				g_hooks.signed_out(Notice::QrExpired);
++				return;
++			}
++			++g_qr_refreshes;
++			RequestQr(token);
++			return;
++		case QrPoll::Succeeded:
++			/* SC:379-383: save first; a refused save is failed(keychain),
++			 * and the login is not verified. */
++			if (!g_hooks.persist(result.credentials))
++				return;
++			Verify(result.credentials, token);
++			return;
++		case QrPoll::Failed:
++			/* SC:387-392: a cancelled flow returned silently; a real error
++			 * is failed with the mapped notice. */
++			g_hooks.failed(NoticeFor(result.error), DetailFor(result.error));
++			return;
++		}
++
++		ScheduleTick(kPollIntervalMs, [token]() { PollOnce(token); });
++	});
++}
++
++/* ── state comparison ───────────────────────────────────────────────────── */
++
++bool SameRoom(const live::RoomInfo &left, const live::RoomInfo &right)
++{
++	return left.room_id == right.room_id && left.short_room_id == right.short_room_id && left.uid == right.uid &&
++	       left.title == right.title && left.live_status == right.live_status && left.area_id == right.area_id;
++}
++
++void Remember(Phase phase, Notice notice, const std::string &detail)
++{
++	g_phase = phase;
++	g_notice = notice;
++	g_detail = detail;
++	g_known = true;
++}
++
++bool SameState(Phase phase, Notice notice, const std::string &detail)
++{
++	return g_known && g_phase == phase && g_notice == notice && g_detail == detail;
++}
++
++} // namespace
++
++const char *StateRaw(State state)
++{
++	switch (state) {
++	case State::SignedOut:
++		return "signedOut";
++	case State::QrCode:
++		return "qrCode";
++	case State::Verifying:
++		return "verifying";
++	case State::Ready:
++		return "ready";
++	case State::Failed:
++		return "failed";
++	}
++	return "failed";
++}
++
++void Session::SetObserver(Observer observer)
++{
++	observer_ = std::move(observer);
++}
++
++void Session::Notify(State state)
++{
++	if (!observer_)
++		return;
++	/* Only ever called from the Publish* functions, which are on the main
++	 * thread and only after the state actually changed, so this is the same
++	 * "the session moved" signal CBridge.swift:40-52 reacts to. */
++	observer_(state, account_.room.room_id, account_.mid);
++}
++
++const char *NoticeRaw(Notice notice)
++{
++	/* SessionCoordinator.swift:10-18, emitted as the raw strings CONTRACT §4.1
++	 * lists. Notice::None is the "no notice" of signedOut(nil), which has no
++	 * failed-state spelling. */
++	switch (notice) {
++	case Notice::SessionExpired:
++		return "sessionExpired";
++	case Notice::LegacyNeedsLogin:
++		return "legacyNeedsLogin";
++	case Notice::QrExpired:
++		return "qrExpired";
++	case Notice::NoLiveRoom:
++		return "noLiveRoom";
++	case Notice::Network:
++		return "network";
++	case Notice::Server:
++		return "server";
++	case Notice::Keychain:
++		return "keychain";
++	case Notice::None:
++		break;
++	}
++	return "";
++}
++
++Session &Session::Instance()
++{
++	static Session session;
++	return session;
++}
++
++void Session::Start(const std::string &credential_service)
++{
++	credential_service_ = credential_service.empty() ? kDefaultService : credential_service;
++	CredentialStore::Instance().SetService(credential_service_);
++
++	Retire();
++	g_credentials = Credentials{};
++	g_qr_url.clear();
++	g_qr_key.clear();
++	g_qr_refreshes = 0;
++	ready_ = false;
++	account_ = Account{};
++	g_known = false; /* CB:156 publishes the initial state unconditionally */
++
++	/* The publish hooks can only be built here: Publish*() is private, and a
++	 * member function's lambda may call it (see the Hooks comment above). */
++	g_hooks = Hooks{};
++	g_hooks.qr = [this](const std::string &url, bool scanned) { PublishQr(url, scanned); };
++	g_hooks.verifying = [this]() { PublishVerifying(); };
++	g_hooks.ready = [this](long long mid, const std::string &username, const live::RoomInfo &room) {
++		account_.mid = mid;
++		account_.username = username;
++		account_.room = room;
++		PublishReady();
++	};
++	g_hooks.failed = [this](Notice notice, const std::string &detail) { PublishFailed(notice, detail); };
++	g_hooks.signed_out = [this](Notice notice) { PublishSignedOut(notice); };
++	g_hooks.persist = [this](const Credentials &credentials) {
++		g_credentials = credentials;
++		g_credentials.saved_at = static_cast<long long>(std::time(nullptr)) - kReferenceDateUnix;
++		PersistSession();
++		return g_persist_ok;
++	};
++
++	/* CB:156-157: publish, then restore. A saved login turns this into
++	 * verifying and then ready or failed; with nothing saved, signedOut is the
++	 * only state the UI ever sees. */
++	PublishSignedOut(Notice::None);
++	RestoreSession();
++}
++
++void Session::Stop()
++{
++	/* CB:163-169 clears the callback before cancelling the poll, so nothing is
++	 * published on the way out; the stored login stays in the vault and the
++	 * next Start restores it. */
++	Retire();
++	g_hooks = Hooks{};
++	g_credentials = Credentials{};
++	g_qr_url.clear();
++	g_qr_key.clear();
++	g_qr_refreshes = 0;
++	ready_ = false;
++	account_ = Account{};
++	g_phase = Phase::SignedOut;
++	g_notice = Notice::None;
++	g_detail.clear();
++	g_known = false;
++	net::CookieJar::Instance().Clear();
++}
++
++void Session::StartQrLogin()
++{
++	/* The Swift's `CoreBridge.shared?.coordinator` guard: no core has been
++	 * started, so there is no bridge to run a flow through. */
++	if (!g_hooks.qr)
++		return;
++
++	/* SC:361-362. The jar goes with the credentials, because our requests read
++	 * cookies from the jar: "credentials = nil" has to mean "no cookies", or
++	 * the QR generate/poll calls would carry an old session's — the Swift's
++	 * QR session sent none at all (QR:57,127-133). */
++	const unsigned token = Retire();
++	g_credentials = Credentials{};
++	net::CookieJar::Instance().Clear();
++	g_qr_refreshes = 0;
++	g_qr_key.clear();
++	RequestQr(token);
++}
++
++void Session::CancelQrLogin()
++{
++	/* SC:116-120: stopping the poll is not a sign-out. Only a QR code on
++	 * screen turns back into signedOut; anything else keeps its state. */
++	Retire();
++	if (g_phase == Phase::QrCode)
++		PublishSignedOut(Notice::None);
++}
++
++void Session::Retry()
++{
++	if (!g_hooks.qr)
++		return;
++
++	const unsigned token = Retire();
++	const StoredSession stored = LoadStoredSession();
++	/* SC:124-132: only the current envelope is re-verified — complete or not,
++	 * which is what `if case .current` matched — and everything else (absent,
++	 * legacy, unreadable) starts a new QR login. */
++	if (stored.kind == StoredKind::Current) {
++		Verify(stored.credentials, token);
++		return;
++	}
++	StartQrLogin();
++}
++
++void Session::SignOut()
++{
++	/* SC:134-154. */
++	Retire();
++	g_credentials = Credentials{};
++	ready_ = false;
++	account_ = Account{};
++	net::CookieJar::Instance().Clear();
++
++	if (!CredentialStore::Instance().Clear()) {
++		PublishFailed(Notice::Keychain, kRemoveFailedDetail);
++		return;
++	}
++	PublishSignedOut(Notice::None);
++
++	/* SC:148-153 also ended the login on Bilibili's side (A10,
++	 * login/exit/v2), best effort. The port has no SessionMaintenance — no
++	 * logout call exists in live/liveclient.h — so the login is removed
++	 * locally and stays valid on Bilibili's side until it expires. That is a
++	 * gap, not a success. */
++}
++
++void Session::RefreshRoom()
++{
++	/* SC:303-308: only a ready account, and a failure leaves the current
++	 * account untouched. */
++	if (!ready_ || g_phase != Phase::Ready)
++		return;
++
++	const unsigned token = g_generation;
++	const long long mid = account_.mid;
++	const long long room_id = account_.room.room_id;
++	live::FetchRoomInfo(room_id, [this, token, mid](live::Result<live::RoomInfo> room) {
++		/* The Swift re-checked the state after the await (SC:306). */
++		if (token != g_generation || !ready_ || account_.mid != mid)
++			return;
++		if (!room.ok)
++			return;
++		account_.room = room.value;
++		PublishReady();
++	});
++}
++
++void Session::MarkSignedOut(Notice notice)
++{
++	/* SC:320-324 (guarded) and SC:407-410 (verify): the live layer saw -101.
++	 * `try? store.remove()` — a failure here does not change the outcome. */
++	Retire();
++	g_credentials = Credentials{};
++	ready_ = false;
++	account_ = Account{};
++	CredentialStore::Instance().Clear();
++	net::CookieJar::Instance().Clear();
++	PublishSignedOut(notice);
++}
++
++void Session::PublishSignedOut(Notice notice)
++{
++	ready_ = false;
++	account_ = Account{};
++
++	if (SameState(Phase::SignedOut, notice, std::string()))
++		return;
++	Remember(Phase::SignedOut, notice, std::string());
++
++	json object{{"state", "signedOut"}};
++	if (notice != Notice::None)
++		object["notice"] = NoticeRaw(notice);
++	Emit(object);
++	Notify(State::SignedOut);
++}
++
++void Session::PublishFailed(Notice notice, const std::string &detail)
++{
++	ready_ = false;
++	account_ = Account{};
++
++	if (SameState(Phase::Failed, notice, detail))
++		return;
++	Remember(Phase::Failed, notice, detail);
++
++	Emit(json{{"state", "failed"}, {"notice", NoticeRaw(notice)}, {"detail", detail}});
++	Notify(State::Failed);
++}
++
++void Session::PublishVerifying()
++{
++	/* SC:396: the account is not available while the login is being checked —
++	 * `readyAccount()` throws notReady for the whole verification. */
++	ready_ = false;
++	account_ = Account{};
++
++	if (SameState(Phase::Verifying, Notice::None, std::string()))
++		return;
++	Remember(Phase::Verifying, Notice::None, std::string());
++
++	Emit(json{{"state", "verifying"}});
++	Notify(State::Verifying);
++}
++
++void Session::PublishReady()
++{
++	ready_ = true;
++	const bool unchanged = SameState(Phase::Ready, Notice::None, std::string()) && g_ready_mid == account_.mid &&
++			       g_ready_username == account_.username && SameRoom(g_ready_room, account_.room);
++	g_ready_mid = account_.mid;
++	g_ready_username = account_.username;
++	g_ready_room = account_.room;
++	Remember(Phase::Ready, Notice::None, std::string());
++
++	if (unchanged)
++		return;
++
++	/* CB:115-123, field for field. */
++	Emit(json{{"state", "ready"},
++		  {"mid", account_.mid},
++		  {"username", account_.username},
++		  {"roomId", account_.room.room_id},
++		  {"shortRoomId", account_.room.short_room_id},
++		  {"title", account_.room.title},
++		  {"liveStatus", account_.room.live_status},
++		  {"areaId", account_.room.area_id}});
++	Notify(State::Ready);
++}
++
++void Session::PublishQr(const std::string &url, bool scanned)
++{
++	ready_ = false;
++	account_ = Account{};
++
++	const bool unchanged =
++		SameState(Phase::QrCode, Notice::None, std::string()) && g_qr_published_url == url &&
++		g_qr_published_scanned == scanned;
++	g_qr_published_url = url;
++	g_qr_published_scanned = scanned;
++	Remember(Phase::QrCode, Notice::None, std::string());
++
++	if (unchanged)
++		return;
++
++	/* CB:109-112. `scanned` is always present; qrPng only when the code
++	 * encoded, because a wrong or empty image is worse than none — the UI
++	 * shows the hint text and the user is not invited to scan a blank. */
++	json object{{"state", "qrCode"}};
++	object["scanned"] = scanned;
++	const std::string png = qr::PngBase64(url);
++	if (!png.empty())
++		object["qrPng"] = png;
++	Emit(object);
++	Notify(State::QrCode);
++}
++
++void Session::PersistSession()
++{
++	/* CredentialStore.swift:83-98 through the opaque blob credentials.h
++	 * describes. A failure is the Swift's CredentialStoreError: the state
++	 * becomes failed(keychain) and the caller stops (SC:380-381). */
++	g_persist_ok = CredentialStore::Instance().Save(EncodeBlob(g_credentials));
++	if (!g_persist_ok)
++		PublishFailed(Notice::Keychain, kSaveFailedDetail);
++}
++
++bool Session::RestoreSession()
++{
++	const unsigned token = g_generation;
++
++	std::string blob;
++	if (!CredentialStore::Instance().Load(blob) || blob.empty())
++		return false; /* .none: the initial signedOut is all the UI hears */
++
++	const StoredSession stored = DecodeBlob(blob);
++	switch (stored.kind) {
++	case StoredKind::None:
++		return false; /* unknown data is treated as signed out (CS:48-50) */
++	case StoredKind::Current:
++		/* SC:347-348. The cookie jar is filled before nav. */
++		Verify(stored.credentials, token);
++		return true;
++	case StoredKind::Legacy:
++		/* SC:349-357: the v0.1.2 record held a refresh token and the rest of
++		 * the login lived in the old app's WebKit cookie store. Windows has
++		 * no such store to import from, so the import yields nothing and the
++		 * Swift's own "migration incomplete" branch is the one that runs. */
++		PublishVerifying();
++		PublishSignedOut(Notice::LegacyNeedsLogin);
++		return true;
++	}
++	return false;
++}
++
++} // namespace auth
++} // namespace livehime
+diff --git a/plugins/livehime/core/win/auth/session.h b/plugins/livehime/core/win/auth/session.h
+index b06ca08..0abbc99 100644
+--- a/plugins/livehime/core/win/auth/session.h
++++ b/plugins/livehime/core/win/auth/session.h
+@@ -7,6 +7,7 @@
+ 
+ #pragma once
+ 
++#include <functional>
+ #include <string>
+ 
+ #include "live/liveclient.h"
+@@ -28,6 +29,18 @@ enum class Notice {
+ 
+ const char *NoticeRaw(Notice notice);
+ 
++/* The five states SessionCoordinator.swift:26-32 defines, by the name the UI
++ * receives. */
++enum class State {
++	SignedOut,
++	QrCode,
++	Verifying,
++	Ready,
++	Failed,
++};
++
++const char *StateRaw(State state);
++
+ struct Account {
+ 	long long mid = 0;
+ 	std::string username;
+@@ -62,6 +75,14 @@ public:
+ 	 * moved back to the login screen for the one case that warrants it. */
+ 	void MarkSignedOut(Notice notice);
+ 
++	/* Invoked on the main thread after every published state, with the room and
++	 * account id when there is one. This is the hook CoreBridge.swift:40-52
++	 * (syncDanmaku) hangs off: the danmaku socket is started when the session
++	 * turns ready and stopped when it leaves. Set once, from
++	 * livehime_core_start. */
++	using Observer = std::function<void(State state, long long room_id, long long mid)>;
++	void SetObserver(Observer observer);
++
+ private:
+ 	Session() = default;
+ 
+@@ -71,12 +92,16 @@ private:
+ 	void PublishReady();
+ 	void PublishQr(const std::string &url, bool scanned);
+ 
++	/* Runs the observer, if any. Called at the end of each Publish*. */
++	void Notify(State state);
++
+ 	void PersistSession();
+ 	bool RestoreSession();
+ 
+ 	bool ready_ = false;
+ 	Account account_;
+ 	std::string credential_service_;
++	Observer observer_;
+ };
+ 
+ } // namespace auth
+diff --git a/plugins/livehime/core/win/core/qr/qr_png.cpp b/plugins/livehime/core/win/core/qr/qr_png.cpp
+index 19ff79e..e82619a 100644
+--- a/plugins/livehime/core/win/core/qr/qr_png.cpp
++++ b/plugins/livehime/core/win/core/qr/qr_png.cpp
+@@ -1,11 +1,12 @@
+ #include "qr_png.h"
+ 
+-#include "../net/crypto.h"
++#include "../../net/crypto.h"
+ #include "qrcodegen.hpp"
+ 
+ #include <zlib.h>
+ 
+ #include <cstring>
++#include <optional>
+ 
+ namespace livehime {
+ namespace qr {
+@@ -46,15 +47,19 @@ std::vector<uint8_t> Png(const std::string &text, int pixels)
+ 	/* qrcodegen signals an over-long payload by throwing (data_too_long, a
+ 	 * std::length_error). A DLL must not let that cross the C ABI, so an
+ 	 * unencodable string is a plain empty result and the caller emits the
+-	 * qrCode state without "qrPng". */
+-	QrCode code;
++	 * qrCode state without "qrPng".
++	 *
++	 * QrCode has no default constructor (qrcodegen.hpp:334), so the object is
++	 * built inside the try rather than assigned to an outer one. */
++	std::optional<QrCode> encoded;
+ 	try {
+-		code = QrCode::encodeText(text.c_str(), QrCode::Ecc::MEDIUM);
++		encoded = QrCode::encodeText(text.c_str(), QrCode::Ecc::MEDIUM);
+ 	} catch (...) {
+ 		return out;
+ 	}
+-	if (code.getSize() <= 0)
++	if (!encoded || encoded->getSize() <= 0)
+ 		return out;
++	const QrCode &code = *encoded;
+ 
+ 	/* PlatformSupport.swift:31-34: four modules of quiet zone on each side, and
+ 	 * a whole-number scale that keeps the result at or under the target. */
+diff --git a/plugins/livehime/core/win/live/danmaku.cpp b/plugins/livehime/core/win/live/danmaku.cpp
+new file mode 100644
+index 0000000..87063b4
+--- /dev/null
++++ b/plugins/livehime/core/win/live/danmaku.cpp
+@@ -0,0 +1,1388 @@
++/* Danmaku WebSocket client for the Windows core — the port of
++ * DanmakuClient.swift + DanmakuProtocol.swift (macOS).
++ *
++ * The wire format is the 16-byte big-endian frame of DanmakuProtocol.swift:23-35
++ * (see EncodePacket for the byte offsets), carried inside WinHTTP WebSocket
++ * messages: wss://<host>:<wss_port>/sub, one auth packet (operation 7), a
++ * heartbeat every 30 s (operation 2) and JSON commands in operation-5 frames.
++ *
++ * Where this file deliberately differs from the Swift, and why:
++ *
++ *   1. `kProtoVersion` — the auth packet asks for protover 2 (zlib) instead of
++ *      the Swift's 3 (brotli). No brotli decoder exists in this tree or in
++ *      obs-deps, so protocol-version-3 containers cannot be decoded; asking for
++ *      zlib keeps the danmaku working and the version-3 path is an explicit,
++ *      named failure. The constant's comment has the full story.
++ *   2. A danmaku frame may straddle WebSocket messages. WinHTTP hands the
++ *      application fragments, so this port keeps a byte accumulator and decodes
++ *      every complete frame, instead of decoding each message on its own and
++ *      silently discarding a truncated tail the way DanmakuProtocol.swift:41-44
++ *      does (docs/port-spec/danmaku-protocol.md §9.3 asks for the accumulator).
++ *   3. A container or frame this build cannot decode produces one
++ *      {"event":"unsupported",...} event naming the cause. The Swift's failure
++ *      path emits nothing at all (DMP:48-53,126), which is a silent feed that
++ *      claims to be connected — the fabricated success CONTRACT §9 forbids.
++ *   4. `room_id_` is the one member danmaku.h declares; the handlers, the
++ *      WinHTTP handles, the worker thread and the receive accumulator are all
++ *      file-local to this translation unit.
++ *
++ * cites: DMC = core/Sources/LiveHimeCore/DanmakuClient.swift,
++ *        DMP = core/Sources/LiveHimeCore/DanmakuProtocol.swift,
++ *        LRA = core/Sources/LiveHimeCore/LiveRoomActions.swift,
++ *        CONTRACT = docs/port-spec/CONTRACT.md,
++ *        docs/port-spec/danmaku-protocol.md = the byte-level protocol spec. */
++
++#include "danmaku.h"
++
++#include "liveclient.h"
++#include "../net/crypto.h"
++#include "../platform/dispatch.h"
++
++#include <windows.h>
++#include <winhttp.h>
++#include <zlib.h>
++
++#include <algorithm>
++#include <atomic>
++#include <charconv>
++#include <chrono>
++#include <condition_variable>
++#include <cstdint>
++#include <cstring>
++#include <map>
++#include <memory>
++#include <mutex>
++#include <string>
++#include <thread>
++#include <utility>
++#include <vector>
++
++namespace livehime {
++namespace live {
++namespace {
++
++using nlohmann::json;
++
++/* danmaku.h nests the handler types in the class, so the file-local helpers
++ * below name them through the class once here. */
++using EventFn = DanmakuClient::EventFn;
++using StatusFn = DanmakuClient::StatusFn;
++
++
++/* ── protocol constants (DanmakuProtocol.swift) ─────────────────────────── */
++
++constexpr std::uint16_t kHeaderLength = 16; /* DMP:23 */
++/* Every packet this client sends carries version 1 (DMP:25). Received versions
++ * are only inspected by the compression branch below (DMP:48). */
++constexpr std::uint16_t kSendProtocolVersion = 1;
++/* The decoder never reads the sequence field (DMP:45-47); 1 is what the Swift
++ * writes (DMP:32). */
++constexpr std::uint32_t kSequence = 1;
++
++constexpr std::uint16_t kVersionZlib = 2;   /* DMP:48-49, RFC1950 body */
++constexpr std::uint16_t kVersionBrotli = 3; /* DMP:49, raw brotli body */
++
++/* The auth packet's protover. DanmakuClient.swift:66 hard-codes 3, and the
++ * server then answers with brotli (protocol version 3) containers. Brotli is
++ * genuinely required for that: the body is a raw brotli stream with no prefix
++ * (docs/port-spec §5.2), there is no brotli decoder anywhere in this tree, in
++ * obs-deps or in Windows itself, and the plugin links none. Rather than send 3
++ * and deliver a feed that can never decode a message, this port asks for
++ * protover 2 — zlib, the long-standing default, whose path below is implemented
++ * in full. A version-3 container that arrives anyway is reported honestly by
++ * Inflate()/ReportFailures(); it is never dropped in silence.
++ *
++ * This is the one deliberate protocol deviation in this file. Once brotli is
++ * vendored and Inflate() gains its version-3 branch, flipping this back to 3 is
++ * the only change the negotiation needs. */
++constexpr int kProtoVersion = 2;
++
++/* DMP:73 — a literal 30 s interval, no jitter. The body is the literal string
++ * "[object Object]" (DMC:72); the frame is 31 bytes. */
++constexpr char kHeartbeatBody[] = "[object Object]";
++constexpr auto kHeartbeatInterval = std::chrono::seconds(30);
++
++/* The receive timeout doubles as this loop's tick. One thread owns the socket
++ * for its whole life and WinHTTP cannot send while a receive is parked, so the
++ * receive has to return regularly for the heartbeat to go out on time: with a
++ * 5 s tick a heartbeat is at most 5 s behind its 30 s deadline and never early.
++ * Between messages a tick means "nothing arrived"; in the middle of a
++ * fragmented message it means the peer stalled, and the session ends the way
++ * any other transport failure does. */
++constexpr auto kReceiveTick = std::chrono::seconds(5);
++
++/* Reconnect backoff (DMC:37,45). The sleep after the first failed session is
++ * 4 s, not 2: the initial value is doubled before it is used
++ * (docs/port-spec §6.2's "2, 4, 8, 16, 30" is the value sequence, the code's
++ * sleeps are 4, 8, 16, 30, 30). */
++constexpr long long kBackoffInitialMs = 2000;
++constexpr long long kBackoffMaxMs = 30000;
++constexpr long long kBackoffResetAfterMs = 60000;
++
++/* Safety net for the wait on FetchDanmakuInfo's main-thread answer; see
++ * FetchConnectInfo. net::Send always answers, so this only fires when there is
++ * no dispatcher to carry the answer at all. */
++constexpr auto kInfoWaitLimit = std::chrono::seconds(30);
++
++/* A container may nest containers (docs/port-spec §5.4). The server nests one
++ * level; the cap only keeps a hostile stream from exhausting the stack. */
++constexpr std::size_t kMaxContainerDepth = 4;
++
++/* BilibiliWeb.userAgent (QRLogin.swift:134) — the string the Swift's upgrade
++ * request sends (DMC:60). Kept verbatim: this is a faithful port, and the
++ * point of the header is to look like the browser session that owns the
++ * cookies, not like the operating system the plugin runs on. */
++constexpr char kBilibiliUserAgent[] =
++	"Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15";
++
++/* Operation codes, complete set in the Swift source (DMP:10-16). */
++enum class Operation : std::uint32_t {
++	Heartbeat = 2,      /* client -> server, every 30 s */
++	HeartbeatReply = 3, /* server -> client, never handled (DMP:12) */
++	Message = 5,        /* server -> client, the only operation with events */
++	Auth = 7,           /* client -> server, once per connection */
++	AuthReply = 8,      /* server -> client, code 0 means accepted */
++};
++
++/* ── shared state ───────────────────────────────────────────────────────── */
++
++/* One connect-and-backoff run, from Start() until Stop(). Stop() cancels it:
++ * `cancelled` keeps a stopped run from reporting a status, and `websocket` is
++ * how Stop() unblocks a receive that is parked inside WinHTTP. File-local on
++ * purpose: danmaku.h keeps only `room_id_`, so WinHTTP's types stay out of every
++ * translation unit that includes it. */
++struct RunToken {
++	std::atomic<bool> cancelled{false};
++
++	/* Guards `websocket`. Stop() calls WinHttpWebSocketClose on the handle to
++	 * wake the receive; the session clears the pointer before it closes the
++	 * handle, so the handle can never be closed twice or used after closing. */
++	std::mutex socket_mutex;
++	HINTERNET websocket = nullptr;
++};
++
++struct ClientState {
++	/* Guards everything below, and is never held while a callback runs:
++	 * dispatch::Post executes inline on the main thread, and a handler is
++	 * allowed to call back into this client. */
++	std::mutex mutex;
++	EventFn on_event;
++	StatusFn on_status;
++	std::shared_ptr<RunToken> run;
++	std::thread worker;
++	/* The last status handed to dispatch::Post; Swift's `didSet` only fires the
++	 * callback when the value changes (DMC:14-16). */
++	DanmakuStatus last_status = DanmakuStatus::Stopped;
++	/* InjectForTest's byte stream: the same accumulator the socket keeps, so a
++	 * test can split a frame across two injections. */
++	std::string test_buffer;
++};
++
++ClientState g_client;
++
++/* ── delivering results on the main thread ──────────────────────────────── */
++
++/* Sends one room event (CONTRACT §4.2) through the client's handler, on the
++ * main thread. The handler is copied under the lock but invoked outside it:
++ * dispatch::Post runs the call inline when the caller is already the main
++ * thread. */
++void PostEvent(const json &event)
++{
++	EventFn handler;
++	{
++		std::lock_guard<std::mutex> lock(g_client.mutex);
++		handler = g_client.on_event;
++	}
++	if (!handler)
++		return;
++	dispatch::Post([handler, event]() { handler(event); });
++}
++
++/* Posts `status` unless the last posted status is already that value, and
++ * unless the run that asked for it has been stopped in the meantime. `token`
++ * is null only for Stop()'s own write, which is final. */
++void PostStatus(DanmakuStatus status, const std::shared_ptr<RunToken> &token)
++{
++	StatusFn handler;
++	{
++		std::lock_guard<std::mutex> lock(g_client.mutex);
++		if (token && token->cancelled.load())
++			return;
++		if (g_client.last_status == status)
++			return;
++		g_client.last_status = status;
++		handler = g_client.on_status;
++	}
++	if (!handler)
++		return;
++	dispatch::Post([handler, status, token]() {
++		/* Checked again at delivery: Stop() may have queued .stopped after
++		 * this one, and the worker's last write must never win. */
++		if (token && token->cancelled.load())
++			return;
++		handler(status);
++	});
++}
++
++/* ── the wire format (DanmakuProtocol.swift:23-57) ──────────────────────── */
++
++std::uint16_t ReadU16(const std::string &data, std::size_t offset)
++{
++	return static_cast<std::uint16_t>((static_cast<std::uint16_t>(static_cast<std::uint8_t>(data[offset])) << 8) |
++					  static_cast<std::uint8_t>(data[offset + 1]));
++}
++
++std::uint32_t ReadU32(const std::string &data, std::size_t offset)
++{
++	return (static_cast<std::uint32_t>(static_cast<std::uint8_t>(data[offset])) << 24) |
++	       (static_cast<std::uint32_t>(static_cast<std::uint8_t>(data[offset + 1])) << 16) |
++	       (static_cast<std::uint32_t>(static_cast<std::uint8_t>(data[offset + 2])) << 8) |
++	       static_cast<std::uint32_t>(static_cast<std::uint8_t>(data[offset + 3]));
++}
++
++void WriteU16(std::string &out, std::size_t offset, std::uint16_t value)
++{
++	out[offset] = static_cast<char>((value >> 8) & 0xFF);
++	out[offset + 1] = static_cast<char>(value & 0xFF);
++}
++
++void WriteU32(std::string &out, std::size_t offset, std::uint32_t value)
++{
++	out[offset] = static_cast<char>((value >> 24) & 0xFF);
++	out[offset + 1] = static_cast<char>((value >> 16) & 0xFF);
++	out[offset + 2] = static_cast<char>((value >> 8) & 0xFF);
++	out[offset + 3] = static_cast<char>(value & 0xFF);
++}
++
++/* One frame: exactly what DanmakuProtocol.swift:25-35 appends, in order. Byte
++ * offsets, all multi-byte fields big-endian:
++ *
++ *	0   4  u32  packet length   = 16 + body size          (DMP:28)
++ *	4   2  u16  header length   = 16                      (DMP:29)
++ *	6   2  u16  protocol version = 1 on send              (DMP:25,30)
++ *	8   4  u32  operation                                  (DMP:31)
++ *	12  4  u32  sequence        = 1                        (DMP:32)
++ *	16  …      body                                        (DMP:33)
++ *
++ * The body length is packet length - header length; there is no checksum and no
++ * magic number. The heartbeat frame this produces is the 31-byte vector of
++ * docs/port-spec §6.1 / §11.3. */
++std::string EncodePacket(Operation operation, const std::string &body, std::uint16_t version = kSendProtocolVersion)
++{
++	std::string frame(kHeaderLength + body.size(), '\0');
++	WriteU32(frame, 0, static_cast<std::uint32_t>(kHeaderLength + body.size()));
++	WriteU16(frame, 4, kHeaderLength);
++	WriteU16(frame, 6, version);
++	WriteU32(frame, 8, static_cast<std::uint32_t>(operation));
++	WriteU32(frame, 12, kSequence);
++	if (!body.empty())
++		std::memcpy(&frame[kHeaderLength], body.data(), body.size());
++	return frame;
++}
++
++/* A decoded frame (DMP:45-47). `version` and `operation` are kept even though
++ * only the compression branch and the event parser read them. */
++struct Frame {
++	std::uint16_t version = 0;
++	std::uint32_t operation = 0;
++	std::string body;
++};
++
++/* Something this build could not decode. `what` names the cause for the
++ * {"event":"unsupported"} report; `detail` is the human-readable sentence. */
++struct DecodeFailure {
++	std::string what;
++	std::string detail;
++};
++
++struct DecodeOutcome {
++	/* Bytes that formed complete frames and may be dropped from the front of
++	 * the caller's buffer. */
++	std::size_t consumed = 0;
++	/* Decoded frames, containers already expanded, in stream order. */
++	std::vector<Frame> frames;
++	/* One entry per container or frame that could not be decoded. */
++	std::vector<DecodeFailure> failures;
++	/* True when the bytes cannot be a frame stream at all (a length field that
++	 * cannot be honoured): the caller must drop the whole buffer, because there
++	 * is no way to find the next boundary. */
++	bool corrupt = false;
++};
++
++/* Protocol version 2: RFC1950 zlib. The body is
++ * [2-byte zlib header][raw DEFLATE][4-byte Adler-32]; the Swift strips the
++ * header and the trailer and runs a raw-deflate decoder (DMP:69-71), so this
++ * does the same and hands inflate() raw DEFLATE via windowBits -15. The
++ * grow-and-retry loop mirrors DMP:74-87: start at max(4096, 8x input), retry
++ * four times larger while the output fills the buffer, stop at 64 MiB. */
++bool InflateZlib(const std::string &body, std::string &inflated, DecodeFailure &failure)
++{
++	failure.what = "danmaku_inflate";
++
++	/* DMP:70 — bodies of six bytes or fewer never inflate. */
++	if (body.size() <= 6) {
++		failure.detail = "zlib container is too short to hold a 2-byte header and a 4-byte Adler-32 (" +
++				 std::to_string(body.size()) + " bytes)";
++		return false;
++	}
++	const std::string input = body.substr(2, body.size() - 6);
++	if (input.size() > 0xFFFFFFFFu) {
++		failure.detail = "zlib container is larger than the inflate window can address";
++		return false;
++	}
++
++	z_stream stream = {};
++	if (inflateInit2(&stream, -15) != Z_OK) {
++		failure.detail = "zlib could not start an inflate stream";
++		return false;
++	}
++
++	const std::size_t ceiling = static_cast<std::size_t>(64) << 20; /* DMP:75 */
++	std::size_t capacity = std::max<std::size_t>(4096, input.size() * 8);
++	bool ok = false;
++	for (;;) {
++		if (capacity > ceiling) {
++			failure.detail = "zlib output exceeded the 64 MiB ceiling";
++			break;
++		}
++		std::string output(capacity, '\0');
++		stream.next_in = reinterpret_cast<Bytef *>(const_cast<char *>(input.data()));
++		stream.avail_in = static_cast<uInt>(input.size());
++		stream.next_out = reinterpret_cast<Bytef *>(&output[0]);
++		stream.avail_out = static_cast<uInt>(capacity);
++
++		const int rc = inflate(&stream, Z_FINISH);
++		const std::size_t written = capacity - stream.avail_out;
++		if (rc == Z_STREAM_END) {
++			inflated.assign(output, 0, written);
++			ok = true;
++			break;
++		}
++		if (rc != Z_OK && rc != Z_BUF_ERROR) {
++			failure.detail = "zlib inflate failed (zlib " + std::to_string(rc) + ")";
++			break;
++		}
++		/* Apple's decode_buffer returns 0 for a stream that produced nothing,
++		 * and DMP:83 turns that into a failure; mirrors it here. */
++		if (written == 0) {
++			failure.detail = "zlib inflate produced no output";
++			break;
++		}
++		/* The output filled the buffer, so it may have been truncated: start
++		 * over with four times the room (DMP:85). */
++		if (inflateReset(&stream) != Z_OK) {
++			failure.detail = "zlib refused to restart the inflate stream";
++			break;
++		}
++		capacity *= 4;
++	}
++	inflateEnd(&stream);
++	return ok;
++}
++
++/* Decompresses an operation-5 container. Version 3 is brotli, for which this
++ * build has no decoder at all — no guessed decoding, no silent pass-through:
++ * the caller reports the named failure. */
++bool Inflate(std::uint16_t version, const std::string &body, std::string &inflated, DecodeFailure &failure)
++{
++	if (version == kVersionBrotli) {
++		failure.what = "danmaku_brotli";
++		failure.detail = "brotli container (protocol version 3): no brotli decoder is linked into "
++				 "this build, so this message cannot be decoded";
++		return false;
++	}
++	return InflateZlib(body, inflated, failure);
++}
++
++DecodeOutcome DecodeStream(const std::string &buffer, std::size_t depth);
++
++/* One frame's turn through the decode rules of DMP:48-53: an operation-5
++ * version-2/3 frame is a container whose inflated body is a frame stream, and
++ * everything else is a packet. A container that fails to inflate is *not*
++ * dropped: it becomes a failure the caller reports, which is where this port
++ * parts ways with the Swift's silent pass-through. */
++void Expand(const Frame &frame, std::size_t depth, DecodeOutcome &out)
++{
++	const bool container = frame.operation == static_cast<std::uint32_t>(Operation::Message) &&
++			       (frame.version == kVersionZlib || frame.version == kVersionBrotli);
++	if (!container) {
++		out.frames.push_back(frame);
++		return;
++	}
++	if (depth >= kMaxContainerDepth) {
++		out.failures.push_back({"danmaku_frame", "compressed containers nested deeper than " +
++								 std::to_string(kMaxContainerDepth) + " levels"});
++		return;
++	}
++
++	std::string inflated;
++	DecodeFailure failure;
++	if (!Inflate(frame.version, frame.body, inflated, failure)) {
++		out.failures.push_back(std::move(failure));
++		return;
++	}
++
++	/* The inflated bytes are a packet stream, not a bare JSON blob (DMP:50). */
++	DecodeOutcome inner = DecodeStream(inflated, depth + 1);
++	out.frames.insert(out.frames.end(), std::make_move_iterator(inner.frames.begin()),
++			  std::make_move_iterator(inner.frames.end()));
++	out.failures.insert(out.failures.end(), std::make_move_iterator(inner.failures.begin()),
++			    std::make_move_iterator(inner.failures.end()));
++	if (inner.corrupt)
++		out.failures.push_back({"danmaku_frame", "a decompressed container did not hold a valid frame stream"});
++}
++
++/* Walks every *complete* frame in `buffer`. The Swift walks one WebSocket
++ * message and stops at a truncated tail, dropping it (DMP:41-44); this leaves
++ * the tail in the caller's accumulator instead, so a frame split across
++ * messages still arrives (docs/port-spec §9.3). Returns what was decoded and
++ * how many bytes that consumed. */
++DecodeOutcome DecodeStream(const std::string &buffer, std::size_t depth = 0)
++{
++	DecodeOutcome out;
++	std::size_t offset = 0;
++	while (buffer.size() - offset >= kHeaderLength) {
++		const std::uint32_t length = ReadU32(buffer, offset);
++		const std::uint16_t header = ReadU16(buffer, offset + 4);
++		if (length < header || header < kHeaderLength) {
++			/* DMP:44 breaks out and drops the rest. Nothing can resynchronise
++			 * a stream with no magic number, so the caller drops the buffer —
++			 * and says so, instead of going quiet. */
++			out.corrupt = true;
++			out.failures.push_back({"danmaku_frame",
++						"frame header is impossible (packet length " + std::to_string(length) +
++							", header length " + std::to_string(header) + ")"});
++			break;
++		}
++		if (length > buffer.size() - offset)
++			break; /* incomplete: keep it for the next message */
++
++		Frame frame;
++		frame.version = ReadU16(buffer, offset + 6);
++		frame.operation = ReadU32(buffer, offset + 8);
++		frame.body.assign(buffer, offset + header, length - header);
++		Expand(frame, depth, out);
++		offset += length;
++	}
++	out.consumed = offset;
++	return out;
++}
++
++/* ── JSON reading, with the Swift's coercions ───────────────────────────── */
++
++const json &Nothing()
++{
++	static const json nothing;
++	return nothing;
++}
++
++const json &Member(const json &object, const char *key)
++{
++	if (!object.is_object())
++		return Nothing();
++	const auto it = object.find(key);
++	return it == object.end() ? Nothing() : *it;
++}
++
++/* Array element, or null when the index is out of range. */
++const json &Element(const json &array, std::size_t index)
++{
++	if (!array.is_array() || index >= array.size())
++		return Nothing();
++	return array[index];
++}
++
++/* Swift's Int(String): an optional sign and digits, the whole string, no
++ * spaces, and nothing that does not fit in Int64 (DMP:205,209). */
++std::int64_t ParseInteger(const std::string &text)
++{
++	const char *begin = text.data();
++	const char *end = text.data() + text.size();
++	if (begin != end && *begin == '+') /* Int("+5") == 5; from_chars wants no sign there */
++		++begin;
++	if (begin == end)
++		return 0;
++	std::int64_t value = 0;
++	const std::from_chars_result result = std::from_chars(begin, end, value);
++	if (result.ec != std::errc() || result.ptr != end)
++		return 0;
++	return value;
++}
++
++/* DanmakuParser.int / int64 (DMP:204-210): an NSNumber — which is what
++ * JSONSerialization makes of a JSON boolean too, so `true` is 1 — or a numeric
++ * string; anything else, including a missing field, is 0. */
++std::int64_t JsonInt(const json &value)
++{
++	if (value.is_boolean())
++		return value.get<bool>() ? 1 : 0;
++	if (value.is_number()) /* NSNumber.intValue truncates a fractional value */
++		return value.get<std::int64_t>();
++	if (value.is_string())
++		return ParseInteger(value.get_ref<const std::string &>());
++	return 0;
++}
++
++/* Swift's `as? String`; numbers, booleans and objects all fall back. */
++std::string JsonStr(const json &value)
++{
++	return value.is_string() ? value.get<std::string>() : std::string();
++}
++
++/* ── minimal protobuf reader (DMP:214-257) ──────────────────────────────── */
++
++struct ProtobufFields {
++	std::map<int, std::uint64_t> varints;
++	std::map<int, std::string> bytes;
++};
++
++bool ReadVarint(const std::vector<std::uint8_t> &data, std::size_t &index, std::uint64_t &value)
++{
++	std::uint64_t result = 0;
++	std::uint64_t shift = 0;
++	while (index < data.size() && shift < 64) {
++		const std::uint8_t byte = data[index++];
++		result |= static_cast<std::uint64_t>(byte & 0x7F) << shift;
++		if ((byte & 0x80) == 0) {
++			value = result;
++			return true;
++		}
++		shift += 7;
++	}
++	return false;
++}
++
++/* Wire types 0 (varint) and 2 (length-delimited) are kept, 1 and 5 are skipped,
++ * anything else stops the walk and returns what was collected, exactly like
++ * DMP:237-254. A repeated field keeps its last occurrence. */
++ProtobufFields ReadProtobufFields(const std::vector<std::uint8_t> &data)
++{
++	ProtobufFields fields;
++	std::size_t index = 0;
++	std::uint64_t key = 0;
++	while (index < data.size() && ReadVarint(data, index, key)) {
++		const int field = static_cast<int>(key >> 3);
++		switch (key & 7) {
++		case 0: {
++			std::uint64_t value = 0;
++			if (!ReadVarint(data, index, value))
++				return fields;
++			fields.varints[field] = value;
++			break;
++		}
++		case 2: {
++			std::uint64_t length = 0;
++			if (!ReadVarint(data, index, length))
++				return fields;
++			if (length > data.size() - index)
++				return fields;
++			fields.bytes[field] = std::string(reinterpret_cast<const char *>(data.data() + index),
++							  static_cast<std::size_t>(length));
++			index += static_cast<std::size_t>(length);
++			break;
++		}
++		case 1:
++			index += 8;
++			break;
++		case 5:
++			index += 4;
++			break;
++		default:
++			return fields;
++		}
++	}
++	return fields;
++}
++
++/* ── commands to events (DanmakuParser, DMP:130-201) ────────────────────── */
++
++/* "DANMU_MSG:4:0:2:2:2:0" dispatches as "DANMU_MSG" (DMP:133). A command with
++ * no colon is used as-is; a missing or non-string `cmd` has no name at all. */
++std::string CommandName(const json &object)
++{
++	const json &raw = Member(object, "cmd");
++	if (!raw.is_string())
++		return {};
++	const std::string &text = raw.get_ref<const std::string &>();
++	const std::size_t colon = text.find(':');
++	return colon == std::string::npos ? text : text.substr(0, colon);
++}
++
++/* InteractionKind (DMP:118-120) as the kind strings CBridge.swift:92 emits:
++ * enter stays enter, share stays share, follow/specialFollow/mutualFollow all
++ * become follow. Any other msg_type is not an event (DMP:180). */
++bool InteractionKindName(std::int64_t msg_type, std::string &kind)
++{
++	switch (msg_type) {
++	case 1:
++		kind = "enter";
++		return true;
++	case 2:
++	case 4:
++	case 5:
++		kind = "follow";
++		return true;
++	case 3:
++		kind = "share";
++		return true;
++	default:
++		return false;
++	}
++}
++
++/* DANMU_MSG (DMP:136-165). The payload is the `info` array, not `data`. */
++bool BuildChat(const json &object, json &out)
++{
++	const json &info = Member(object, "info");
++	if (!info.is_array() || info.size() <= 2)
++		return false;
++	const json &text_value = Element(info, 1);
++	if (!text_value.is_string())
++		return false;
++	const json &user = Element(info, 2);
++	if (!user.is_array() || user.size() <= 1)
++		return false;
++
++	const std::string text = text_value.get<std::string>();
++	const std::string user_name = JsonStr(Element(user, 1));
++
++	/* medal: "<name> <int(m[0])>" only when info[3] is an array whose second
++	 * element is a non-empty string (DMP:139-142). */
++	std::string medal;
++	const json &medal_value = Element(info, 3);
++	if (medal_value.is_array() && medal_value.size() > 1 && Element(medal_value, 1).is_string() &&
++	    !Element(medal_value, 1).get_ref<const std::string &>().empty()) {
++		medal = Element(medal_value, 1).get<std::string>() + " " +
++			std::to_string(JsonInt(Element(medal_value, 0)));
++	}
++
++	/* info[0][15]["extra"] is JSON inside JSON: the danmaku id, the viewer it
++	 * replies to and its inline emoticons (DMP:147-158). */
++	const json &meta = Element(info, 0);
++	std::string dmid;
++	std::string reply_to;
++	std::map<std::string, std::string> emots;
++	if (meta.is_array() && meta.size() > 15) {
++		const json &extra = Member(Element(meta, 15), "extra");
++		if (extra.is_string()) {
++			const json fields = json::parse(extra.get_ref<const std::string &>(), nullptr, false);
++			if (!fields.is_discarded() && fields.is_object()) {
++				const std::string id = JsonStr(Member(fields, "id_str"));
++				if (!id.empty())
++					dmid = id;
++				const std::string reply_name = JsonStr(Member(fields, "reply_uname"));
++				if (!reply_name.empty())
++					reply_to = reply_name;
++				const json &codes = Member(fields, "emots");
++				if (codes.is_object()) {
++					for (auto it = codes.begin(); it != codes.end(); ++it) {
++						const std::string url = JsonStr(Member(it.value(), "url"));
++						if (!url.empty() && text.find(it.key()) != std::string::npos)
++							emots[it.key()] = url;
++					}
++				}
++			}
++		}
++	}
++
++	/* A sticker danmaku has dm_type 1 in info[0][12] and its picture in
++	 * info[0][13] (DMP:159-163). */
++	json sticker;
++	const json &meta_picture = Element(meta, 13);
++	if (meta.is_array() && meta.size() > 13 && JsonInt(Element(meta, 12)) == 1 && meta_picture.is_object()) {
++		const std::string url = JsonStr(Member(meta_picture, "url"));
++		if (!url.empty()) {
++			/* CBridge.swift:83 names these url/w/h/key. */
++			sticker = json{{"url", url},
++				       {"w", static_cast<int>(JsonInt(Member(meta_picture, "width")))},
++				       {"h", static_cast<int>(JsonInt(Member(meta_picture, "height")))},
++				       {"key", JsonStr(Member(meta_picture, "emoticon_unique"))}};
++		}
++	}
++
++	out = json{{"event", "room"},
++		   {"kind", "chat"},
++		   {"uid", JsonInt(Element(user, 0))},
++		   {"user", user_name},
++		   {"text", text}};
++	if (!medal.empty())
++		out["medal"] = medal;
++	if (!dmid.empty())
++		out["dmid"] = dmid;
++	if (!reply_to.empty())
++		out["replyTo"] = reply_to;
++	if (!emots.empty())
++		out["emots"] = emots;
++	if (!sticker.is_null())
++		out["sticker"] = sticker;
++	return true;
++}
++
++/* SEND_GIFT / SEND_GIFT_V2 (DMP:166-171). `giftName` wins over `gift_name`
++ * even when it is the empty string, because that is what `??` does. */
++json BuildGift(const json &object)
++{
++	const json &data = Member(object, "data");
++	const json &gift_name = Member(data, "giftName");
++	const std::string name = gift_name.is_string() ? gift_name.get<std::string>()
++						       : JsonStr(Member(data, "gift_name"));
++	return json{{"event", "room"},
++		    {"kind", "gift"},
++		    {"user", JsonStr(Member(data, "uname"))},
++		    {"name", name},
++		    {"count", static_cast<int>(JsonInt(Member(data, "num")))},
++		    {"paid", JsonStr(Member(data, "coin_type")) == "gold"},
++		    {"totalCoin", static_cast<int>(JsonInt(Member(data, "total_coin")))}};
++}
++
++/* SUPER_CHAT_MESSAGE (DMP:172-175); the user name is one level deeper. */
++json BuildSuperChat(const json &object)
++{
++	const json &data = Member(object, "data");
++	const json &user = Member(data, "user_info");
++	return json{{"event", "room"},
++		    {"kind", "superChat"},
++		    {"user", JsonStr(Member(user, "uname"))},
++		    {"text", JsonStr(Member(data, "message"))},
++		    {"price", static_cast<int>(JsonInt(Member(data, "price")))},
++		    {"seconds", static_cast<int>(JsonInt(Member(data, "time")))}};
++}
++
++/* GUARD_BUY (DMP:176-178); the field is `username`, not `uname`. */
++json BuildGuard(const json &object)
++{
++	const json &data = Member(object, "data");
++	return json{{"event", "room"},
++		    {"kind", "guard"},
++		    {"user", JsonStr(Member(data, "username"))},
++		    {"level", static_cast<int>(JsonInt(Member(data, "guard_level")))},
++		    {"name", JsonStr(Member(data, "gift_name"))},
++		    {"count", static_cast<int>(JsonInt(Member(data, "num")))}};
++}
++
++/* INTERACT_WORD (DMP:179-181). */
++bool BuildInteraction(const json &object, json &out)
++{
++	const json &data = Member(object, "data");
++	std::string kind;
++	if (!InteractionKindName(JsonInt(Member(data, "msg_type")), kind))
++		return false;
++	out = json{{"event", "room"}, {"kind", kind}, {"user", JsonStr(Member(data, "uname"))}};
++	return true;
++}
++
++/* INTERACT_WORD_V2 (DMP:182-186): base64 protobuf, field 5 is msg_type and
++ * field 2 is the viewer's name. */
++bool BuildInteractionV2(const json &object, json &out)
++{
++	const json &pb = Member(Member(object, "data"), "pb");
++	if (!pb.is_string())
++		return false;
++	const std::vector<std::uint8_t> bytes = crypto::Base64Decode(pb.get_ref<const std::string &>());
++	if (bytes.empty())
++		return false;
++
++	const ProtobufFields fields = ReadProtobufFields(bytes);
++	const auto kind_field = fields.varints.find(5);
++	std::string kind;
++	if (!InteractionKindName(kind_field == fields.varints.end() ? 0 : static_cast<std::int64_t>(kind_field->second),
++				 kind))
++		return false;
++
++	std::string user;
++	const auto user_field = fields.bytes.find(2);
++	if (user_field != fields.bytes.end())
++		user = user_field->second;
++	out = json{{"event", "room"}, {"kind", kind}, {"user", user}};
++	return true;
++}
++
++/* WATCHED_CHANGE / LIKE_INFO_V3_UPDATE / ONLINE_RANK_COUNT (DMP:187-192). */
++json BuildCounter(const json &object, const char *kind, const char *field)
++{
++	return json{{"event", "room"},
++		    {"kind", kind},
++		    {"value", static_cast<int>(JsonInt(Member(Member(object, "data"), field)))}};
++}
++
++/* The command table of DMP:130-201, in the Swift's order. Commands that are
++ * not in it produce nothing at all (DMP:199-200). */
++void ParseCommand(const json &object, std::vector<json> &events)
++{
++	const std::string command = CommandName(object);
++	if (command == "DANMU_MSG") {
++		json event;
++		if (BuildChat(object, event))
++			events.push_back(std::move(event));
++	} else if (command == "SEND_GIFT" || command == "SEND_GIFT_V2") {
++		events.push_back(BuildGift(object));
++	} else if (command == "SUPER_CHAT_MESSAGE") {
++		events.push_back(BuildSuperChat(object));
++	} else if (command == "GUARD_BUY") {
++		events.push_back(BuildGuard(object));
++	} else if (command == "INTERACT_WORD") {
++		json event;
++		if (BuildInteraction(object, event))
++			events.push_back(std::move(event));
++	} else if (command == "INTERACT_WORD_V2") {
++		json event;
++		if (BuildInteractionV2(object, event))
++			events.push_back(std::move(event));
++	} else if (command == "WATCHED_CHANGE") {
++		events.push_back(BuildCounter(object, "watched", "num"));
++	} else if (command == "LIKE_INFO_V3_UPDATE") {
++		events.push_back(BuildCounter(object, "likes", "click_count"));
++	} else if (command == "ONLINE_RANK_COUNT") {
++		events.push_back(BuildCounter(object, "onlineRank", "count"));
++	} else if (command == "LIVE") {
++		events.push_back(json{{"event", "room"}, {"kind", "liveStarted"}});
++	} else if (command == "PREPARING") {
++		events.push_back(json{{"event", "room"}, {"kind", "liveEnded"}});
++	} else if (command == "ROOM_CHANGE") {
++		events.push_back(json{{"event", "room"},
++				      {"kind", "roomChanged"},
++				      {"title", JsonStr(Member(Member(object, "data"), "title"))}});
++	}
++}
++
++/* DanmakuParser.events(from:) (DMP:124-128): operation 5 and a body that parses
++ * as a JSON object, otherwise no events. */
++void DispatchFrame(const Frame &frame)
++{
++	if (frame.operation != static_cast<std::uint32_t>(Operation::Message))
++		return;
++	const json object = json::parse(frame.body, nullptr, false);
++	if (object.is_discarded() || !object.is_object())
++		return;
++
++	std::vector<json> events;
++	ParseCommand(object, events);
++	for (const json &event : events)
++		PostEvent(event);
++}
++
++/* What could not be decoded is said out loud, once per container or malformed
++ * frame. CONTRACT §4.2 has no room-event kind for "undecodable" and inventing
++ * one would make the UI read a field it does not know, so the report uses the
++ * {"event":"unsupported"} shape the rest of the Windows core already uses for
++ * "this cannot be done" (livehime-core-stub.cpp), through the client's own
++ * event channel and therefore on the main thread like every other event. */
++void ReportFailures(const std::vector<DecodeFailure> &failures)
++{
++	for (const DecodeFailure &failure : failures) {
++		PostEvent(json{{"event", "unsupported"},
++			       {"status", "unsupported"},
++			       {"what", failure.what},
++			       {"detail", failure.detail}});
++	}
++}
++
++/* ── helpers the session needs ──────────────────────────────────────────── */
++
++std::wstring Widen(const std::string &utf8)
++{
++	if (utf8.empty())
++		return {};
++	const int length = MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(), static_cast<int>(utf8.size()), nullptr, 0);
++	if (length <= 0)
++		return {};
++	std::wstring wide(static_cast<std::size_t>(length), L'\0');
++	MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(), static_cast<int>(utf8.size()), &wide[0], length);
++	return wide;
++}
++
++std::string Trim(const std::string &text)
++{
++	const std::size_t begin = text.find_first_not_of(" \t");
++	if (begin == std::string::npos)
++		return {};
++	const std::size_t end = text.find_last_not_of(" \t");
++	return text.substr(begin, end - begin + 1);
++}
++
++/* The auth body's `buvid` is DanmakuConnectInfo.buvid in the Swift: the buvid3
++ * cookie when there is one, otherwise the value /x/frontend/finger/spi returned
++ * (LRA:30-38,74) — which FetchDanmakuInfo puts in the jar. The cookie header
++ * rebuilt from that jar is the same one the danmaku endpoints use, so read the
++ * value back from there. Empty when the jar has none: that is what the Swift
++ * would send too, and the server's answer is the honest one (the Swift throws
++ * on it before connecting, which the Result from FetchDanmakuInfo already
++ * covers). */
++std::string BuvidFromCookies()
++{
++	const std::string header = CookieHeader();
++	std::size_t pos = 0;
++	while (pos < header.size()) {
++		const std::size_t end = header.find(';', pos);
++		const std::string pair =
++			header.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
++		const std::size_t equals = pair.find('=');
++		if (equals != std::string::npos && Trim(pair.substr(0, equals)) == "buvid3")
++			return Trim(pair.substr(equals + 1));
++		if (end == std::string::npos)
++			break;
++		pos = end + 1;
++	}
++	return {};
++}
++
++/* FetchDanmakuInfo answers on the main thread (liveclient.h); the worker needs
++ * the value to carry on, so it waits on this slot. Deliberately not a
++ * std::promise: Stop() cancels the run and joins the worker, and a main thread
++ * blocked in that join can no longer run the posted callback, so the wait must
++ * be interruptible rather than tied to a future that may never be set. */
++struct InfoSlot {
++	std::mutex mutex;
++	std::condition_variable cv;
++	bool ready = false;
++	Result<DanmakuConnectInfo> value;
++};
++
++/* The token and the server list, refetched on every attempt, which is what
++ * DMC:57 does inside the session function. */
++Result<DanmakuConnectInfo> FetchConnectInfo(long long room_id, long long uid, const std::shared_ptr<RunToken> &token)
++{
++	auto slot = std::make_shared<InfoSlot>();
++	FetchDanmakuInfo(room_id, uid, [slot](Result<DanmakuConnectInfo> result) {
++		{
++			std::lock_guard<std::mutex> lock(slot->mutex);
++			slot->value = std::move(result);
++			slot->ready = true;
++		}
++		slot->cv.notify_all();
++	});
++
++	std::unique_lock<std::mutex> lock(slot->mutex);
++	const auto deadline = std::chrono::steady_clock::now() + kInfoWaitLimit;
++	while (!slot->ready && !token->cancelled.load()) {
++		if (slot->cv.wait_for(lock, std::chrono::milliseconds(100), [&slot] { return slot->ready; }))
++			break;
++		if (std::chrono::steady_clock::now() >= deadline)
++			break; /* net::Send answers exactly once, so this only fires when
++				  there is no dispatcher to answer through; a reconnect
++				  attempt must not hang on it forever. */
++	}
++	if (!slot->ready)
++		return {};
++	return slot->value;
++}
++
++/* Sends one complete WebSocket message. WinHTTP owns the framing; the
++ * *_MESSAGE_BUFFER_TYPE makes this call one whole message (docs/port-spec
++ * §9.3). */
++bool SendBinary(HINTERNET socket, const std::string &payload)
++{
++	if (!socket)
++		return false;
++	return WinHttpWebSocketSend(socket, WINHTTP_WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE,
++				    const_cast<char *>(payload.data()),
++				    static_cast<DWORD>(payload.size())) == ERROR_SUCCESS;
++}
++
++/* The auth reply (DMC:86-91). The Swift keeps a malformed reply's session: a
++ * body that does not parse gives `reply == nil`, `int(nil) == 0`, and the guard
++ * therefore passes (docs/port-spec §2.3). Preserved on purpose — this is the
++ * Swift's behaviour, not an oversight this port may quietly fix. */
++bool AuthAccepted(const std::string &body)
++{
++	const json reply = json::parse(body, nullptr, false);
++	if (reply.is_discarded() || !reply.is_object())
++		return true;
++	return JsonInt(Member(reply, "code")) == 0;
++}
++
++/* Backoff, sliced so Stop() is never left waiting out a 30 s sleep. */
++void SleepInterruptible(std::chrono::milliseconds duration, const std::shared_ptr<RunToken> &token)
++{
++	const auto deadline = std::chrono::steady_clock::now() + duration;
++	while (!token->cancelled.load()) {
++		const auto now = std::chrono::steady_clock::now();
++		if (now >= deadline)
++			return;
++		const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
++		std::this_thread::sleep_for(std::min(remaining, std::chrono::milliseconds(100)));
++	}
++}
++
++/* ── one connection ─────────────────────────────────────────────────────── */
++
++/* The HTTP handles the handshake opens, closed in reverse order on every path.
++ * The WebSocket handle is not here: it is published to the run token and closed
++ * by Socket, under that token's mutex, so Stop() can never race the close. */
++struct Handshake {
++	HINTERNET session = nullptr;
++	HINTERNET connect = nullptr;
++	HINTERNET request = nullptr;
++
++	~Handshake()
++	{
++		if (request)
++			WinHttpCloseHandle(request);
++		if (connect)
++			WinHttpCloseHandle(connect);
++		if (session)
++			WinHttpCloseHandle(session);
++	}
++
++	Handshake(const Handshake &) = delete;
++	Handshake &operator=(const Handshake &) = delete;
++	Handshake() = default;
++};
++
++class Socket {
++public:
++	explicit Socket(const std::shared_ptr<RunToken> &token) : token_(token) {}
++	~Socket() { Close(); }
++
++	Socket(const Socket &) = delete;
++	Socket &operator=(const Socket &) = delete;
++
++	/* Takes ownership of the upgraded handle and publishes it, in one step, so
++	 * a Stop() that arrives between the upgrade and the first receive can still
++	 * cancel it. */
++	void Adopt(HINTERNET handle)
++	{
++		std::lock_guard<std::mutex> lock(token_->socket_mutex);
++		handle_ = handle;
++		token_->websocket = handle;
++	}
++
++	HINTERNET Get() const { return handle_; }
++
++	void Close()
++	{
++		HINTERNET handle = nullptr;
++		{
++			std::lock_guard<std::mutex> lock(token_->socket_mutex);
++			handle = handle_;
++			handle_ = nullptr;
++			token_->websocket = nullptr;
++		}
++		if (handle)
++			WinHttpCloseHandle(handle);
++	}
++
++private:
++	std::shared_ptr<RunToken> token_;
++	HINTERNET handle_ = nullptr;
++};
++
++/* One session: server list and token, upgrade, auth, then the heartbeat and
++ * receive loop. Returns how long the connection stayed authenticated, in
++ * milliseconds, which is the only thing the backoff decision reads (DMC:42-45);
++ * zero covers every failure, like the Swift's `.zero`. */
++long long RunSession(long long room_id, long long uid, const std::shared_ptr<RunToken> &token)
++{
++	const Result<DanmakuConnectInfo> info = FetchConnectInfo(room_id, uid, token);
++	if (token->cancelled.load() || !info.ok || info.value.host.empty() || info.value.port <= 0)
++		return 0;
++
++	Handshake handshake;
++	handshake.session = WinHttpOpen(L"LiveHime/0.2 (Windows; OBS)", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
++					WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
++	if (!handshake.session)
++		return 0;
++	/* Resolve, connect, send, receive. The receive budget is the loop tick
++	 * (kReceiveTick): big enough for the server's 101, small enough to keep the
++	 * heartbeat on time. */
++	WinHttpSetTimeouts(handshake.session, 10000, 10000, 15000,
++			   static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(kReceiveTick).count()));
++
++	handshake.connect = WinHttpConnect(handshake.session, Widen(info.value.host).c_str(),
++					   static_cast<INTERNET_PORT>(info.value.port), 0);
++	if (!handshake.connect)
++		return 0;
++
++	/* wss://<host>:<wss_port>/sub (DMC:59). */
++	handshake.request = WinHttpOpenRequest(handshake.connect, L"GET", L"/sub", nullptr, WINHTTP_NO_REFERER,
++					       WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
++	if (!handshake.request)
++		return 0;
++	/* Required before the upgrade request goes out; Sec-WebSocket-* stays
++	 * WinHTTP's business (docs/port-spec §9.3). */
++	if (!WinHttpSetOption(handshake.request, WINHTTP_OPTION_UPGRADE_TO_WEB_SOCKET, nullptr, 0))
++		return 0;
++
++	/* DMC:60-61. No Cookie header: the handshake is not what authenticates this
++	 * socket — the operation-7 packet is (docs/port-spec §2.1). */
++	const std::wstring headers = Widen(std::string("User-Agent: ") + kBilibiliUserAgent +
++					   "\r\nOrigin: https://live.bilibili.com\r\n");
++	if (!WinHttpSendRequest(handshake.request, headers.c_str(), static_cast<DWORD>(headers.size()), nullptr, 0, 0, 0))
++		return 0;
++	if (!WinHttpReceiveResponse(handshake.request, nullptr))
++		return 0;
++
++	DWORD status = 0;
++	DWORD status_size = sizeof(status);
++	if (!WinHttpQueryHeaders(handshake.request, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
++				 WINHTTP_HEADER_NAME_BY_INDEX, &status, &status_size, WINHTTP_NO_HEADER_INDEX) ||
++	    status != 101)
++		return 0;
++
++	HINTERNET upgraded = WinHttpWebSocketCompleteUpgrade(handshake.request, 0);
++	if (!upgraded)
++		return 0;
++	Socket socket(token);
++	socket.Adopt(upgraded);
++	WinHttpCloseHandle(handshake.request);
++	handshake.request = nullptr;
++
++	/* The auth packet: one binary message, version 1, operation 7, sequence 1
++	 * (DMC:66-68). Key order inside the JSON is JSONSerialization's business in
++	 * the Swift and Not In Source (docs/port-spec §10.1); nlohmann writes keys
++	 * sorted, which the server accepts and which makes logs diffable. */
++	const json auth{{"uid", uid},
++			{"roomid", room_id},
++			{"protover", kProtoVersion},
++			{"buvid", BuvidFromCookies()},
++			{"platform", "web"},
++			{"type", 2},
++			{"key", info.value.token}};
++	if (!SendBinary(socket.Get(), EncodePacket(Operation::Auth, auth.dump())))
++		return 0;
++
++	/* DMC:70-76: the heartbeat starts immediately — its first frame goes out
++	 * before the first receive — and then every 30 s. The deadline advances
++	 * from the send, so the interval is never shorter than the Swift's, and the
++	 * receive tick above bounds how much later it can be. */
++	auto next_heartbeat = std::chrono::steady_clock::now();
++	std::chrono::steady_clock::time_point connected_at;
++	bool connected = false;
++
++	/* Two accumulators: one for the fragments of the WebSocket message in
++	 * flight, one for danmaku frames that a message boundary cut in half. */
++	std::string message;
++	std::string pending;
++	bool fragmented = false;
++
++	for (;;) {
++		if (token->cancelled.load())
++			break;
++
++		const auto now = std::chrono::steady_clock::now();
++		if (now >= next_heartbeat) {
++			/* A send failure is ignored on purpose: the Swift uses `try?` and
++			 * lets the receive side notice the break (DMC:72,78-97). */
++			SendBinary(socket.Get(), EncodePacket(Operation::Heartbeat, kHeartbeatBody));
++			next_heartbeat = now + kHeartbeatInterval;
++		}
++
++		char chunk[16384];
++		DWORD read = 0;
++		WINHTTP_WEB_SOCKET_BUFFER_TYPE type = WINHTTP_WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE;
++		const DWORD result = WinHttpWebSocketReceive(socket.Get(), chunk, sizeof(chunk), &read, &type);
++
++		if (result == ERROR_WINHTTP_TIMEOUT) {
++			/* The tick. Between messages it means the room is quiet; in the
++			 * middle of a fragmented message it means the peer stalled, and
++			 * the session ends the way any transport failure does. */
++			if (fragmented)
++				break;
++			continue;
++		}
++		if (result != ERROR_SUCCESS)
++			break; /* includes ERROR_WINHTTP_OPERATION_CANCELLED, which is
++				  Stop() having closed the socket: reconnect is not wanted,
++				  the run token is cancelled and the loop above exits. */
++
++		if (type == WINHTTP_WEB_SOCKET_CLOSE_BUFFER_TYPE) {
++			/* The server closed. WinHTTP wants the close status read before
++			 * the handle goes away; the Swift discards the close reason
++			 * entirely and lets the backoff loop reconnect (DMC:95-97), so
++			 * nothing consumes it here either. */
++			USHORT close_status = 0;
++			unsigned char reason[123];
++			DWORD reason_length = 0;
++			WinHttpWebSocketQueryCloseStatus(socket.Get(), &close_status, reason, sizeof(reason),
++							 &reason_length);
++			break;
++		}
++
++		/* Binary and text messages reach the same decoder (DMC:80-84). */
++		message.append(chunk, read);
++		fragmented = type == WINHTTP_WEB_SOCKET_BINARY_FRAGMENT_BUFFER_TYPE ||
++			     type == WINHTTP_WEB_SOCKET_UTF8_FRAGMENT_BUFFER_TYPE;
++		if (fragmented)
++			continue; /* more of this message follows */
++
++		pending.append(message);
++		message.clear();
++
++		/* A WebSocket message is not a frame boundary. Complete frames are
++		 * decoded; a half frame stays in `pending` for the next message
++		 * instead of being dropped the way the Swift's per-message decode
++		 * drops it (DMP:41-44). */
++		const DecodeOutcome outcome = DecodeStream(pending);
++		if (outcome.corrupt)
++			pending.clear(); /* a stream with no magic number cannot be resynchronised */
++		else
++			pending.erase(0, outcome.consumed);
++
++		ReportFailures(outcome.failures);
++
++		bool rejected = false;
++		for (const Frame &frame : outcome.frames) {
++			if (frame.operation == static_cast<std::uint32_t>(Operation::AuthReply)) {
++				if (!AuthAccepted(frame.body)) {
++					/* DMC:88 — the session ends at once, returning zero. */
++					rejected = true;
++					break;
++				}
++				connected_at = std::chrono::steady_clock::now();
++				connected = true;
++				PostStatus(DanmakuStatus::Connected, token);
++			}
++			DispatchFrame(frame);
++		}
++		if (rejected)
++			return 0;
++	}
++
++	if (!connected)
++		return 0;
++	return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - connected_at)
++		.count();
++}
++
++/* The reconnect loop of DMC:36-49, on its own thread for the whole life of one
++ * Start(): connect, wait out the backoff, connect again, until Stop(). */
++void WorkerMain(long long room_id, long long uid, std::shared_ptr<RunToken> token)
++{
++	long long backoff_ms = kBackoffInitialMs;
++	int attempt = 0;
++	while (!token->cancelled.load()) {
++		/* `.connecting` is emitted exactly once per run: attempt never resets
++		 * (docs/port-spec §6.2). */
++		PostStatus(attempt == 0 ? DanmakuStatus::Connecting : DanmakuStatus::Reconnecting, token);
++		++attempt;
++
++		const long long connected_ms = RunSession(room_id, uid, token);
++		if (token->cancelled.load())
++			break;
++		/* DMC:45 — a session that stayed authenticated for more than a minute
++		 * starts over at 2 s; anything else doubles, capped at 30 s. */
++		backoff_ms = connected_ms > kBackoffResetAfterMs ? kBackoffInitialMs
++								 : std::min(backoff_ms * 2, kBackoffMaxMs);
++		PostStatus(DanmakuStatus::Reconnecting, token);
++		SleepInterruptible(std::chrono::milliseconds(backoff_ms), token);
++	}
++}
++
++} // namespace
++
++/* ── the frozen interface ───────────────────────────────────────────────── */
++
++const char *DanmakuStatusRaw(DanmakuStatus status)
++{
++	/* The Swift's Status raw values (DMC:9); the core emits them verbatim in
++	 * {"event":"danmakuStatus","status":...} (CBridge.swift:28). */
++	switch (status) {
++	case DanmakuStatus::Connecting:
++		return "connecting";
++	case DanmakuStatus::Connected:
++		return "connected";
++	case DanmakuStatus::Reconnecting:
++		return "reconnecting";
++	case DanmakuStatus::Stopped:
++		break;
++	}
++	return "stopped";
++}
++
++DanmakuClient &DanmakuClient::Instance()
++{
++	static DanmakuClient instance;
++	return instance;
++}
++
++void DanmakuClient::SetHandlers(EventFn on_event, StatusFn on_status)
++{
++	std::lock_guard<std::mutex> lock(g_client.mutex);
++	g_client.on_event = std::move(on_event);
++	g_client.on_status = std::move(on_status);
++}
++
++void DanmakuClient::Start(long long room_id, long long uid)
++{
++	/* The frozen header promises a no-op while the client already runs for this
++	 * room. DanmakuClient.swift:24 stops first even then; this is the one place
++	 * the header and the Swift disagree, and the header wins so that a
++	 * redundant Start cannot blink a working socket. */
++	{
++		std::lock_guard<std::mutex> lock(g_client.mutex);
++		if (g_client.run && !g_client.run->cancelled.load() && room_id_ == room_id)
++			return;
++	}
++
++	Stop();
++
++	std::shared_ptr<RunToken> token;
++	{
++		std::lock_guard<std::mutex> lock(g_client.mutex);
++		room_id_ = room_id;
++		token = std::make_shared<RunToken>();
++		g_client.run = token;
++		g_client.worker = std::thread(WorkerMain, room_id, uid, token);
++	}
++}
++
++void DanmakuClient::Stop()
++{
++	std::shared_ptr<RunToken> token;
++	std::thread worker;
++	{
++		std::lock_guard<std::mutex> lock(g_client.mutex);
++		token = g_client.run;
++		g_client.run.reset();
++		worker = std::move(g_client.worker);
++	}
++
++	if (token) {
++		token->cancelled.store(true);
++		/* Closing the socket is what unblocks a receive parked inside WinHTTP
++		 * (it returns ERROR_WINHTTP_OPERATION_CANCELLED); the close code is
++		 * .goingAway, what the Swift's `socket.cancel` sends (DMC:64). The
++		 * handle itself stays the worker's to close, under the same mutex, so
++		 * it can never be closed twice. */
++		std::lock_guard<std::mutex> lock(token->socket_mutex);
++		if (token->websocket) {
++			WinHttpWebSocketClose(token->websocket, WINHTTP_WEB_SOCKET_ENDPOINT_TERMINATED_CLOSE_STATUS,
++					      nullptr, 0);
++		}
++	}
++
++	if (worker.joinable())
++		worker.join();
++
++	room_id_ = 0;
++	/* After the join, so a status the worker had already queued can never land
++	 * after this one: its posts are dropped by the cancelled token. Safe to
++	 * call when never started or twice — there is nothing to join and the
++	 * status is already the one it would report. */
++	PostStatus(DanmakuStatus::Stopped, nullptr);
++}
++
++void DanmakuClient::InjectForTest(const std::string &bytes)
++{
++	/* The receive loop's decode path, with an accumulator of its own so a test
++	 * can split a frame across two calls. Connection state is untouched — only
++	 * the socket loop owns status — but frames, containers, event shapes and
++	 * failure reports are the same code the socket runs. */
++	DecodeOutcome outcome;
++	{
++		std::lock_guard<std::mutex> lock(g_client.mutex);
++		g_client.test_buffer.append(bytes);
++		outcome = DecodeStream(g_client.test_buffer);
++		if (outcome.corrupt)
++			g_client.test_buffer.clear();
++		else
++			g_client.test_buffer.erase(0, outcome.consumed);
++	}
++
++	ReportFailures(outcome.failures);
++	for (const Frame &frame : outcome.frames)
++		DispatchFrame(frame);
++}
++
++} // namespace live
++} // namespace livehime
+diff --git a/plugins/livehime/core/win/live/danmaku.h b/plugins/livehime/core/win/live/danmaku.h
+index 1cfec90..6d8d502 100644
+--- a/plugins/livehime/core/win/live/danmaku.h
++++ b/plugins/livehime/core/win/live/danmaku.h
+@@ -50,6 +50,14 @@ public:
+ 
+ private:
+ 	DanmakuClient() = default;
++
++	/* The room the socket is attached to, which the inline accessor above
++	 * reads. Everything else — the WinHTTP handles, the worker thread, the
++	 * handlers, the receive accumulator — is file-local in danmaku.cpp: this
++	 * is a process-wide singleton, and keeping the rest of its state out of
++	 * the header means WinHTTP's headers do not leak into every translation
++	 * unit that includes this one. */
++	long long room_id_ = 0;
+ };
+ 
+ } // namespace live
+diff --git a/plugins/livehime/core/win/live/liveclient.cpp b/plugins/livehime/core/win/live/liveclient.cpp
+new file mode 100644
+index 0000000..9c53e62
+--- /dev/null
++++ b/plugins/livehime/core/win/live/liveclient.cpp
+@@ -0,0 +1,1889 @@
++/* Bilibili live APIs for the Windows core — the C++ counterpart of
++ * BilibiliLiveClient.swift, LiveRoomActions.swift, BilibiliControlClient.swift
++ * and the Emoticons half of Emoticons.swift.
++ *
++ * The rule for this port (CONTRACT) is to behave like the Swift, not like a
++ * reasonable person's idea of what the Swift meant. Where the Swift is odd —
++ * the eight-field startLive signature, the room-lookup fallback chain, reading
++ * the WBI keys out of a -101 nav answer without the usual code check — the C++
++ * does the same thing and the comment cites the file:line it came from.
++ *
++ * Every public callback leaves through dispatch::Post, so it runs on the main
++ * thread exactly once, including when the transport failed. Errors are shaped
++ * per CONTRACT §4.3 and only sessionExpired sets `logged_out` (CONTRACT §4.1).
++ * The stream key is a secret: it travels in Result<StreamConfig> and nowhere
++ * else — this file never logs or emits.
++ *
++ * Not ported from the Swift, each called out where it would have run:
++ * BilibiliDiagnosticStore (the C++ probe entry point is a later milestone) and
++ * the ImageIO re-encode plus the cache-trim task of Emoticons.swift. */
++
++#include "liveclient.h"
++
++#include "../net/cookies.h"
++#include "../net/crypto.h"
++#include "../net/http.h"
++#include "../net/signing.h"
++#include "../platform/dispatch.h"
++
++#include <algorithm>
++#include <cerrno>
++#include <cctype>
++#include <cmath>
++#include <cstdlib>
++#include <ctime>
++#include <filesystem>
++#include <fstream>
++#include <limits>
++#include <map>
++#include <memory>
++#include <mutex>
++#include <optional>
++#include <string>
++#include <system_error>
++#include <utility>
++#include <vector>
++
++namespace livehime {
++namespace live {
++namespace {
++
++/* ── endpoints and headers ──────────────────────────────────────────────── */
++
++/* BilibiliLiveClient.swift:41-46 plus the endpoints LiveRoomActions.swift,
++ * BilibiliControlClient.swift and Emoticons.swift name inline. kLiveInfoUrl is
++ * the room-id fallback CONTRACT §5's table does not list; it is
++ * BilibiliLiveClient.swift:46 and FetchRoom uses it exactly as the Swift does. */
++constexpr const char *kNavUrl = "https://api.bilibili.com/x/web-interface/nav";
++constexpr const char *kServerClockUrl = "https://api.bilibili.com/x/report/click/now";
++constexpr const char *kFingerprintUrl = "https://api.bilibili.com/x/frontend/finger/spi";
++constexpr const char *kRoomByUidUrl = "https://api.live.bilibili.com/room/v2/Room/room_id_by_uid";
++constexpr const char *kRoomInfoOldUrl = "https://api.live.bilibili.com/room/v1/Room/getRoomInfoOld";
++constexpr const char *kRoomInfoUrl = "https://api.live.bilibili.com/room/v1/Room/get_info";
++constexpr const char *kLiveInfoUrl = "https://api.live.bilibili.com/i/api/liveinfo";
++constexpr const char *kAreaListUrl = "https://api.live.bilibili.com/room/v1/Area/getList";
++constexpr const char *kStartLiveUrl = "https://api.live.bilibili.com/room/v1/Room/startLive";
++constexpr const char *kStopLiveUrl = "https://api.live.bilibili.com/room/v1/Room/stopLive";
++constexpr const char *kUpstreamUrl = "https://api.live.bilibili.com/xlive/app-blink/v1/live/GetUpStreamRtmp";
++constexpr const char *kLiveVersionUrl =
++	"https://api.live.bilibili.com/xlive/app-blink/v1/liveVersionInfo/getHomePageLiveVersion";
++constexpr const char *kDanmuInfoUrl = "https://api.live.bilibili.com/xlive/web-room/v1/index/getDanmuInfo";
++constexpr const char *kSendDanmakuUrl = "https://api.live.bilibili.com/msg/send";
++constexpr const char *kRoomUpdateUrl = "https://api.live.bilibili.com/room/v1/Room/update";
++constexpr const char *kFaceAuthUrl =
++	"https://api.live.bilibili.com/xlive/app-blink/v1/preLive/IsUserIdentifiedByFaceAuth";
++constexpr const char *kMuteUserUrl = "https://api.live.bilibili.com/xlive/web-ucenter/v1/banned/AddSilentUser";
++constexpr const char *kShieldListUrl =
++	"https://api.live.bilibili.com/xlive/web-ucenter/v1/banned/GetShieldKeywordList";
++constexpr const char *kShieldAddUrl = "https://api.live.bilibili.com/xlive/web-ucenter/v1/banned/AddShieldKeyword";
++constexpr const char *kShieldDelUrl = "https://api.live.bilibili.com/xlive/web-ucenter/v1/banned/DelShieldKeyword";
++constexpr const char *kEmoticonsUrl = "https://api.live.bilibili.com/xlive/web-ucenter/v2/emoticon/GetEmoticons";
++constexpr const char *kMainSiteEmotesUrl = "https://api.bilibili.com/x/emote/user/panel/web";
++
++/*
++ * BilibiliControlClient.swift:44-47 and QRLogin.swift:134: every request sends
++ * this browser-like UA, because the nav endpoint treats a bespoke one as an
++ * unsupported client after a risk-control login. Kept verbatim so the C++ core
++ * speaks the same protocol as the macOS one, and set on every request so
++ * WinHTTP's own session user agent never reaches Bilibili.
++ */
++constexpr const char *kUserAgent =
++	"Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15";
++/* BilibiliLiveClient.swift:394-398: the live endpoints reject otherwise
++ * well-formed native requests without these. */
++constexpr const char *kLiveReferer = "https://live.bilibili.com/";
++constexpr const char *kApiOrigin = "https://api.live.bilibili.com";
++/* BilibiliControlClient.swift:48: nav wants the site referer instead. */
++constexpr const char *kNavReferer = "https://www.bilibili.com/";
++/* requestJSON sets timeoutInterval = 12 on every request. */
++constexpr int kTimeoutMs = 12000;
++/* Emoticons.swift:193: a picture of this size or more is refused. */
++constexpr size_t kMaxImageBytes = 4000000;
++
++/* BilibiliLiveClient.swift:307,436: the last-resort API message, escaped so the
++ * literal does not depend on the compiler's source code page. It is Chinese
++ * for "the Bilibili interface returned a failure". */
++constexpr const char *kApiFailureMessage =
++	"Bilibili \xe6\x8e\xa5\xe5\x8f\xa3\xe8\xbf\x94\xe5\x9b\x9e\xe5\xa4\xb1\xe8\xb4\xa5";
++/* BilibiliControlClient.swift:75 names its own message: "身份接口返回失败". */
++constexpr const char *kIdentityFailureMessage =
++	"\xe8\xba\xab\xe4\xbb\xbd\xe6\x8e\xa5\xe5\x8f\xa3\xe8\xbf\x94\xe5\x9b\x9e\xe5\xa4\xb1\xe8\xb4\xa5";
++
++/* ── error shapes (CONTRACT §4.3) ───────────────────────────────────────── */
++
++ApiError ErrorOf(json fields, bool logged_out = false)
++{
++	ApiError error;
++	error.fields = std::move(fields);
++	error.logged_out = logged_out;
++	return error;
++}
++
++/* CBridge.swift:194-218 picks the shape. Only sessionExpired may move the
++ * session back to signedOut, so it is the only one that sets logged_out
++ * (liveclient.h:50-52). */
++ApiError SessionExpired()
++{
++	return ErrorOf(json{{"kind", "sessionExpired"}}, true);
++}
++
++ApiError NoLiveRoom()
++{
++	return ErrorOf(json{{"kind", "noLiveRoom"}});
++}
++
++ApiError ApiFailure(long long code, const std::string &message)
++{
++	return ErrorOf(json{{"kind", "api"}, {"code", code}, {"message", message}});
++}
++
++ApiError HttpFailure(long status)
++{
++	return ErrorOf(json{{"kind", "http"}, {"code", status}});
++}
++
++ApiError ServerFailure(const std::string &message)
++{
++	return ErrorOf(json{{"kind", "server"}, {"message", message}});
++}
++
++ApiError NetworkFailure(const std::string &message)
++{
++	return ErrorOf(json{{"kind", "network"}, {"message", message}});
++}
++
++/* CBridge.swift:197-199: the voucher key is present only when there is one. */
++ApiError FaceAuthRequired(const std::optional<std::string> &voucher)
++{
++	json fields{{"kind", "faceAuth"}};
++	if (voucher)
++		fields["voucher"] = *voucher;
++	return ErrorOf(std::move(fields));
++}
++
++ApiError FaceAuthQr(const std::string &url)
++{
++	return ErrorOf(json{{"kind", "faceAuthQR"}, {"qr", url}});
++}
++
++/* The Swift reports a transport failure as BilibiliLiveError.network(code:) or
++ * .transport and puts that error's description in the event. There is no
++ * URLSession here, so WinHTTP's own text takes its place — it says more than a
++ * code would. */
++ApiError TransportFailure(const net::Response &res)
++{
++	return NetworkFailure(res.error.empty() ? std::string("transport") : res.error);
++}
++
++bool Failed(const ApiError &error)
++{
++	return !error.fields.empty();
++}
++
++/* ── results and delivery ───────────────────────────────────────────────── */
++
++template <typename T> Result<T> Ok(T value)
++{
++	Result<T> result;
++	result.ok = true;
++	result.value = std::move(value);
++	return result;
++}
++
++template <typename T> Result<T> Fail(const ApiError &error)
++{
++	Result<T> result;
++	result.error = error;
++	return result;
++}
++
++/* Every public callback leaves through dispatch::Post: exactly one call, on the
++ * main thread, whatever happened. Post runs the work inline when it is already
++ * on the main thread, so this is also the cheap path. */
++template <typename T> void Deliver(const std::function<void(Result<T>)> &done, const Result<T> &result)
++{
++	if (!done)
++		return;
++	dispatch::Post([done, result]() { done(result); });
++}
++
++void DeliverSimple(const SimpleFn &done, bool ok, const ApiError &error)
++{
++	if (!done)
++		return;
++	dispatch::Post([done, ok, error]() { done(ok, error); });
++}
++
++void DeliverPath(const PathFn &done, bool ok, const std::string &path, const ApiError &error)
++{
++	if (!done)
++		return;
++	dispatch::Post([done, ok, path, error]() { done(ok, path, error); });
++}
++
++/* ── reading Swift-shaped JSON ──────────────────────────────────────────── */
++
++std::string LowerAscii(std::string text)
++{
++	for (char &c : text)
++		c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
++	return text;
++}
++
++/* `int64(_:)` from BilibiliLiveClient.swift:512 / DanmakuProtocol.swift:208:
++ * any number — a JSON boolean included, because it bridges through NSNumber to
++ * 0/1 — or a decimal string; everything else is 0. */
++long long IntValue(const json &value)
++{
++	if (value.is_number()) {
++		const double number = value.get<double>();
++		if (!std::isfinite(number))
++			return 0;
++		/* Out-of-range float-to-integer conversion is undefined in C++ where
++		 * NSNumber's is not, so clamp before casting. */
++		if (number >= 9223372036854775807.0)
++			return std::numeric_limits<long long>::max();
++		if (number <= -9223372036854775808.0)
++			return std::numeric_limits<long long>::min();
++		return static_cast<long long>(number);
++	}
++	if (value.is_boolean())
++		return value.get<bool>() ? 1 : 0;
++	if (value.is_string()) {
++		const std::string &text = value.get_ref<const std::string &>();
++		if (text.empty())
++			return 0;
++		char *end = nullptr;
++		errno = 0;
++		const long long parsed = std::strtoll(text.c_str(), &end, 10);
++		if (end == text.c_str() + text.size() && errno != ERANGE)
++			return parsed;
++	}
++	return 0;
++}
++
++/* `int(_:)` from the same two places. */
++int IntValueInt(const json &value)
++{
++	return static_cast<int>(IntValue(value));
++}
++
++/* `d["a"] ?? d["b"]`: the fallback happens only when the key is absent. A
++ * present null wins the chain and reads as 0 — or as no string at all. */
++const json *FieldValue(const json &object, std::initializer_list<const char *> keys)
++{
++	if (!object.is_object())
++		return nullptr;
++	for (const char *key : keys) {
++		auto it = object.find(key);
++		if (it != object.end())
++			return &*it;
++	}
++	return nullptr;
++}
++
++long long FieldInt(const json &object, std::initializer_list<const char *> keys)
++{
++	const json *value = FieldValue(object, keys);
++	return value ? IntValue(*value) : 0;
++}
++
++int FieldIntInt(const json &object, const char *key)
++{
++	const json *value = FieldValue(object, {key});
++	return value ? IntValueInt(*value) : 0;
++}
++
++/* `d["a"] as? String ?? d["b"] as? String`: here a non-string value falls
++ * through to the next key, because the cast fails rather than the lookup. */
++std::optional<std::string> FieldString(const json &object, std::initializer_list<const char *> keys)
++{
++	if (!object.is_object())
++		return std::nullopt;
++	for (const char *key : keys) {
++		auto it = object.find(key);
++		if (it != object.end() && it->is_string())
++			return it->get<std::string>();
++	}
++	return std::nullopt;
++}
++
++bool FieldBool(const json &object, const char *key, bool &out)
++{
++	if (!object.is_object())
++		return false;
++	auto it = object.find(key);
++	if (it == object.end() || !it->is_boolean())
++		return false;
++	out = it->get<bool>();
++	return true;
++}
++
++/* `(value as? NSNumber)?.int64Value`: a number or a boolean, never a string
++ * (a Swift String does not bridge to NSNumber). */
++long long NumberField(const json &object, const char *key)
++{
++	const json *value = FieldValue(object, {key});
++	if (!value || !(value->is_number() || value->is_boolean()))
++		return 0;
++	return IntValue(*value);
++}
++
++/* `x as? [String: Any]`: an object, or nullptr. */
++const json *ObjectField(const json &object, const char *key)
++{
++	if (!object.is_object())
++		return nullptr;
++	auto it = object.find(key);
++	return it != object.end() && it->is_object() ? &*it : nullptr;
++}
++
++/* `root["data"] as? [String: Any]` — an object, or nothing. */
++json DataObject(const json &root)
++{
++	const json *data = ObjectField(root, "data");
++	return data ? *data : json();
++}
++
++/* `x as? [[String: Any]]`: an array whose items are all objects. A mixed or
++ * nested array matches neither cast and is skipped whole by the Swift. */
++const json *ObjectArrayField(const json &object, const char *key)
++{
++	if (!object.is_object())
++		return nullptr;
++	auto it = object.find(key);
++	if (it == object.end() || !it->is_array())
++		return nullptr;
++	for (const json &item : *it) {
++		if (!item.is_object())
++			return nullptr;
++	}
++	return &*it;
++}
++
++/* apiCode(_:) from BilibiliLiveClient.swift:456-461: an integral number inside
++ * Int32 that is not a JSON boolean. */
++bool IntegralValue(const json &value, long long &out)
++{
++	if (!value.is_number())
++		return false;
++	const double number = value.get<double>();
++	if (!std::isfinite(number) || number != std::floor(number) || std::abs(number) > 2147483647.0)
++		return false;
++	out = static_cast<long long>(number);
++	return true;
++}
++
++/* `Self.apiCode(root["code"])`, the check every requestJSON answer gets. */
++bool RootCode(const json &root, long long &out)
++{
++	const json *value = FieldValue(root, {"code"});
++	return value && IntegralValue(*value, out);
++}
++
++/* `apiCode(data["live_status"] ?? data["liveStatus"])`. */
++bool LiveStatusCode(const json &data, long long &out)
++{
++	const json *value = FieldValue(data, {"live_status", "liveStatus"});
++	return value && IntegralValue(*value, out);
++}
++
++/* `root["message"] as? String ?? root["msg"] as? String` and the Chinese
++ * fallback BilibiliLiveClient.swift:307,436 carries. */
++std::string ApiMessage(const json &root)
++{
++	if (auto message = FieldString(root, {"message", "msg"}))
++		return *message;
++	return kApiFailureMessage;
++}
++
++/* BilibiliLiveClient.swift:321-332. `required` forces an answer for the
++ * face-auth error codes even when the payload carries neither flag; nullopt
++ * means "this payload is not asking for face verification". */
++std::optional<ApiError> FaceAuthError(const json &data, bool required)
++{
++	bool flagged = false;
++	if (const json *value = FieldValue(data, {"need_face_auth"})) {
++		if (value->is_boolean())
++			flagged = value->get<bool>();
++		else if (value->is_number())
++			flagged = IntValueInt(*value) == 1;
++	}
++	if (auto qr = FieldString(data, {"qr"})) {
++		if (!qr->empty() && (flagged || required))
++			return FaceAuthQr(*qr);
++	}
++	std::optional<std::string> voucher;
++	if (const json *risk = ObjectField(data, "risk_extra"))
++		voucher = FieldString(*risk, {"v_voucher"});
++	if (required || flagged)
++		return FaceAuthRequired(voucher);
++	return std::nullopt;
++}
++
++/* ── HTTP plumbing ──────────────────────────────────────────────────────── */
++
++/* BilibiliLiveClient.swift:392-400: the headers requestJSON sets on top of the
++ * Cookie header the jar owns. */
++void ApplyLiveHeaders(net::Request &req)
++{
++	req.timeout_ms = kTimeoutMs;
++	req.headers["Accept"] = "application/json, text/plain, */*";
++	req.headers["Origin"] = kApiOrigin;
++	req.headers["Referer"] = kLiveReferer;
++	req.headers["User-Agent"] = kUserAgent;
++}
++
++/* A POST whose body is a form, the way `form(_:)` builds it
++ * (BilibiliLiveClient.swift:498-505, :400). */
++net::Request FormPost(const std::string &url, const std::vector<std::pair<std::string, std::string>> &fields)
++{
++	net::Request req;
++	req.method = "POST";
++	req.url = url;
++	req.body = net::FormEncode(fields);
++	req.content_type = "application/x-www-form-urlencoded; charset=UTF-8";
++	ApplyLiveHeaders(req);
++	return req;
++}
++
++using JsonHandler = std::function<void(const json &root, const ApiError &error)>;
++
++/* BilibiliLiveClient.swift:387-440, the requestJSON all the live calls go
++ * through: the HTTP status, then Bilibili's own code, then -101/60043/60024.
++ * `done` gets an empty error.fields on success. */
++void RequestJson(net::Request req, JsonHandler done)
++{
++	net::Send(req, [done](net::Response res) {
++		if (res.status == 0) {
++			done(json(), TransportFailure(res));
++			return;
++		}
++		if (!res.Ok()) {
++			done(json(), HttpFailure(res.status));
++			return;
++		}
++		json root = json::parse(res.body, nullptr, false);
++		long long code = 0;
++		if (root.is_discarded() || !RootCode(root, code)) {
++			done(json(), ServerFailure("invalidResponse"));
++			return;
++		}
++		if (code != 0) {
++			/* BilibiliLiveClient.swift:429-436. */
++			if (code == -101) {
++				done(json(), SessionExpired());
++				return;
++			}
++			if (code == 60043 || code == 60024) {
++				/* `faceAuthError(root["data"], required: true)!` — the
++				 * force-unwrap cannot fail with required set, but the
++				 * fallback keeps this honest without one. */
++				std::optional<ApiError> face = FaceAuthError(DataObject(root), true);
++				done(json(), face ? *face : ApiFailure(code, ApiMessage(root)));
++				return;
++			}
++			done(json(), ApiFailure(code, ApiMessage(root)));
++			return;
++		}
++		done(root, ApiError{});
++	});
++}
++
++/* ── WBI keys (CONTRACT §6.1) ───────────────────────────────────────────── */
++
++/* Filled by FetchIdentity's nav answer, used by FetchDanmakuInfo. Every call
++ * site is on the main thread; the lock costs nothing and keeps the helper
++ * honest if a probe ever calls it from elsewhere. */
++std::mutex g_signer_mutex;
++std::optional<net::WbiSigner> g_signer;
++
++std::optional<net::WbiSigner> CachedSigner()
++{
++	std::lock_guard<std::mutex> lock(g_signer_mutex);
++	return g_signer;
++}
++
++/* LiveRoomActions.swift:40-41: nav carries the WBI keys even when it answers
++ * -101, so they are read without the usual API-code check. */
++void StoreSignerFromNav(const json &root)
++{
++	/* A named copy: ObjectField hands back a pointer, and a pointer into a
++	 * temporary would dangle the moment the full expression ends. */
++	const json data = DataObject(root);
++	const json *wbi = ObjectField(data, "wbi_img");
++	if (!wbi)
++		return;
++	auto signer = net::WbiSigner::FromNav(FieldString(*wbi, {"img_url"}).value_or(""),
++					      FieldString(*wbi, {"sub_url"}).value_or(""));
++	if (!signer)
++		return;
++	std::lock_guard<std::mutex> lock(g_signer_mutex);
++	g_signer = signer;
++}
++
++using SignerHandler = std::function<void(std::optional<net::WbiSigner>, const ApiError &)>;
++
++/* LiveRoomActions.swift:42-57 asks nav again for the keys. The C++ keeps the
++ * copy FetchIdentity already parsed (liveclient.h:76-77) and only pays for a
++ * nav request when nothing has been cached yet. */
++void EnsureWbiSigner(SignerHandler done)
++{
++	if (auto cached = CachedSigner()) {
++		done(cached, ApiError{});
++		return;
++	}
++
++	net::Request req;
++	req.url = kNavUrl;
++	req.timeout_ms = kTimeoutMs;
++	/* :43-47: nav with the live referer and the browser UA — and, unlike the
++	 * live API calls, no Accept and no Origin. */
++	req.headers["Referer"] = kLiveReferer;
++	req.headers["User-Agent"] = kUserAgent;
++	net::Send(req, [done](net::Response res) {
++		if (res.status == 0) {
++			done(std::nullopt, TransportFailure(res));
++			return;
++		}
++		if (!res.Ok()) {
++			done(std::nullopt, HttpFailure(res.status));
++			return;
++		}
++		/* :51-56 parses the body without a code check at all. */
++		json root = json::parse(res.body, nullptr, false);
++		if (root.is_discarded() || !root.is_object()) {
++			done(std::nullopt, ServerFailure("invalidResponse"));
++			return;
++		}
++		StoreSignerFromNav(root);
++		if (auto signer = CachedSigner()) {
++			done(signer, ApiError{});
++			return;
++		}
++		done(std::nullopt, ServerFailure("invalidResponse"));
++	});
++}
++
++/* ── rooms ──────────────────────────────────────────────────────────────── */
++
++/* BilibiliLiveClient.swift:375-383, the legacy getRoomInfoOld answer:
++ * data.room_info ?? data, then roomid ?? room_id and roomname ?? title. */
++bool ParseLegacyRoom(const json &root, RoomInfo &out)
++{
++	const json data = DataObject(root);
++	if (!data.is_object())
++		return false;
++	const json *info = ObjectField(data, "room_info");
++	const json &d = info ? *info : data;
++	const long long room_id = FieldInt(d, {"room_id", "roomid"});
++	if (room_id <= 0)
++		return false;
++	out.room_id = room_id;
++	out.uid = FieldInt(d, {"uid"});
++	out.short_room_id = FieldInt(d, {"short_id"});
++	out.title = FieldString(d, {"title", "roomname"}).value_or("");
++	const json *status = FieldValue(d, {"live_status", "liveStatus"});
++	out.live_status = status ? IntValueInt(*status) : 0;
++	out.area_id = FieldInt(d, {"area_v2_id", "area_id"});
++	return true;
++}
++
++/* BilibiliLiveClient.swift:242-261: data.room_id must match the requested room
++ * and live_status must be an integral 0/1/2, or the answer is invalidResponse. */
++bool ParseCanonicalRoom(const json &root, long long room_id, RoomInfo &out)
++{
++	const json data = DataObject(root);
++	long long status = 0;
++	if (!data.is_object() || FieldInt(data, {"room_id"}) != room_id || !LiveStatusCode(data, status))
++		return false;
++	if (status != 0 && status != 1 && status != 2)
++		return false;
++	out.room_id = room_id;
++	out.uid = FieldInt(data, {"uid"});
++	out.short_room_id = FieldInt(data, {"short_id"});
++	out.title = FieldString(data, {"title"}).value_or("");
++	out.live_status = static_cast<int>(status);
++	out.area_id = FieldInt(data, {"area_v2_id", "area_id"});
++	return true;
++}
++
++/* BilibiliLiveClient.swift:109 and :375-383, the first leg of the room lookup.
++ * An answer without a room_info object, or with a non-positive room id, is
++ * BilibiliLiveError.missingRoom — which is what lets FetchRoom fall through
++ * to the other two endpoints. */
++void FetchLegacyRoom(long long mid, RoomFn done)
++{
++	net::Request req;
++	req.url = net::AppendQuery(kRoomInfoOldUrl, net::FormEncode({{"mid", std::to_string(mid)}}));
++	ApplyLiveHeaders(req);
++	RequestJson(req, [done](const json &root, const ApiError &error) {
++		if (Failed(error)) {
++			Deliver(done, Fail<RoomInfo>(error));
++			return;
++		}
++		RoomInfo room;
++		if (!ParseLegacyRoom(root, room)) {
++			Deliver(done, Fail<RoomInfo>(NoLiveRoom()));
++			return;
++		}
++		Deliver(done, Ok(room));
++	});
++}
++
++/* BilibiliLiveClient.swift:134-144. The caller wraps this in `try?`, so every
++ * failure here — transport included — means "no room id from this endpoint". */
++void ResolveRoomByUid(long long mid, std::function<void(long long)> done)
++{
++	net::Request req;
++	req.url = net::AppendQuery(kRoomByUidUrl, net::FormEncode({{"uid", std::to_string(mid)}}));
++	ApplyLiveHeaders(req);
++	RequestJson(req, [done](const json &root, const ApiError &error) {
++		if (Failed(error)) {
++			done(0);
++			return;
++		}
++		/* `int64(data?["room_id"] ?? root["room_id"])`: a present key in data
++		 * wins even when its value is null; only an absent one falls back. */
++		const json data = DataObject(root);
++		long long room_id = 0;
++		if (data.is_object() && data.contains("room_id"))
++			room_id = IntValue(*FieldValue(data, {"room_id"}));
++		else
++			room_id = FieldInt(root, {"room_id"});
++		done(room_id > 0 ? room_id : 0);
++	});
++}
++
++/* BilibiliLiveClient.swift:218-237. The last resort walks every value of every
++ * dictionary; Swift's dictionary order is unspecified and nlohmann's is
++ * sorted, so this answer is deterministic where the Swift's is not. */
++std::optional<long long> FindRoomId(const json &value)
++{
++	if (value.is_object()) {
++		/* Prefer the explicit room keys. */
++		for (const char *key : {"roomid", "room_id", "roomId"}) {
++			if (const json *id = FieldValue(value, {key})) {
++				const long long room_id = IntValue(*id);
++				if (room_id > 0)
++					return room_id;
++			}
++		}
++		for (const char *key : {"room_info", "live_info", "room", "data"}) {
++			if (const json *child = FieldValue(value, {key})) {
++				if (auto room_id = FindRoomId(*child))
++					return room_id;
++			}
++		}
++		/* `id` counts only inside a room_info/live_info object, so an area or
++		 * an unrelated object id is never read as a room id. */
++		if (!value.contains("room_id") && !value.contains("roomid") &&
++		    (value.contains("room_info") || value.contains("live_info"))) {
++			if (const json *id = FieldValue(value, {"id"})) {
++				const long long room_id = IntValue(*id);
++				if (room_id > 0)
++					return room_id;
++			}
++		}
++		for (auto it = value.begin(); it != value.end(); ++it) {
++			if (auto room_id = FindRoomId(it.value()))
++				return room_id;
++		}
++	} else if (value.is_array()) {
++		for (const json &child : value) {
++			if (auto room_id = FindRoomId(child))
++				return room_id;
++		}
++	}
++	return std::nullopt;
++}
++
++/* BilibiliLiveClient.swift:212-240, the authenticated legacy endpoint that
++ * still knows the room id when getRoomInfoOld answers with an empty
++ * room_info — which some accounts do until the live page has been opened. */
++void ResolveCurrentRoom(std::function<void(long long, const ApiError &)> done)
++{
++	net::Request req;
++	req.url = kLiveInfoUrl;
++	ApplyLiveHeaders(req);
++	RequestJson(req, [done](const json &root, const ApiError &error) {
++		if (Failed(error)) {
++			done(0, error);
++			return;
++		}
++		std::optional<long long> room_id;
++		if (const json *data = FieldValue(root, {"data"}))
++			room_id = FindRoomId(*data);
++		if (!room_id) {
++			done(0, NoLiveRoom());
++			return;
++		}
++		done(*room_id, ApiError{});
++	});
++}
++
++/* ── areas ──────────────────────────────────────────────────────────────── */
++
++/* BilibiliLiveClient.swift:146-181. Parent areas are containers; only a node
++ * with an id, a name and no child list is a leaf, and it inherits the enclosing
++ * parent when it has no parent of its own. `startLive.area_v2` needs a leaf id
++ * — a parent id earns Bilibili's generic -400. */
++struct AreaTree {
++	std::vector<json> leaves;
++
++	void Flatten(const json &value, long long parent_id, const std::string &parent_name)
++	{
++		/* `value as? [[String: Any]]`: an array of dictionaries and nothing
++		 * else, so a mixed or nested array is skipped whole. */
++		if (value.is_array()) {
++			for (const json &item : value) {
++				if (!item.is_object())
++					return;
++			}
++			for (const json &item : value)
++				Flatten(item, parent_id, parent_name);
++			return;
++		}
++		if (!value.is_object())
++			return;
++
++		std::vector<json> children;
++		for (const char *key : {"list", "area_list", "children", "areas"}) {
++			if (const json *child = FieldValue(value, {key}))
++				children.push_back(*child);
++		}
++		const long long own_id = FieldInt(value, {"id", "area_id"});
++		const std::string own_name = FieldString(value, {"name", "area_name"}).value_or("");
++
++		if (children.empty() && (value.contains("id") || value.contains("area_id")) &&
++		    (value.contains("name") || value.contains("area_name"))) {
++			json leaf = value;
++			if (!leaf.contains("parent_id") && !leaf.contains("parent_area_id") && parent_id > 0)
++				leaf["parent_id"] = parent_id;
++			if (!leaf.contains("parent_name") && !leaf.contains("parent_area_name") && !parent_name.empty())
++				leaf["parent_name"] = parent_name;
++			leaves.push_back(std::move(leaf));
++		}
++		for (const json &child : children)
++			Flatten(child, own_id > 0 ? own_id : parent_id, own_name.empty() ? parent_name : own_name);
++	}
++};
++
++/* BilibiliLiveClient.swift:184-187 turns the collected leaves into areas; a
++ * leaf without a positive id or a name is dropped. */
++std::optional<Area> ToArea(const json &leaf)
++{
++	const long long id = FieldInt(leaf, {"id", "area_id"});
++	auto name = FieldString(leaf, {"name", "area_name"});
++	if (id <= 0 || !name)
++		return std::nullopt;
++	Area area;
++	area.id = id;
++	area.parent_id = FieldInt(leaf, {"parent_id", "parent_area_id"});
++	area.name = *name;
++	area.parent_name = FieldString(leaf, {"parent_name", "parent_area_name"}).value_or("");
++	return area;
++}
++
++/* ── stream endpoints ───────────────────────────────────────────────────── */
++
++/* BilibiliLiveClient.swift:336-341: addr/server/rtmp_addr plus code/key/
++ * stream_code, both non-empty. */
++std::optional<std::pair<std::string, std::string>> StreamPair(const json &value)
++{
++	auto address = FieldString(value, {"addr", "server", "rtmp_addr"});
++	auto key = FieldString(value, {"code", "key", "stream_code"});
++	if (!address || !key || address->empty() || key->empty())
++		return std::nullopt;
++	return std::make_pair(*address, *key);
++}
++
++/* :342-349: every dictionary contributes its pair, children in sorted key
++ * order — "first match wins" must never depend on hash order. */
++void CollectStreamPairs(const json &value, std::vector<std::pair<std::string, std::string>> &out)
++{
++	if (value.is_object()) {
++		if (auto pair = StreamPair(value))
++			out.push_back(*pair);
++		for (auto it = value.begin(); it != value.end(); ++it)
++			CollectStreamPairs(it.value(), out);
++	} else if (value.is_array()) {
++		for (const json &item : value)
++			CollectStreamPairs(item, out);
++	}
++}
++
++/* :350-354: URL(string:) + an rtmp/rtmps scheme + a non-empty host. */
++std::optional<StreamConfig> UsableConfig(const std::pair<std::string, std::string> &candidate)
++{
++	const std::string &address = candidate.first;
++	/* URL(string:) refuses whitespace; the split below would not. */
++	if (address.find_first_of(" \t\r\n") != std::string::npos)
++		return std::nullopt;
++	const size_t scheme_end = address.find("://");
++	if (scheme_end == std::string::npos)
++		return std::nullopt;
++	const std::string scheme = LowerAscii(address.substr(0, scheme_end));
++	if (scheme != "rtmp" && scheme != "rtmps")
++		return std::nullopt;
++	const size_t host_start = scheme_end + 3;
++	const size_t host_end = address.find_first_of("/:?#", host_start);
++	const std::string host =
++		address.substr(host_start, host_end == std::string::npos ? std::string::npos : host_end - host_start);
++	if (host.empty())
++		return std::nullopt;
++	StreamConfig config;
++	config.server = address;
++	config.key = candidate.second;
++	return config;
++}
++
++/* BilibiliLiveClient.swift:334-365. Face verification runs before anything
++ * else, so a payload asking for it never reads as a missing endpoint. */
++Result<StreamConfig> ParseStreamConfig(const json &root)
++{
++	const json data = DataObject(root);
++	if (auto face = FaceAuthError(data, false))
++		return Fail<StreamConfig>(*face);
++
++	std::vector<std::pair<std::string, std::string>> candidates;
++	/* :357-361: the known RTMP locations first — data.rtmp, then the rtmp
++	 * entries of data.protocols — before the generic walk. */
++	if (const json *rtmp = ObjectField(data, "rtmp")) {
++		if (auto pair = StreamPair(*rtmp))
++			candidates.push_back(*pair);
++	}
++	if (const json *protocols = ObjectArrayField(data, "protocols")) {
++		for (const json &entry : *protocols) {
++			auto protocol = FieldString(entry, {"protocol"});
++			if (protocol && LowerAscii(*protocol) == "rtmp") {
++				if (auto pair = StreamPair(entry))
++					candidates.push_back(*pair);
++			}
++		}
++	}
++	CollectStreamPairs(data, candidates);
++	for (const auto &candidate : candidates) {
++		if (auto config = UsableConfig(candidate))
++			return Ok(*config);
++	}
++	/* CBridge.swift:212-213 maps this to {"kind":"server",
++	 * "message":"missingStreamConfig"}. */
++	return Fail<StreamConfig>(ServerFailure("missingStreamConfig"));
++}
++
++/* ── moderation helpers ─────────────────────────────────────────────────── */
++
++/* LiveRoomActions.swift:163-178: the list's key names are not stable across
++ * versions, so every non-empty "keyword" string (or plain string item) is
++ * taken. Swift sorts each dictionary's keys; nlohmann's map is already sorted. */
++void CollectKeywords(const json &value, std::vector<std::string> &found)
++{
++	if (value.is_object()) {
++		auto it = value.find("keyword");
++		if (it != value.end() && it->is_string() && !it->get_ref<const std::string &>().empty()) {
++			found.push_back(it->get<std::string>());
++			return;
++		}
++		for (auto child = value.begin(); child != value.end(); ++child)
++			CollectKeywords(child.value(), found);
++	} else if (value.is_array()) {
++		for (const json &item : value) {
++			if (item.is_string() && !item.get_ref<const std::string &>().empty())
++				found.push_back(item.get<std::string>());
++			else
++				CollectKeywords(item, found);
++		}
++	}
++}
++
++/* LiveRoomActions.swift:122-131: any truthy "identified"/"is_face"/"is_auth"/
++ * "face_auth" style field counts; anything else reads as "not yet". */
++bool Identified(const json &value)
++{
++	if (!value.is_object()) {
++		/* `(value as? Bool) ?? false` — a bare true, or a bare NSNumber 0/1. */
++		if (value.is_boolean())
++			return value.get<bool>();
++		if (value.is_number())
++			return IntValueInt(value) == 1;
++		return false;
++	}
++	for (auto it = value.begin(); it != value.end(); ++it) {
++		const std::string name = LowerAscii(it.key());
++		const bool relevant = name.find("identif") != std::string::npos ||
++				      name.find("is_face") != std::string::npos || name == "is_auth" ||
++				      name == "face_auth";
++		if (!relevant)
++			continue;
++		if (it->is_boolean() && it->get<bool>())
++			return true;
++		if (it->is_number() && IntValueInt(*it) == 1)
++			return true;
++	}
++	return false;
++}
++
++/* ── emoticon shapes (Emoticons.swift:35-93, :240-247) ─────────────────── */
++
++/* `text.count > 2 && text.hasPrefix("[") && text.hasSuffix("]")`
++ * (Emoticons.swift:22). Swift counts Characters; these codes are ASCII
++ * delimited, so counting UTF-8 code points gives the same number without a
++ * Unicode table. */
++bool InlineCode(const std::string &text)
++{
++	size_t characters = 0;
++	for (unsigned char byte : text) {
++		if ((byte & 0xC0) != 0x80)
++			++characters;
++	}
++	return characters > 2 && !text.empty() && text.front() == '[' && text.back() == ']';
++}
++
++/* Emoticons.swift:38-58: root.data.data[] packs with emoticons[]. Packs and
++ * items without a usable image are dropped. The JSON is already the CBridge
++ * field shape (:242-244), which is what the UI reads. */
++std::vector<json> ParseLivePacks(const json &root)
++{
++	std::vector<json> packs;
++	/* Named copies: the Object* helpers hand back pointers into their
++	 * argument, so the argument has to outlive the pointer. */
++	const json data = DataObject(root);
++	const json *list = ObjectArrayField(data, "data");
++	if (!list)
++		return packs;
++
++	for (const json &pack : *list) {
++		json items = json::array();
++		if (const json *emoticons = ObjectArrayField(pack, "emoticons")) {
++			for (const json &item : *emoticons) {
++				auto url = FieldString(item, {"url"});
++				auto unique = FieldString(item, {"emoticon_unique"});
++				if (!url || url->empty() || !unique || unique->empty())
++					continue;
++				const std::string name = FieldString(item, {"descript"}).value_or("");
++				const std::string text = FieldString(item, {"emoji"}).value_or(name);
++				/* `item["perm"].map { int($0) } ?? 1`: a present key counts
++				 * even when its value is null, so only an absent one is 1. */
++				const long long perm = item.contains("perm") ? IntValue(*FieldValue(item, {"perm"})) : 1;
++				std::string hint;
++				if (auto unlock = FieldString(item, {"unlock_show_text"})) {
++					if (!unlock->empty())
++						hint = *unlock;
++				}
++				if (hint.empty()) {
++					const int level = FieldIntInt(item, "unlock_need_level");
++					if (level > 0)
++						hint = "Lv" + std::to_string(level);
++				}
++				items.push_back(json{{"key", *unique},
++						     {"text", text.empty() ? name : text},
++						     {"name", name.empty() ? text : name},
++						     {"url", *url},
++						     {"w", FieldIntInt(item, "width")},
++						     {"h", FieldIntInt(item, "height")},
++						     {"inline", InlineCode(text)},
++						     {"usable", perm != 0},
++						     {"hint", hint}});
++			}
++		}
++		if (items.empty())
++			continue;
++		bool all_inline = true;
++		for (const json &item : items) {
++			if (!item.value("inline", false))
++				all_inline = false;
++		}
++		packs.push_back(json{{"id", FieldInt(pack, {"pkg_id"})},
++				     {"name", FieldString(pack, {"pkg_name"}).value_or("")},
++				     {"large", !all_inline},
++				     {"items", std::move(items)}});
++	}
++	return packs;
++}
++
++/* Emoticons.swift:66-84: root.data.packages[] with emote[] of "[code]" texts
++ * (the 小黄脸 set and the packs the account owns). Text-only packs are left
++ * out; the apps send these as stickers named "upower_" + code, and
++ * sentAsText: false keeps them out of the inline path (:78). */
++std::vector<json> ParseMainSitePacks(const json &root)
++{
++	std::vector<json> packs;
++	/* Named copy, for the same lifetime reason as ParseLivePacks. */
++	const json data = DataObject(root);
++	const json *list = ObjectArrayField(data, "packages");
++	if (!list)
++		return packs;
++
++	for (const json &pack : *list) {
++		json items = json::array();
++		if (const json *emotes = ObjectArrayField(pack, "emote")) {
++			for (const json &item : *emotes) {
++				auto url = FieldString(item, {"url"});
++				auto text = FieldString(item, {"text"});
++				if (!url || !text)
++					continue;
++				if (url->compare(0, 4, "http") != 0 && url->compare(0, 2, "//") != 0)
++					continue;
++				if (text->size() < 2 || text->front() != '[' || text->back() != ']')
++					continue;
++				bool no_access = false;
++				bool unlocked = false;
++				if (const json *flags = ObjectField(item, "flags")) {
++					FieldBool(*flags, "no_access", no_access);
++					FieldBool(*flags, "unlocked", unlocked);
++				}
++				const json *meta = ObjectField(item, "meta");
++				const std::string alias = meta ? FieldString(*meta, {"alias"}).value_or("") : "";
++				items.push_back(json{{"key", "upower_" + *text},
++						     {"text", *text},
++						     {"name", alias.empty() ? *text : alias},
++						     {"url", *url},
++						     {"w", 0},
++						     {"h", 0},
++						     {"inline", false},
++						     {"usable", !(no_access && !unlocked)},
++						     {"hint", ""}});
++			}
++		}
++		if (items.empty())
++			continue;
++		const json *meta = ObjectField(pack, "meta");
++		const int size = meta ? FieldIntInt(*meta, "size") : 0;
++		packs.push_back(json{{"id", FieldInt(pack, {"id"})},
++				     {"name", FieldString(pack, {"text"}).value_or("")},
++				     {"large", size == 2},
++				     {"items", std::move(items)}});
++	}
++	return packs;
++}
++
++/* The id my own pack objects carry, read back for the merge order. */
++long long PackId(const json &pack)
++{
++	auto it = pack.find("id");
++	return it != pack.end() ? IntValue(*it) : 0;
++}
++
++/* ── emoticon pictures (Emoticons.swift:146-237) ───────────────────────── */
++
++/* :168-175: https only, and only Bilibili's image hosts. "//host/x" and
++ * "http://host/x" are both rewritten to https first. */
++std::optional<std::string> AllowedImageUrl(const std::string &address)
++{
++	std::string url = address;
++	if (url.compare(0, 2, "//") == 0)
++		url = "https:" + url;
++	else if (url.compare(0, 7, "http://") == 0)
++		url = "https://" + url.substr(7);
++	if (url.compare(0, 8, "https://") != 0)
++		return std::nullopt;
++
++	const size_t host_start = 8;
++	const size_t host_end = url.find_first_of("/?#:", host_start);
++	const std::string host =
++		LowerAscii(url.substr(host_start, host_end == std::string::npos ? std::string::npos : host_end - host_start));
++	for (const char *allowed : {"hdslb.com", "biliimg.com"}) {
++		if (host == allowed)
++			return url;
++		const std::string suffix = std::string(".") + allowed;
++		if (host.size() > suffix.size() &&
++		    host.compare(host.size() - suffix.size(), suffix.size(), suffix) == 0)
++			return url;
++	}
++	return std::nullopt;
++}
++
++/* :164-180: %LOCALAPPDATA%\LiveHime\emoticons\<sha256 of the address>.png —
++ * the Windows stand-in for Caches/LiveHime/emoticons. _wgetenv keeps a
++ * non-ASCII user name intact where the ANSI CRT would not. */
++std::optional<std::filesystem::path> CacheFolder()
++{
++	const wchar_t *local = _wgetenv(L"LOCALAPPDATA");
++	if (!local || !*local)
++		return std::nullopt;
++	return std::filesystem::path(local) / L"LiveHime" / L"emoticons";
++}
++
++std::filesystem::path CacheFile(const std::filesystem::path &folder, const std::string &address)
++{
++	return folder / (crypto::Sha256Hex(address) + ".png");
++}
++
++/* The Swift's acceptance test is "CGImageSourceCreateWithData decodes it"
++ * (:194). The C++ core has no image codec, so this is the cheap stand-in: the
++ * formats those hosts serve. */
++bool LooksLikeImage(const std::string &bytes)
++{
++	static const char kPng[] = "\x89PNG\r\n\x1a\n";
++	if (bytes.size() >= 8 && bytes.compare(0, 8, kPng, 8) == 0)
++		return true;
++	if (bytes.size() >= 3 && bytes.compare(0, 3, "\xff\xd8\xff", 3) == 0)
++		return true;
++	if (bytes.size() >= 4 && bytes.compare(0, 4, "GIF8", 4) == 0)
++		return true;
++	if (bytes.size() >= 12 && bytes.compare(0, 4, "RIFF", 4) == 0 && bytes.compare(8, 4, "WEBP", 4) == 0)
++		return true;
++	if (bytes.size() >= 2 && bytes.compare(0, 2, "BM", 2) == 0)
++		return true;
++	if (bytes.size() >= 12 && bytes.compare(4, 4, "ftyp", 4) == 0)
++		return true; /* HEIF/AVIF */
++	return false;
++}
++
++/* Writes the picture and reports whether the bytes really landed: a caller
++ * that gets a path back may open it immediately. */
++bool WriteCacheFile(const std::filesystem::path &path, const std::string &bytes)
++{
++	std::error_code ec;
++	std::filesystem::create_directories(path.parent_path(), ec);
++	if (ec)
++		return false;
++	std::ofstream stream(path, std::ios::binary | std::ios::trunc);
++	if (!stream)
++		return false;
++	stream.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
++	stream.close();
++	if (!stream)
++		return false;
++	return true;
++}
++
++/* Addresses being downloaded right now (Emoticons.swift:151, :186-187).
++ * Main-thread only, like every callback in this file. */
++std::map<std::string, std::vector<PathFn>> g_image_waiters;
++
++/* Hands the answer to everyone waiting on this address, exactly once. */
++void DeliverImage(const std::string &url, const std::string &path, const ApiError &error)
++{
++	std::vector<PathFn> waiters;
++	auto it = g_image_waiters.find(url);
++	if (it != g_image_waiters.end()) {
++		waiters = std::move(it->second);
++		g_image_waiters.erase(it);
++	}
++	const bool ok = !Failed(error) && !path.empty();
++	for (const PathFn &waiter : waiters)
++		DeliverPath(waiter, ok, path, error);
++}
++
++/* ── shared continuations ───────────────────────────────────────────────── */
++
++/* BilibiliLiveClient.swift:192-203. startLive keeps the known markers as a
++ * transient-network fallback (:267-269), so every failure here is swallowed
++ * and the fallback values answer instead. */
++void FetchLiveVersionBestEffort(const std::function<void(std::string, int)> &done)
++{
++	net::Request req;
++	req.url = net::AppendQuery(kLiveVersionUrl, net::FormEncode({{"system_version", "2"}}));
++	ApplyLiveHeaders(req);
++	RequestJson(req, [done](const json &root, const ApiError &error) {
++		std::string version = "8.6.0";
++		int build = 11050;
++		if (!Failed(error)) {
++			/* `root["data"] as? [String: Any] ?? root` */
++			const json *data = ObjectField(root, "data");
++			const json &source = data ? *data : root;
++			const std::string candidate = FieldString(source, {"curr_version", "version"}).value_or("");
++			const int value = FieldIntInt(source, "build");
++			/* :201: both markers must be present or it is invalidResponse. */
++			if (!candidate.empty() && value > 0) {
++				version = candidate;
++				build = value;
++			}
++		}
++		done(version, build);
++	});
++}
++
++/* BilibiliLiveClient.swift:476-488: the server clock from
++ * /x/report/click/now, or the local one when that endpoint does not answer
++ * with a positive `now` — including a Bilibili code that is not 0. */
++void FetchServerTimestampBestEffort(const std::function<void(long long)> &done)
++{
++	net::Request req;
++	req.url = kServerClockUrl;
++	ApplyLiveHeaders(req);
++	RequestJson(req, [done](const json &root, const ApiError &error) {
++		long long now = 0;
++		if (!Failed(error))
++			now = FieldInt(DataObject(root), {"now"});
++		if (now <= 0)
++			now = static_cast<long long>(std::time(nullptr));
++		done(now);
++	});
++}
++
++/* LiveRoomActions.swift:29-38: buvid3 identifies the browser to the danmaku
++ * server and QR login does not set it, so the public fingerprint endpoint
++ * supplies it. */
++void EnsureBuvid3(const std::function<void(const ApiError &)> &done)
++{
++	if (net::CookieJar::Instance().Has("buvid3")) {
++		done(ApiError{});
++		return;
++	}
++	net::Request req;
++	req.url = kFingerprintUrl;
++	ApplyLiveHeaders(req);
++	RequestJson(req, [done](const json &root, const ApiError &error) {
++		if (Failed(error)) {
++			done(error);
++			return;
++		}
++		auto value = FieldString(DataObject(root), {"b_3"});
++		if (!value || value->empty()) {
++			done(ServerFailure("invalidResponse"));
++			return;
++		}
++		/* The Swift sends the rest of this request chain with a temporary
++		 * "; buvid3=" appended to its cookie header (:61). The frozen http
++		 * layer owns the Cookie header, so the jar is the C++ equivalent —
++		 * and the danmaku client reads it back through CookieHeader(). */
++		net::CookieJar::Instance().Set(".bilibili.com", "buvid3", *value);
++		done(ApiError{});
++	});
++}
++
++/* ── public interface ───────────────────────────────────────────────────── */
++
++} // namespace
++
++/* GET /x/web-interface/nav. Reads the WBI keys too; they are present even when
++ * the answer is -101. */
++void FetchIdentity(IdentityFn done)
++{
++	/* BilibiliControlClient.swift:33-88. */
++	net::Request req;
++	req.url = kNavUrl;
++	req.timeout_ms = kTimeoutMs;
++	/* :47-49: nav takes the browser UA, the www referer and the JSON Accept,
++	 * and no Origin — the live API's headers are not used here. The jar
++	 * supplies the Cookie header. */
++	req.headers["Accept"] = "application/json, text/plain, */*";
++	req.headers["Referer"] = kNavReferer;
++	req.headers["User-Agent"] = kUserAgent;
++
++	net::Send(req, [done](net::Response res) {
++		if (res.status == 0) {
++			Deliver(done, Fail<Identity>(TransportFailure(res)));
++			return;
++		}
++		if (!res.Ok()) {
++			Deliver(done, Fail<Identity>(HttpFailure(res.status)));
++			return;
++		}
++		const json root = json::parse(res.body, nullptr, false);
++		if (root.is_discarded() || !root.is_object()) {
++			Deliver(done, Fail<Identity>(ServerFailure("invalidResponse")));
++			return;
++		}
++		/* LiveRoomActions.swift:40-41: the keys are read before the code
++		 * check, because nav answers them even when signed out (-101). */
++		StoreSignerFromNav(root);
++		long long code = 0;
++		if (!RootCode(root, code)) {
++			Deliver(done, Fail<Identity>(ServerFailure("invalidResponse")));
++			return;
++		}
++		if (code != 0) {
++			if (code == -101) {
++				Deliver(done, Fail<Identity>(SessionExpired()));
++				return;
++			}
++			/* :75 names this one itself, instead of requestJSON's message. */
++			Deliver(done, Fail<Identity>(ApiFailure(code, kIdentityFailureMessage)));
++			return;
++		}
++		const json data = DataObject(root);
++		bool is_login = false;
++		if (!data.is_object() || !FieldBool(data, "isLogin", is_login)) {
++			Deliver(done, Fail<Identity>(ServerFailure("invalidResponse")));
++			return;
++		}
++		/* :80: isLogin false is the other "not logged in" answer. */
++		if (!is_login) {
++			Deliver(done, Fail<Identity>(SessionExpired()));
++			return;
++		}
++		/* :82-85: `mid` must be a positive number (a string does not count)
++		 * or the answer is invalid rather than signed in. */
++		const long long mid = NumberField(data, "mid");
++		if (mid <= 0) {
++			Deliver(done, Fail<Identity>(ServerFailure("invalidResponse")));
++			return;
++		}
++		Identity identity;
++		identity.mid = mid;
++		identity.username = FieldString(data, {"uname"}).value_or("");
++		identity.logged_in = true;
++		Deliver(done, Ok(identity));
++	});
++}
++
++/* Room for the signed-in account. Tries room_id_by_uid then getRoomInfoOld,
++ * the order BilibiliLiveClient.swift:205-260 uses. */
++void FetchRoom(long long mid, RoomFn done)
++{
++	/* BilibiliLiveClient.swift:107-132. Only a missingRoom answer falls
++	 * through to the other endpoints (`catch BilibiliLiveError.missingRoom`);
++	 * a transport or API error is the answer. */
++	FetchLegacyRoom(mid, [mid, done](Result<RoomInfo> legacy) {
++		if (!legacy.ok) {
++			if (legacy.error.Kind() != "noLiveRoom") {
++				Deliver(done, legacy);
++				return;
++			}
++			/* `if let roomID = try? await resolveRoomIDByUID(mid: mid)` —
++			 * every failure of that endpoint means "try liveinfo next". */
++			ResolveRoomByUid(mid, [done](long long room_id) {
++				if (room_id > 0) {
++					FetchRoomInfo(room_id, done);
++					return;
++				}
++				ResolveCurrentRoom([done](long long current, const ApiError &error) {
++					if (Failed(error)) {
++						Deliver(done, Fail<RoomInfo>(error));
++						return;
++					}
++					FetchRoomInfo(current, done);
++				});
++			});
++			return;
++		}
++		/* getRoomInfoOld omits the v2 child-area id. Fetch the canonical
++		 * record so startLive receives the required area_v2 value; a failure
++		 * or an area id of 0 keeps the legacy record (:112-116). */
++		if (legacy.value.area_id == 0) {
++			FetchRoomInfo(legacy.value.room_id, [legacy, done](Result<RoomInfo> canonical) {
++				if (canonical.ok && canonical.value.area_id != 0) {
++					Deliver(done, canonical);
++					return;
++				}
++				Deliver(done, legacy);
++			});
++			return;
++		}
++		Deliver(done, legacy);
++	});
++}
++
++/* GET /room/v1/Room/get_info — the shape the danmaku reconnect path reads. */
++void FetchRoomInfo(long long room_id, RoomFn done)
++{
++	/* BilibiliLiveClient.swift:242-261. */
++	net::Request req;
++	req.url = net::AppendQuery(kRoomInfoUrl, net::FormEncode({{"room_id", std::to_string(room_id)}}));
++	ApplyLiveHeaders(req);
++	RequestJson(req, [room_id, done](const json &root, const ApiError &error) {
++		if (Failed(error)) {
++			Deliver(done, Fail<RoomInfo>(error));
++			return;
++		}
++		RoomInfo room;
++		if (!ParseCanonicalRoom(root, room_id, room)) {
++			Deliver(done, Fail<RoomInfo>(ServerFailure("invalidResponse")));
++			return;
++		}
++		Deliver(done, Ok(room));
++	});
++}
++
++/* GET /room/v1/Area/getList */
++void FetchAreas(AreasFn done)
++{
++	/* BilibiliLiveClient.swift:146-188; the C++ call has no parent_id, so the
++	 * query is the platform alone (:147). */
++	net::Request req;
++	req.url = net::AppendQuery(kAreaListUrl, net::FormEncode({{"platform", "pc_link"}}));
++	ApplyLiveHeaders(req);
++	RequestJson(req, [done](const json &root, const ApiError &error) {
++		if (Failed(error)) {
++			Deliver(done, Fail<std::vector<Area>>(error));
++			return;
++		}
++		/* `guard let data = root["data"]` — even a null passes it, and then
++		 * yields no leaves, which is invalidResponse (:150, :183). */
++		const json *data = FieldValue(root, {"data"});
++		if (!data) {
++			Deliver(done, Fail<std::vector<Area>>(ServerFailure("invalidResponse")));
++			return;
++		}
++		AreaTree tree;
++		tree.Flatten(*data, 0, "");
++		if (tree.leaves.empty()) {
++			Deliver(done, Fail<std::vector<Area>>(ServerFailure("invalidResponse")));
++			return;
++		}
++		std::vector<Area> areas;
++		for (const json &leaf : tree.leaves) {
++			if (auto area = ToArea(leaf))
++				areas.push_back(*area);
++		}
++		Deliver(done, Ok(std::move(areas)));
++	});
++}
++
++/* POST /room/v1/Room/startLive — see CONTRACT §6.2 for the signature. */
++void StartLive(long long room_id, const Area &area, StreamFn done)
++{
++	/* BilibiliLiveClient.swift:263-288. The csrf is read before anything is
++	 * requested; a missing bili_jct is a failure, not a reason to ask. */
++	const std::string csrf = net::CookieJar::Instance().Get("bili_jct");
++	if (csrf.empty()) {
++		/* CBridge.swift:214-217 maps missingCSRF to server, not to a session
++		 * that expired — only -101 is notLoggedIn in the Swift. */
++		Deliver(done, Fail<StreamConfig>(ServerFailure("missingCSRF")));
++		return;
++	}
++
++	/* Two best-effort lookups before signing, in this order: the client
++	 * version markers (:267) and the server clock (:277). */
++	FetchLiveVersionBestEffort([room_id, area_id = area.id, csrf, done](std::string version, int build) {
++		FetchServerTimestampBestEffort([room_id, area_id, csrf, version, build, done](long long timestamp) {
++			/* The eight fields in this exact insertion order; the source
++			 * calls the order load-bearing, and extra fields such as
++			 * csrf_token/backup_stream make newer accounts reject the
++			 * request (:270-273). The Swift's parentAreaID parameter is
++			 * accepted and never used — area_v2 is the leaf id alone. */
++			std::vector<std::pair<std::string, std::string>> values = {
++				{"appkey", net::kPcLinkAppKey},
++				{"area_v2", std::to_string(area_id)},
++				{"build", std::to_string(build)},
++				{"csrf", csrf},
++				{"platform", "pc_link"},
++				{"room_id", std::to_string(room_id)},
++				{"ts", std::to_string(timestamp)},
++				{"version", version},
++			};
++			std::vector<std::pair<std::string, std::string>> signed_values = values;
++			signed_values.emplace_back("sign", net::PcLinkSign(values));
++
++			/* All nine pairs travel on the query string of a POST; the body
++			 * stays empty, exactly like `body: nil` with httpMethod "POST"
++			 * (:283-286), so no Content-Type is sent either. */
++			net::Request req;
++			req.method = "POST";
++			req.url = net::AppendQuery(kStartLiveUrl, net::FormEncode(signed_values));
++			ApplyLiveHeaders(req);
++			RequestJson(req, [done](const json &root, const ApiError &error) {
++				if (Failed(error)) {
++					Deliver(done, Fail<StreamConfig>(error));
++					return;
++				}
++				Deliver(done, ParseStreamConfig(root));
++			});
++		});
++	});
++}
++
++void StopLive(long long room_id, SimpleFn done)
++{
++	/* BilibiliLiveClient.swift:290-297. */
++	const std::string csrf = net::CookieJar::Instance().Get("bili_jct");
++	if (csrf.empty()) {
++		DeliverSimple(done, false, ServerFailure("missingCSRF"));
++		return;
++	}
++	net::Request req = FormPost(kStopLiveUrl, {{"room_id", std::to_string(room_id)},
++						   {"platform", "pc_link"},
++						   {"csrf", csrf},
++						   {"csrf_token", csrf}});
++	RequestJson(req, [done](const json &, const ApiError &error) {
++		DeliverSimple(done, !Failed(error), error);
++	});
++}
++
++/* GET /xlive/app-blink/v1/live/GetUpStreamRtmp */
++void FetchUpstream(long long room_id, StreamFn done)
++{
++	/* BilibiliLiveClient.swift:205-210: platform=pc_link, and room_id only
++	 * when one is known. The Swift's parameter is optional; `<= 0` is the only
++	 * way this signature can say "absent". */
++	std::vector<std::pair<std::string, std::string>> query = {{"platform", "pc_link"}};
++	if (room_id > 0)
++		query.emplace_back("room_id", std::to_string(room_id));
++	net::Request req;
++	req.url = net::AppendQuery(kUpstreamUrl, net::FormEncode(query));
++	ApplyLiveHeaders(req);
++	RequestJson(req, [done](const json &root, const ApiError &error) {
++		if (Failed(error)) {
++			Deliver(done, Fail<StreamConfig>(error));
++			return;
++		}
++		Deliver(done, ParseStreamConfig(root));
++	});
++}
++
++void UpdateTitle(long long room_id, const std::string &title, SimpleFn done)
++{
++	/* LiveRoomActions.swift:96-102. The trimming the dock does lives in
++	 * SessionCoordinator.swift:271-272, not here. */
++	const std::string csrf = net::CookieJar::Instance().Get("bili_jct");
++	if (csrf.empty()) {
++		DeliverSimple(done, false, ServerFailure("missingCSRF"));
++		return;
++	}
++	net::Request req = FormPost(kRoomUpdateUrl, {{"room_id", std::to_string(room_id)},
++						     {"title", title},
++						     {"csrf", csrf},
++						     {"csrf_token", csrf}});
++	RequestJson(req, [done](const json &, const ApiError &error) {
++		DeliverSimple(done, !Failed(error), error);
++	});
++}
++
++/* POST /msg/send. `reply_uid` > 0 makes it a reply; `reply_danmaku_id` may be
++ * empty. `emoticon_unique` non-empty sends a sticker instead of text. */
++void SendDanmaku(long long room_id, const std::string &text, long long reply_uid,
++		 const std::string &reply_danmaku_id, const std::string &emoticon_unique, SimpleFn done)
++{
++	/* LiveRoomActions.swift:80-94 for text, Emoticons.swift:125-139 for a
++	 * sticker: one body, with the sticker using its unique as msg and adding
++	 * dm_type/emoticonOptions. */
++	const std::string csrf = net::CookieJar::Instance().Get("bili_jct");
++	if (csrf.empty()) {
++		DeliverSimple(done, false, ServerFailure("missingCSRF"));
++		return;
++	}
++
++	const bool sticker = !emoticon_unique.empty();
++	const std::string reply_mid = reply_uid > 0 ? std::to_string(reply_uid) : "0";
++	/* The reply exists only when there is a uid to reply to, so its danmaku
++	 * id is empty otherwise (CBridge.swift:285). */
++	const std::string reply_dmid = reply_uid > 0 ? reply_danmaku_id : "";
++
++	std::vector<std::pair<std::string, std::string>> fields = {
++		{"bubble", "0"},
++		{"msg", sticker ? emoticon_unique : text},
++		{"color", "16777215"},
++		{"mode", "1"},
++		{"room_type", "0"},
++		{"jumpfrom", "0"},
++		{"reply_mid", reply_mid},
++		{"reply_attr", "0"},
++		/* The web room spells it replay_dmid (sic); LiveHime for Windows
++		 * names it reply_dmid, so both are sent (:77-79). */
++		{"replay_dmid", reply_dmid},
++		{"reply_dmid", reply_dmid},
++	};
++	if (sticker) {
++		fields.emplace_back("dm_type", "1");
++		fields.emplace_back("emoticonOptions", "[object Object]");
++	}
++	fields.emplace_back("statistics", R"({"appId":100,"platform":5})");
++	fields.emplace_back("fontsize", "25");
++	fields.emplace_back("rnd", std::to_string(static_cast<long long>(std::time(nullptr))));
++	fields.emplace_back("roomid", std::to_string(room_id));
++	fields.emplace_back("csrf", csrf);
++	fields.emplace_back("csrf_token", csrf);
++
++	RequestJson(FormPost(kSendDanmakuUrl, fields), [done](const json &, const ApiError &error) {
++		DeliverSimple(done, !Failed(error), error);
++	});
++}
++
++/* POST /xlive/web-ucenter/v1/banned/AddSilentUser. hours: -1 permanent,
++ * 0 current live session, otherwise that many hours. */
++void MuteUser(long long room_id, long long uid, int hours, SimpleFn done)
++{
++	/* LiveRoomActions.swift:135-142. */
++	const std::string csrf = net::CookieJar::Instance().Get("bili_jct");
++	if (csrf.empty()) {
++		DeliverSimple(done, false, ServerFailure("missingCSRF"));
++		return;
++	}
++	net::Request req = FormPost(kMuteUserUrl, {{"room_id", std::to_string(room_id)},
++						   {"tuid", std::to_string(uid)},
++						   {"mobile_app", "web"},
++						   {"type", "1"},
++						   {"hour", std::to_string(hours)},
++						   {"csrf", csrf},
++						   {"csrf_token", csrf},
++						   {"visit_id", ""}});
++	RequestJson(req, [done](const json &, const ApiError &error) {
++		DeliverSimple(done, !Failed(error), error);
++	});
++}
++
++void LoadShieldKeywords(long long room_id, KeywordsFn done)
++{
++	/* LiveRoomActions.swift:144-150. */
++	const std::string csrf = net::CookieJar::Instance().Get("bili_jct");
++	if (csrf.empty()) {
++		Deliver(done, Fail<std::vector<std::string>>(ServerFailure("missingCSRF")));
++		return;
++	}
++	net::Request req = FormPost(kShieldListUrl,
++				    {{"room_id", std::to_string(room_id)}, {"csrf", csrf}, {"csrf_token", csrf}});
++	RequestJson(req, [done](const json &root, const ApiError &error) {
++		if (Failed(error)) {
++			Deliver(done, Fail<std::vector<std::string>>(error));
++			return;
++		}
++		std::vector<std::string> found;
++		if (const json *data = FieldValue(root, {"data"}))
++			CollectKeywords(*data, found);
++		/* `seen.insert($0).inserted` — first-seen order, no repeats. */
++		std::vector<std::string> unique;
++		for (auto &word : found) {
++			if (std::find(unique.begin(), unique.end(), word) == unique.end())
++				unique.push_back(std::move(word));
++		}
++		Deliver(done, Ok(std::move(unique)));
++	});
++}
++
++void SetShieldKeyword(long long room_id, const std::string &keyword, bool add, SimpleFn done)
++{
++	/* LiveRoomActions.swift:152-159. Re-reading the list afterwards is the
++	 * caller's step (CBridge.swift:359-362). */
++	const std::string csrf = net::CookieJar::Instance().Get("bili_jct");
++	if (csrf.empty()) {
++		DeliverSimple(done, false, ServerFailure("missingCSRF"));
++		return;
++	}
++	net::Request req = FormPost(add ? kShieldAddUrl : kShieldDelUrl, {{"room_id", std::to_string(room_id)},
++									 {"keyword", keyword},
++									 {"csrf", csrf},
++									 {"csrf_token", csrf}});
++	RequestJson(req, [done](const json &, const ApiError &error) {
++		DeliverSimple(done, !Failed(error), error);
++	});
++}
++
++/* POST .../preLive/IsUserIdentifiedByFaceAuth */
++void IsIdentifiedByFaceAuth(long long room_id, BoolFn done)
++{
++	/* LiveRoomActions.swift:104-120. The endpoint answers POST only (GET has
++	 * returned 405 since September 2026). */
++	const std::string csrf = net::CookieJar::Instance().Get("bili_jct");
++	if (csrf.empty()) {
++		Deliver(done, Fail<bool>(ServerFailure("missingCSRF")));
++		return;
++	}
++	net::Request req = FormPost(kFaceAuthUrl,
++				    {{"room_id", std::to_string(room_id)}, {"csrf", csrf}, {"csrf_token", csrf}});
++	RequestJson(req, [done](const json &root, const ApiError &error) {
++		if (Failed(error)) {
++			Deliver(done, Fail<bool>(error));
++			return;
++		}
++		const json *data = FieldValue(root, {"data"});
++		Deliver(done, Ok(Identified(data ? *data : json())));
++	});
++}
++
++/* GET /xlive/web-room/v1/index/getDanmuInfo — WBI-signed. Fills host/port/token
++ * for the danmaku client. */
++void FetchDanmakuInfo(long long room_id, long long uid, DanmakuInfoFn done)
++{
++	/* LiveRoomActions.swift:59-75: buvid3, then the WBI keys, then the signed
++	 * request, all with the same cookies. */
++	EnsureBuvid3([room_id, uid, done](const ApiError &buvid_error) {
++		if (Failed(buvid_error)) {
++			Deliver(done, Fail<DanmakuConnectInfo>(buvid_error));
++			return;
++		}
++		EnsureWbiSigner([room_id, uid, done](std::optional<net::WbiSigner> signer,
++						     const ApiError &signer_error) {
++			if (!signer) {
++				Deliver(done, Fail<DanmakuConnectInfo>(signer_error));
++				return;
++			}
++			const std::string query = signer->SignQuery(
++				{{"id", std::to_string(room_id)}, {"type", "0"}, {"web_location", "444.8"}});
++			net::Request req;
++			req.url = net::AppendQuery(kDanmuInfoUrl, query);
++			ApplyLiveHeaders(req);
++			RequestJson(req, [room_id, uid, done](const json &root, const ApiError &error) {
++				if (Failed(error)) {
++					Deliver(done, Fail<DanmakuConnectInfo>(error));
++					return;
++				}
++				const json data = DataObject(root);
++				const json *hosts = ObjectArrayField(data, "host_list");
++				auto token = FieldString(data, {"token"});
++				if (!data.is_object() || !hosts || !token) {
++					Deliver(done, Fail<DanmakuConnectInfo>(ServerFailure("invalidResponse")));
++					return;
++				}
++				/* The Swift keeps every host (DanmakuConnectInfo.servers,
++				 * LiveRoomActions.swift:69-74) and picks one at random when
++				 * it connects (DanmakuClient.swift:58); this struct holds one,
++				 * so the first entry that names a host is reported. */
++				DanmakuConnectInfo info;
++				info.token = *token;
++				info.room_id = room_id;
++				info.uid = uid;
++				bool found = false;
++				for (const json &host : *hosts) {
++					auto name = FieldString(host, {"host"});
++					if (!name)
++						continue;
++					info.host = *name;
++					/* `(host["wss_port"] as? NSNumber)?.intValue ?? 443`:
++					 * 443 only when the field is absent or not a number. */
++					info.port = 443;
++					if (const json *port = FieldValue(host, {"wss_port"})) {
++						if (port->is_number() || port->is_boolean())
++							info.port = IntValueInt(*port);
++					}
++					found = true;
++					break;
++				}
++				if (!found) {
++					Deliver(done, Fail<DanmakuConnectInfo>(ServerFailure("invalidResponse")));
++					return;
++				}
++				Deliver(done, Ok(info));
++			});
++		});
++	});
++}
++
++/* Emoticons for the room (LiveRoomActions/Emoticons.swift). */
++void LoadEmoticons(long long room_id, JsonFn done)
++{
++	/* Emoticons.swift:98-121 (allEmoticons): the room's packs are required,
++	 * the account's main-site panel is optional (`try?`, :118), and the
++	 * picker's order is the 小黄脸 set (id 1) first, then the room's packs,
++	 * then the rest. The caller merges this object into
++	 * {"event":"emoticons","ok":true} (CBridge.swift:260). */
++	struct Shared {
++		bool reported = false;
++		bool live_done = false;
++		bool main_done = false;
++		std::vector<json> live;
++		std::vector<json> main_site;
++	};
++	auto shared = std::make_shared<Shared>();
++
++	auto finish = [shared, room_id, done]() {
++		if (shared->reported || !shared->live_done || !shared->main_done)
++			return;
++		shared->reported = true;
++		json packs = json::array();
++		for (const json &pack : shared->main_site) {
++			if (PackId(pack) == 1)
++				packs.push_back(pack);
++		}
++		for (const json &pack : shared->live)
++			packs.push_back(pack);
++		for (const json &pack : shared->main_site) {
++			if (PackId(pack) != 1)
++				packs.push_back(pack);
++		}
++		Deliver(done, Ok(json{{"room", room_id}, {"packs", packs}}));
++	};
++
++	net::Request live;
++	live.url = net::AppendQuery(kEmoticonsUrl,
++				    net::FormEncode({{"platform", "pc"}, {"room_id", std::to_string(room_id)}}));
++	ApplyLiveHeaders(live);
++	RequestJson(live, [shared, finish, done](const json &root, const ApiError &error) {
++		shared->live_done = true;
++		if (Failed(error)) {
++			/* `let live = try await emoticons(...)` throws here, without
++			 * waiting for the optional main-site request. */
++			shared->reported = true;
++			Deliver(done, Fail<json>(error));
++			return;
++		}
++		shared->live = ParseLivePacks(root);
++		finish();
++	});
++
++	net::Request main_site;
++	main_site.url = net::AppendQuery(kMainSiteEmotesUrl, net::FormEncode({{"business", "reply"}}));
++	ApplyLiveHeaders(main_site);
++	RequestJson(main_site, [shared, finish](const json &root, const ApiError &error) {
++		shared->main_done = true;
++		if (!Failed(error))
++			shared->main_site = ParseMainSitePacks(root);
++		finish();
++	});
++}
++
++/* Downloads one picture and caches it as a file; returns the path, or "" . */
++void FetchEmoticonImage(const std::string &url, PathFn done)
++{
++	/* Emoticons.swift:183-200. The Swift answers nil on every failure, which
++	 * has no error shape, so the C++ names the reason; the caller reads only
++	 * the path (CBridge.swift:276-279). */
++	std::optional<std::string> allowed = AllowedImageUrl(url);
++	if (!allowed) {
++		DeliverPath(done, false, std::string(), ServerFailure("unsupportedImageHost"));
++		return;
++	}
++	std::optional<std::filesystem::path> folder = CacheFolder();
++	if (!folder) {
++		DeliverPath(done, false, std::string(), ServerFailure("cacheFolderUnavailable"));
++		return;
++	}
++	const std::filesystem::path target = CacheFile(*folder, url);
++	std::error_code ec;
++	if (std::filesystem::exists(target, ec) && !ec) {
++		DeliverPath(done, true, target.u8string(), ApiError{});
++		return;
++	}
++
++	/* :186-187: one download per address; a second caller waits for it. */
++	auto waiting = g_image_waiters.find(url);
++	if (waiting != g_image_waiters.end()) {
++		waiting->second.push_back(done);
++		return;
++	}
++	g_image_waiters[url] = {done};
++
++	net::Request req;
++	req.url = *allowed;
++	req.timeout_ms = kTimeoutMs;
++	/* :153-161: the picture session is ephemeral — no cookies and no custom
++	 * headers. net::Send still applies whatever the jar holds for the CDN
++	 * host, which is nothing: Bilibili's cookies belong to .bilibili.com.
++	 * :203-214 also re-encodes every picture to a ≤160 px PNG with ImageIO,
++	 * and :216-237 trims the folder (30 MB -> 20 MB) from a detached task;
++	 * the C++ core has no image codec and no lifetime hook for a detached
++	 * thread inside a plugin DLL, so the bytes are cached verbatim and the
++	 * folder is left to grow. */
++	net::Send(req, [url, target](net::Response res) {
++		ApiError error;
++		std::string path;
++		if (res.status == 0) {
++			error = TransportFailure(res);
++		} else if (res.status != 200) {
++			error = HttpFailure(res.status);
++		} else if (res.body.size() >= kMaxImageBytes) {
++			error = ServerFailure("imageTooLarge");
++		} else if (!LooksLikeImage(res.body)) {
++			error = ServerFailure("notAnImage");
++		} else if (!WriteCacheFile(target, res.body)) {
++			error = ServerFailure("cacheWriteFailed");
++		} else {
++			path = target.u8string();
++		}
++		DeliverImage(url, path, error);
++	});
++}
++
++/* The cookie header for the current session, rebuilt from the jar. */
++std::string CookieHeader()
++{
++	/* SessionCredentials.cookieHeader is a deterministic "k=v; k=v" string
++	 * (QRLogin.swift:24-26); PersistString() is the jar's equivalent
++	 * (CONTRACT §7). net::Send applies the jar itself, so this is for the
++	 * callers that need the text — the web-view login, the danmaku client,
++	 * tests. */
++	return net::CookieJar::Instance().PersistString();
++}
++
++/* csrf = the bili_jct cookie; empty when signed out. */
++std::string CsrfToken()
++{
++	/* QRLogin.swift:22. */
++	return net::CookieJar::Instance().Get("bili_jct");
++}
++
++} // namespace live
++} // namespace livehime
+diff --git a/plugins/livehime/core/win/livehime-core.cpp b/plugins/livehime/core/win/livehime-core.cpp
+index 7c1cef3..f30ec78 100644
+--- a/plugins/livehime/core/win/livehime-core.cpp
++++ b/plugins/livehime/core/win/livehime-core.cpp
+@@ -13,7 +13,12 @@
+ 
+ #include <nlohmann/json.hpp>
+ 
++#include <windows.h>
++
++#include <cstdlib>
++#include <fstream>
+ #include <string>
++#include <thread>
+ 
+ #include "livehime-core.h"
+ 
+@@ -22,6 +27,7 @@
+ #include "core/emit.h"
+ #include "live/danmaku.h"
+ #include "live/liveclient.h"
++#include "net/cookies.h"
+ #include "net/http.h"
+ #include "platform/dispatch.h"
+ 
+@@ -79,6 +85,148 @@ void EmitAction(const char *event, bool ok, const livehime::live::ApiError &erro
+ 	Emit(object);
+ }
+ 
++/* SessionCoordinator.swift refreshes the room after every action that can
++ * change it (start, stop, title), so the dock's title and live badge follow
++ * Bilibili rather than the local guess. Failures are left alone: a failed
++ * action did not change anything. */
++void RefreshRoomQuietly()
++{
++	Session::Instance().RefreshRoom();
++}
++
++/* ── self-test ────────────────────────────────────────────────────────────
++ *
++ * A Windows build of this core has no other way to prove its network stack
++ * works: the dock's buttons need a human, and OBS's log only flushes on exit.
++ * With LIVEHIME_SELFTEST=1 set, the first livehime_core_start runs the two
++ * requests the login depends on, against the real Bilibili, and writes what
++ * came back to %LOCALAPPDATA%\LiveHime\selftest.txt.
++ *
++ * It is off unless the variable is set, it never claims success it did not
++ * observe, and it is the only place in the core that writes a file. */
++
++std::string SelfTestPath()
++{
++	const char *base = std::getenv("LOCALAPPDATA");
++	std::string dir = (base && *base) ? base : ".";
++	dir += "\\LiveHime";
++	CreateDirectoryA(dir.c_str(), nullptr);
++	return dir + "\\selftest.txt";
++}
++
++void SelfTest()
++{
++	std::ofstream out(SelfTestPath(), std::ios::out | std::ios::trunc);
++	if (!out)
++		return;
++
++	auto line = [&out](const std::string &text) {
++		out << text << "\n";
++		out.flush();
++	};
++
++	line("LiveHime Windows core self-test");
++	line("");
++
++	/* 1. Plain HTTPS GET: proves WinHTTP, Schannel and DNS from this machine. */
++	{
++		livehime::net::Request request;
++		request.url = "https://api.bilibili.com/x/web-interface/nav";
++		request.headers["Accept"] = "application/json, text/plain, */*";
++		request.headers["Referer"] = "https://live.bilibili.com/";
++		request.headers["User-Agent"] =
++			"Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/605.1.15 (KHTML, like Gecko) "
++			"Version/17.0 Safari/605.1.15";
++
++		livehime::net::Response response = livehime::net::SendSync(request);
++		line("[nav] status=" + std::to_string(response.status) +
++		     (response.error.empty() ? std::string() : " error=" + response.error));
++		if (!response.body.empty()) {
++			nlohmann::json parsed = nlohmann::json::parse(response.body, nullptr, false);
++			if (parsed.is_discarded()) {
++				line("[nav] body is not JSON: " + response.body.substr(0, 200));
++			} else {
++				line("[nav] code=" + std::to_string(parsed.value("code", -999)) +
++				     " message=" + parsed.value("message", std::string()));
++				const bool has_wbi = parsed.contains("data") && parsed["data"].is_object() &&
++						     parsed["data"].contains("wbi_img");
++				line(std::string("[nav] wbi_img present=") + (has_wbi ? "yes" : "no"));
++			}
++		}
++	}
++
++	/* 2. QR login generate: the request the dock's 扫码登录 button makes. If
++	 *    this answers 0 with a url, the login path is reachable from here. */
++	{
++		livehime::net::Request request;
++		request.url = "https://passport.bilibili.com/x/passport-login/web/qrcode/generate";
++		request.headers["Accept"] = "application/json, text/plain, */*";
++		request.headers["Referer"] = "https://live.bilibili.com/";
++		request.headers["User-Agent"] =
++			"Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/605.1.15 (KHTML, like Gecko) "
++			"Version/17.0 Safari/605.1.15";
++
++		livehime::net::Response response = livehime::net::SendSync(request);
++		line("");
++		line("[qrcode/generate] status=" + std::to_string(response.status) +
++		     (response.error.empty() ? std::string() : " error=" + response.error));
++		if (!response.body.empty()) {
++			nlohmann::json parsed = nlohmann::json::parse(response.body, nullptr, false);
++			if (parsed.is_discarded()) {
++				line("[qrcode/generate] body is not JSON: " + response.body.substr(0, 200));
++			} else {
++				const int code = parsed.value("code", -999);
++				line("[qrcode/generate] code=" + std::to_string(code));
++				if (parsed.contains("data") && parsed["data"].is_object()) {
++					line("[qrcode/generate] url=" +
++					     parsed["data"].value("url", std::string()));
++					/* The key is session material; record only its length. */
++					line("[qrcode/generate] key length=" +
++					     std::to_string(parsed["data"].value("qrcode_key", std::string()).size()));
++				}
++			}
++		}
++	}
++
++	/* 3. What the cookies look like after those two calls. */
++	line("");
++	line("[cookies] count=" + std::to_string(livehime::net::CookieJar::Instance().All().size()));
++
++	/* 4. Drive the real state machine, so the whole QR path runs rather than
++	 *    just the two endpoints: generate -> qrCode state -> poll. The dock
++	 *    shows the code the moment this publishes, which is what makes the
++	 *    self-test a visual check as well as a log one. */
++	line("");
++	line("[session] StartQrLogin() -> expect an account state -> qrCode");
++	livehime::dispatch::Post([] { Session::Instance().StartQrLogin(); });
++
++	line("");
++	line("done");
++}
++
++void SelfTestIfRequested()
++{
++	const char *flag = std::getenv("LIVEHIME_SELFTEST");
++	if (!flag || !*flag || std::string(flag) == "0")
++		return;
++	/* SendSync blocks, and the main thread has a message pump to run. */
++	std::thread(SelfTest).detach();
++}
++
++/* SessionCoordinator.swift:271 trims before deciding whether there is anything
++ * to send. Swift's String.trimmingCharacters(in: .whitespacesAndNewlines)
++ * covers Unicode whitespace; the C ABI hands us UTF-8, so this trims the ASCII
++ * whitespace a copied-and-pasted title can carry and leaves the rest, rather
++ * than pulling in a Unicode table for a title field. */
++std::string TrimAscii(const std::string &text)
++{
++	size_t begin = text.find_first_not_of(" \t\r\n\f\v");
++	if (begin == std::string::npos)
++		return {};
++	size_t end = text.find_last_not_of(" \t\r\n\f\v");
++	return text.substr(begin, end - begin + 1);
++}
++
+ } // namespace
+ 
+ extern "C" {
+@@ -92,11 +240,42 @@ void livehime_core_start(const char *keychain_service, livehime_state_callback c
+ 	 * main thread; this call is on the main thread by contract. */
+ 	livehime::dispatch::Init();
+ 	livehime::SetCallback(callback, context);
++	SelfTestIfRequested();
++
++	/* CBridge.swift:40-52, syncDanmaku: room events and status go straight to
++	 * the UI, and the danmaku socket follows the session — started when it
++	 * turns ready, stopped when it leaves. Start() is a no-op for the room it
++	 * is already on, so a state republish after a title change is harmless. */
++	livehime::live::DanmakuClient::Instance().SetHandlers(
++		[](const nlohmann::json &event) { Emit(event); },
++		[](livehime::live::DanmakuStatus status) {
++			Emit(json{{"event", "danmakuStatus"},
++				  {"status", livehime::live::DanmakuStatusRaw(status)}});
++		});
++	Session::Instance().SetObserver([](livehime::auth::State state, long long room_id, long long mid) {
++		switch (state) {
++		case livehime::auth::State::Ready:
++			livehime::live::DanmakuClient::Instance().Start(room_id, mid);
++			break;
++		case livehime::auth::State::SignedOut:
++		case livehime::auth::State::QrCode:
++			livehime::live::DanmakuClient::Instance().Stop();
++			break;
++		case livehime::auth::State::Verifying:
++		case livehime::auth::State::Failed:
++			/* CBridge.swift:49-50 leaves the connection alone here, so a
++			 * transient failure does not tear down a working feed. */
++			break;
++		}
++	});
++
+ 	Session::Instance().Start(service);
+ }
+ 
+ void livehime_core_stop(void)
+ {
++	Session::Instance().SetObserver(nullptr);
++	livehime::live::DanmakuClient::Instance().SetHandlers(nullptr, nullptr);
+ 	livehime::live::DanmakuClient::Instance().Stop();
+ 	Session::Instance().Stop();
+ 	livehime::SetCallback(nullptr, nullptr);
+@@ -175,6 +354,7 @@ void livehime_core_start_live(long long area_id, long long parent_area_id)
+ 					  Emit(json{{"event", "streamEndpoint"},
+ 						    {"server", result.value.server},
+ 						    {"key", result.value.key}});
++					  RefreshRoomQuietly();
+ 				  });
+ }
+ 
+@@ -184,6 +364,8 @@ void livehime_core_stop_live(void)
+ 		return;
+ 	livehime::live::StopLive(CurrentRoom(), [](bool ok, const livehime::live::ApiError &error) {
+ 		EmitAction("liveStopped", ok, error);
++		if (ok)
++			RefreshRoomQuietly();
+ 	});
+ }
+ 
+@@ -335,9 +517,21 @@ void livehime_core_update_title(const char *title)
+ {
+ 	if (!RequireRoom("titleUpdated"))
+ 		return;
+-	livehime::live::UpdateTitle(CurrentRoom(), title ? title : "",
++
++	const std::string trimmed = TrimAscii(title ? title : "");
++	if (trimmed.empty()) {
++		/* SessionCoordinator.swift:271-272 returns early on an empty title
++		 * without calling Bilibili, and CBridge.swift:307 then reports
++		 * success. Nothing changed, so nothing failed. */
++		Emit(json{{"event", "titleUpdated"}, {"ok", true}});
++		return;
++	}
++
++	livehime::live::UpdateTitle(CurrentRoom(), trimmed,
+ 				    [](bool ok, const livehime::live::ApiError &error) {
+ 					    EmitAction("titleUpdated", ok, error);
++					    if (ok)
++						    RefreshRoomQuietly();
+ 				    });
+ }
+ 
+@@ -403,16 +597,20 @@ void livehime_core_load_shield_keywords(void)
+ {
+ 	const long long room = CurrentRoom();
+ 	if (room <= 0) {
+-		Emit(json{{"event", "shieldKeywords"}, {"ok", false}, {"keywords", json::array()},
+-			  {"kind", "notReady"}});
++		/* CBridge.swift:346 emits the failure shape without a "keywords" key
++		 * at all; the UI keys off "ok". Match it rather than sending an empty
++		 * list that would read as "the server says there are none". */
++		Emit(json{{"event", "shieldKeywords"}, {"ok", false}, {"kind", "notReady"}});
+ 		return;
+ 	}
+ 	livehime::live::LoadShieldKeywords(room, [](livehime::live::Result<std::vector<std::string>> result) {
+ 		json keywords = json::array();
+ 		for (const auto &word : result.value)
+ 			keywords.push_back(word);
+-		json object{{"event", "shieldKeywords"}, {"ok", result.ok}, {"keywords", keywords}};
+-		if (!result.ok) {
++		json object{{"event", "shieldKeywords"}, {"ok", result.ok}};
++		if (result.ok) {
++			object["keywords"] = keywords;
++		} else {
+ 			object = livehime::Merge(object, result.error.fields);
+ 			if (result.error.logged_out)
+ 				Session::Instance().MarkSignedOut(Notice::SessionExpired);
+@@ -425,17 +623,14 @@ void livehime_core_set_shield_keyword(const char *keyword, int add)
+ {
+ 	const long long room = CurrentRoom();
+ 	if (room <= 0) {
+-		Emit(json{{"event", "shieldKeywords"}, {"ok", false}, {"keywords", json::array()},
+-			  {"kind", "notReady"}});
++		Emit(json{{"event", "shieldKeywords"}, {"ok", false}, {"kind", "notReady"}});
+ 		return;
+ 	}
+ 	livehime::live::SetShieldKeyword(room, keyword ? keyword : "", add != 0,
+ 					 [room](bool ok, const livehime::live::ApiError &error) {
+ 						 if (!ok) {
+ 							 json object = livehime::Merge(
+-								 json{{"event", "shieldKeywords"},
+-								      {"ok", false},
+-								      {"keywords", json::array()}},
++								 json{{"event", "shieldKeywords"}, {"ok", false}},
+ 								 error.fields);
+ 							 if (error.logged_out)
+ 								 Session::Instance().MarkSignedOut(
+@@ -443,8 +638,9 @@ void livehime_core_set_shield_keyword(const char *keyword, int add)
+ 							 Emit(object);
+ 							 return;
+ 						 }
+-						 /* The Swift re-reads the list so the UI shows the
+-						  * server's own view rather than a local guess. */
++						 /* CBridge.swift:353-364 re-reads the list so the UI
++						  * shows the server's own view rather than a local
++						  * guess at what the edit did. */
+ 						 livehime::live::LoadShieldKeywords(
+ 							 room,
+ 							 [](livehime::live::Result<std::vector<std::string>> result) {
+@@ -452,9 +648,10 @@ void livehime_core_set_shield_keyword(const char *keyword, int add)
+ 								 for (const auto &word : result.value)
+ 									 keywords.push_back(word);
+ 								 json object{{"event", "shieldKeywords"},
+-									     {"ok", result.ok},
+-									     {"keywords", keywords}};
+-								 if (!result.ok)
++									     {"ok", result.ok}};
++								 if (result.ok)
++									 object["keywords"] = keywords;
++								 else
+ 									 object = livehime::Merge(object,
+ 												  result.error.fields);
+ 								 Emit(object);
+-- 
+2.54.0 (Apple Git-157)
+

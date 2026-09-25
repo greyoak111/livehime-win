@@ -1,0 +1,27 @@
+From 16b17e07860d280d45cd3f1f0e08f384399feaf3 Mon Sep 17 00:00:00 2001
+From: DeepSeek Harness <noreply@deepseek.com>
+Date: Sat, 26 Sep 2026 02:05:56 +0800
+Subject: [PATCH 12/18] Never let git touch the vendored .lib files
+
+The tree's .gitattributes starts with '* text=auto', which leaves git free to
+decide; the WebView2 loaders are binary and must not be normalised.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .gitattributes | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/.gitattributes b/.gitattributes
+index 4c165cd..5cd62b4 100644
+--- a/.gitattributes
++++ b/.gitattributes
+@@ -7,3 +7,6 @@
+ *.vcxproj.filters text eol=crlf
+ 
+ cmake/ALL_BUILD.vcxproj.user.in text eol=crlf
++
++# Vendored binary libraries (WebView2 static loaders): never touch these.
++*.lib binary
+-- 
+2.54.0 (Apple Git-157)
+

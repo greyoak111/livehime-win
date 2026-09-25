@@ -1,0 +1,304 @@
+From 7fdc1840c626f55b094d0a901ec4213a55ac6db3 Mon Sep 17 00:00:00 2001
+From: DeepSeek Harness <noreply@deepseek.com>
+Date: Sat, 26 Sep 2026 02:32:05 +0800
+Subject: [PATCH 14/18] Make the WebView2 host build, and probe for the runtime
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Three defects the host's author found in the wiring around his own file, all
+fixed here:
+
+  - the loader was linked by a relative path, which CMake passes to link.exe as
+    a bare name, so the first attempt asked for
+    "WebView2LoaderStatic.arm64.lib.lib". It is absolute now, and the
+    architecture comes from CMAKE_GENERATOR_PLATFORM rather than
+    CMAKE_SYSTEM_PROCESSOR: this is an ARM64 host cross-building x64 under
+    emulation, so the system processor says ARM64 while x64 is the correct
+    loader. Both mistakes were visible in one link error and neither would have
+    shown up on a native x64 machine.
+  - ole32 is imported by the vendored static loader itself (CoTaskMemAlloc and
+    CoTaskMemFree, dumped from the archive) and shell32 by ShellExecuteW;
+    neither belonged to Qt to provide transitively.
+  - start_web_login now cancels a running QR poll first, as CBridge.swift:376
+    does, so the two logins cannot race for the same session.
+
+One access fix in webview.cpp: closing_ and destroyed_ are read by the
+subclasses' receive paths, so they are protected rather than private.
+
+And the self-test opens with the question the pages depend on, because the
+Evergreen Runtime is a machine component the plugin does not bundle:
+
+  [webview2] available=yes
+
+That is the loader's own synchronous version probe. It cannot be
+CreateCoreWebView2EnvironmentWithOptions, which is asynchronous and completes
+only from the main thread's message loop — awaiting it inside the probe would
+deadlock the UI thread.
+
+livehime.dll is 4,093,952 bytes, up from 2,712,064 before the host. The
+delivery bar's remaining items are unchanged: they need an account.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ plugins/livehime/CMakeLists.txt             | 19 ++++++--
+ plugins/livehime/core/win/livehime-core.cpp | 17 +++++++
+ plugins/livehime/core/win/web/webview.cpp   | 52 +++++++++++++--------
+ 3 files changed, 66 insertions(+), 22 deletions(-)
+
+diff --git a/plugins/livehime/CMakeLists.txt b/plugins/livehime/CMakeLists.txt
+index 74ce63f..cfec31f 100644
+--- a/plugins/livehime/CMakeLists.txt
++++ b/plugins/livehime/CMakeLists.txt
+@@ -161,11 +161,18 @@ if(WIN32)
+   # a single file with nothing extra to ship; the Evergreen Runtime itself is a
+   # machine component the host probes for rather than bundles.
+   target_include_directories(livehime PRIVATE core/win/web/sdk)
+-  if(CMAKE_SYSTEM_PROCESSOR MATCHES "ARM64|arm64|aarch64")
+-    set(LIVEHIME_WEBVIEW2_LOADER core/win/web/sdk/WebView2LoaderStatic.arm64.lib)
++  # Which loader to link is a property of the TARGET, not of the machine
++  # building it: this is an ARM64 host cross-building x64 under emulation, so
++  # CMAKE_SYSTEM_PROCESSOR says ARM64 while the x64 loader is the right one.
++  # CMAKE_GENERATOR_PLATFORM is what the Visual Studio generator was asked for.
++  if(CMAKE_GENERATOR_PLATFORM MATCHES "^[Aa][Rr][Mm]64$")
++    set(LIVEHIME_WEBVIEW2_LOADER "${CMAKE_CURRENT_SOURCE_DIR}/core/win/web/sdk/WebView2LoaderStatic.arm64.lib")
+   else()
+-    set(LIVEHIME_WEBVIEW2_LOADER core/win/web/sdk/WebView2LoaderStatic.x64.lib)
++    set(LIVEHIME_WEBVIEW2_LOADER "${CMAKE_CURRENT_SOURCE_DIR}/core/win/web/sdk/WebView2LoaderStatic.x64.lib")
+   endif()
++  # Absolute, because a relative one reaches the linker as a bare name and it
++  # appends its own .lib (the first attempt asked for
++  # "WebView2LoaderStatic.arm64.lib.lib").
+   target_link_libraries(livehime PRIVATE "${LIVEHIME_WEBVIEW2_LOADER}")
+ 
+   # Vendored third-party code: qrcodegen is Project Nayuki's, MIT, byte-identical
+@@ -225,6 +232,12 @@ elseif(WIN32)
+       winhttp
+       bcrypt
+       advapi32
++      # ole32: the vendored static loader itself imports CoTaskMemAlloc/Free,
++      # and webview.cpp frees the WebView2 strings with it. shell32:
++      # ShellExecuteW for the page's new-window links. Both may arrive
++      # transitively through Qt6, but neither is Qt's to provide.
++      ole32
++      shell32
+       ZLIB::ZLIB
+       nlohmann_json::nlohmann_json
+   )
+diff --git a/plugins/livehime/core/win/livehime-core.cpp b/plugins/livehime/core/win/livehime-core.cpp
+index 6743554..a5ac6de 100644
+--- a/plugins/livehime/core/win/livehime-core.cpp
++++ b/plugins/livehime/core/win/livehime-core.cpp
+@@ -144,6 +144,19 @@ void SelfTest()
+ 	line("LiveHime Windows core self-test");
+ 	line("");
+ 
++	/* 0. WebView2. The pages need the Evergreen Runtime, which is a machine
++	 *    component the plugin does not bundle, so whether this machine has it
++	 *    is the first thing worth knowing. Available() uses the loader's own
++	 *    synchronous version probe rather than creating an environment: the
++	 *    latter is asynchronous and its completion only runs from this
++	 *    thread's message loop, which would deadlock the UI thread here. */
++	{
++		std::string reason;
++		const bool available = livehime::web::Available(&reason);
++		line(std::string("[webview2] available=") + (available ? "yes" : "no") +
++		     (reason.empty() ? std::string() : "  reason: " + reason));
++	}
++
+ 	/* 0a. A room that is actually live. Room 1 answered getDanmuInfo and the
+ 	 *     socket stayed up, but a room that is not streaming sends nothing, so
+ 	 *     a connection is not evidence that anything decodes. This asks the
+@@ -878,6 +891,10 @@ void livehime_core_sign_out(void)
+ 
+ void livehime_core_start_web_login(void)
+ {
++	/* CBridge.swift:376 cancels a running QR poll before presenting this
++	 * window. Without it the poll keeps going while the page is open and the
++	 * two logins race for the same session. */
++	Session::Instance().CancelQrLogin();
+ 	livehime::web::OpenLogin([](const std::string &reason) { EmitWebFailure(kPendingWebView, reason); });
+ }
+ 
+diff --git a/plugins/livehime/core/win/web/webview.cpp b/plugins/livehime/core/win/web/webview.cpp
+index f5653f8..200abdc 100644
+--- a/plugins/livehime/core/win/web/webview.cpp
++++ b/plugins/livehime/core/win/web/webview.cpp
+@@ -368,7 +368,13 @@ constexpr long long kReferenceDateUnix = 978307200;
+ 
+ std::string CredentialBlob(const CookieMap &cookies, const std::string &refresh_token)
+ {
+-	const json stored{{"cookies", cookies},
++	/* The same shape session.cpp writes: a JSON object built by hand rather
++	 * than a container conversion. */
++	json stored_cookies = json::object();
++	for (const auto &cookie : cookies)
++		stored_cookies[cookie.first] = cookie.second;
++
++	const json stored{{"cookies", stored_cookies},
+ 			  {"refreshToken", refresh_token},
+ 			  {"savedAt", static_cast<long long>(std::time(nullptr)) - kReferenceDateUnix}};
+ 	return json{{"schemaVersion", kEnvelopeVersion}, {"credentials", stored}}.dump();
+@@ -818,6 +824,10 @@ private:
+ 	HWND status_ = nullptr;
+ 	HWND confirm_ = nullptr;
+ 	std::wstring profile_;
++protected:
++	/* Read by the subclasses' receive paths, which is why they are not
++	 * private: LoginWindow and the page windows both test them before
++	 * touching a COM object that may already be gone. */
+ 	bool closing_ = false;
+ 	bool destroyed_ = false;
+ 	bool shown_ = false;
+@@ -916,13 +926,13 @@ void HostWindow::ControllerReady(HRESULT status, ICoreWebView2Controller *contro
+ 		return;
+ 	}
+ 	controller_ = controller;
+-	if (FAILED(controller_->get_CoreWebView2(&webview_)) || !webview_) {
++	if (FAILED(controller_->get_CoreWebView2(&webview_)) || webview_.Get() == nullptr) {
+ 		HostUnavailable("WebView2 reported no web view for its controller");
+ 		return;
+ 	}
+ 
+ 	ComPtr<ICoreWebView2Settings> settings;
+-	if (SUCCEEDED(webview_->get_Settings(&settings)) && settings) {
++	if (SUCCEEDED(webview_->get_Settings(&settings)) && settings.Get() != nullptr) {
+ 		/* The host shows the script dialogs itself (WebLoginWindow.swift:
+ 		 * 220-234), which is what the default dialogs have to step aside for. */
+ 		settings->put_AreDefaultScriptDialogsEnabled(FALSE);
+@@ -937,9 +947,13 @@ void HostWindow::ControllerReady(HRESULT status, ICoreWebView2Controller *contro
+ 	}
+ 
+ 	/* The cookie manager arrived with ICoreWebView2_2, not with the first
+-	 * interface the controller hands out. */
++	 * interface the controller hands out. An explicit QueryInterface with the
++	 * header's own IID rather than ComPtr::As or __uuidof, so nothing here
++	 * depends on a smart-pointer conversion or a compiler extension. */
+ 	ComPtr<ICoreWebView2_2> later;
+-	if (SUCCEEDED(webview_.As(&later)) && later)
++	if (SUCCEEDED(webview_.Get()->QueryInterface(IID_ICoreWebView2_2,
++						     reinterpret_cast<void **>(later.GetAddressOf()))) &&
++	    later.Get() != nullptr)
+ 		later->get_CookieManager(&cookies_);
+ 
+ 	EventRegistrationToken token = {};
+@@ -1018,7 +1032,7 @@ void HostWindow::Layout()
+ 	RECT bounds{0, 0, client.right, client.bottom - status};
+ 	if (bounds.bottom < 0)
+ 		bounds.bottom = 0;
+-	if (controller_)
++	if (controller_.Get() != nullptr)
+ 		controller_->put_Bounds(bounds);
+ 	if (status_) {
+ 		int width = client.right - (confirm_ ? kConfirmWidth + 8 : 0);
+@@ -1097,7 +1111,7 @@ void HostWindow::Teardown()
+ 	/* Release COM before the HWND: closing the controller stops the page, and
+ 	 * dropping the web view releases the handlers that hold a shared_ptr to
+ 	 * this object. */
+-	if (controller_)
++	if (controller_.Get() != nullptr)
+ 		controller_->Close();
+ 	webview_.Reset();
+ 	cookies_.Reset();
+@@ -1131,14 +1145,14 @@ void HostWindow::Teardown()
+ 
+ void HostWindow::Navigate(const std::string &url)
+ {
+-	if (!webview_)
++	if (webview_.Get() == nullptr)
+ 		return;
+ 	webview_->Navigate(Widen(url).c_str());
+ }
+ 
+ void HostWindow::Run(const std::string &script)
+ {
+-	if (!webview_)
++	if (webview_.Get() == nullptr)
+ 		return;
+ 	webview_->ExecuteScript(Widen(script).c_str(),
+ 				Callback<ICoreWebView2ExecuteScriptCompletedHandler>(
+@@ -1148,7 +1162,7 @@ void HostWindow::Run(const std::string &script)
+ 
+ void HostWindow::ToPage(const json &object)
+ {
+-	if (!webview_)
++	if (webview_.Get() == nullptr)
+ 		return;
+ 	webview_->PostWebMessageAsJson(Widen(object.dump()).c_str());
+ }
+@@ -1177,11 +1191,11 @@ LRESULT HostWindow::HandleMessage(HWND hwnd, UINT message, WPARAM wparam, LPARAM
+ 		Layout();
+ 		return 0;
+ 	case WM_WINDOWPOSCHANGED:
+-		if (controller_)
++		if (controller_.Get() != nullptr)
+ 			controller_->NotifyParentWindowPositionChanged();
+ 		break;
+ 	case WM_SETFOCUS:
+-		if (controller_)
++		if (controller_.Get() != nullptr)
+ 			controller_->MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC);
+ 		return 0;
+ 	case WM_GETMINMAXINFO:
+@@ -1312,11 +1326,11 @@ void HostWindow::OnScriptDialog(ICoreWebView2ScriptDialogOpeningEventArgs *args)
+ 	 * deferred: the handler returns, the box is shown from the message queue,
+ 	 * and the deferral is completed with the answer. */
+ 	ComPtr<ICoreWebView2Deferral> deferral;
+-	if (FAILED(args->GetDeferral(&deferral)) || !deferral) {
++	if (FAILED(args->GetDeferral(&deferral)) || deferral.Get() == nullptr) {
+ 		args->Accept(); /* nothing can be shown; dismissing is the honest answer */
+ 		return;
+ 	}
+-	ComPtr<ICoreWebView2ScriptDialogOpeningEventArgs> dialog = args;
++	ComPtr<ICoreWebView2ScriptDialogOpeningEventArgs> dialog(args);
+ 	const bool confirm = kind == COREWEBVIEW2_SCRIPT_DIALOG_KIND_CONFIRM;
+ 	const bool unhandled = kind == COREWEBVIEW2_SCRIPT_DIALOG_KIND_PROMPT ||
+ 			       kind == COREWEBVIEW2_SCRIPT_DIALOG_KIND_BEFOREUNLOAD;
+@@ -1379,7 +1393,7 @@ void HostWindow::Evaluate(const std::string &script, const PageResultFn &done)
+ {
+ 	if (!done)
+ 		return;
+-	if (!webview_) {
++	if (webview_.Get() == nullptr) {
+ 		done("{\"error\":\"the page is not ready\"}");
+ 		return;
+ 	}
+@@ -1428,7 +1442,7 @@ void HostWindow::Evaluate(const std::string &script, const PageResultFn &done)
+ 
+ bool HostWindow::Click(double x, double y)
+ {
+-	if (!Live() || !webview_)
++	if (!Live() || webview_.Get() == nullptr)
+ 		return false;
+ 	if (!std::isfinite(x) || !std::isfinite(y))
+ 		return false;
+@@ -1662,7 +1676,7 @@ void LoginWindow::ApplyCookieBatch(const json &payload, long long id)
+ 		ComPtr<ICoreWebView2Cookie> cookie;
+ 		if (FAILED(manager->CreateCookie(Widen(operation.name).c_str(), Widen(operation.value).c_str(),
+ 						 L".bilibili.com", L"/", &cookie)) ||
+-		    !cookie)
++		    cookie.Get() == nullptr)
+ 			continue;
+ 		cookie->put_IsSecure(TRUE);
+ 		if (operation.remove)
+@@ -1723,7 +1737,7 @@ void LoginWindow::CookiesRead(HRESULT status, ICoreWebView2CookieList *list, int
+ 		list->get_Count(&count);
+ 		for (UINT32 index = 0; index < count; ++index) {
+ 			ComPtr<ICoreWebView2Cookie> cookie;
+-			if (FAILED(list->GetValueAtIndex(index, &cookie)) || !cookie)
++			if (FAILED(list->GetValueAtIndex(index, &cookie)) || cookie.Get() == nullptr)
+ 				continue;
+ 			std::string name;
+ 			std::string domain;
+@@ -1961,7 +1975,7 @@ void PageWindow::SeedCookies()
+ 		ComPtr<ICoreWebView2Cookie> created;
+ 		if (FAILED(manager->CreateCookie(Widen(cookie.first).c_str(), Widen(cookie.second).c_str(),
+ 						 L".bilibili.com", L"/", &created)) ||
+-		    !created)
++		    created.Get() == nullptr)
+ 			continue;
+ 		created->put_IsSecure(TRUE);
+ 		manager->AddOrUpdateCookie(created.Get());
+-- 
+2.54.0 (Apple Git-157)
+

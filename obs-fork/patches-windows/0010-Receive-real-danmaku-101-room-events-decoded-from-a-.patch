@@ -1,0 +1,154 @@
+From b47f20015d63297bb6159625372f1582f4d828bc Mon Sep 17 00:00:00 2001
+From: DeepSeek Harness <noreply@deepseek.com>
+Date: Sat, 26 Sep 2026 01:58:16 +0800
+Subject: [PATCH 10/18] Receive real danmaku: 101 room events decoded from a
+ live room
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The self-test picked room 5050 (1.29M viewers, found through
+room/get_user_recommend, which needs no signature where the web-interface
+getList answers -352) and held its danmaku socket for 34 seconds. OBS's log:
+
+  danmaku status -> connecting
+  danmaku status -> connected
+  live event -> room        x101
+  live event -> emoticonImage x4
+  account state -> qrCode
+  danmaku status -> stopped
+
+That is the whole receive path under real traffic — WinHTTP WebSocket, the
+zlib bodies, the 16-byte header, the command dispatch, the CONTRACT §4.2 shape —
+and the emoticonImage events show the emote parsing inside chat text ran too.
+"收弹幕" is therefore live-tested, not harness-tested.
+
+Room info is live-tested on its public path: FetchRoomInfo(5440) returns
+roomId 5440, shortId 1, uid 9617619, liveStatus 2, areaId 145 and a title. The
+signed-in path (room_id_by_uid) still needs an account.
+
+One thing that looked like a bug and is not: FetchRoomInfo(1) fails with
+invalidResponse. get_info?room_id=1 answers data.room_id=5440, because room 1
+is an alias for short room 1, and the parser's `data.room_id == roomID` guard
+rejects the mismatch — which is exactly what BilibiliLiveClient.swift:246 does.
+The port is right and the test was wrong; room 5440 is the canonical id and is
+what the self-test now uses.
+
+The self-test's danmaku step also runs before the QR login on purpose: the
+session observer stops the client when the state becomes qrCode, so the other
+order measures the observer instead of the handshake.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ plugins/livehime/core/win/livehime-core.cpp | 95 ++++++++++++++++++---
+ 1 file changed, 84 insertions(+), 11 deletions(-)
+
+diff --git a/plugins/livehime/core/win/livehime-core.cpp b/plugins/livehime/core/win/livehime-core.cpp
+index 4cd8f06..d35fc1d 100644
+--- a/plugins/livehime/core/win/livehime-core.cpp
++++ b/plugins/livehime/core/win/livehime-core.cpp
+@@ -132,17 +132,90 @@ void SelfTest()
+ 	line("LiveHime Windows core self-test");
+ 	line("");
+ 
+-	/* 0. The danmaku WebSocket goes FIRST, deliberately. The session observer
+-	 *    installed in livehime_core_start stops the client whenever the state
+-	 *    becomes qrCode or signedOut — CBridge.swift:47-48 does the same — so a
+-	 *    run that starts the QR login first would stop this connection a few
+-	 *    milliseconds in and we would be measuring the observer instead of the
+-	 *    handshake. (It did exactly that before this ordering was fixed:
+-	 *    connecting at .362, qrCode at .440, stopped at .458.) */
+-	line("[danmaku] Start(room 1, uid 0) -> expect connecting then connected");
+-	livehime::dispatch::Post([] { livehime::live::DanmakuClient::Instance().Start(1, 0); });
+-	std::this_thread::sleep_for(std::chrono::seconds(25));
+-	line("[danmaku] 25 s elapsed; see OBS's log for the status values");
++	/* 0a. A room that is actually live. Room 1 answered getDanmuInfo and the
++	 *     socket stayed up, but a room that is not streaming sends nothing, so
++	 *     a connection is not evidence that anything decodes. This asks the
++	 *     public "who is live right now" list and takes its first entry; if
++	 *     that fails the danmaku step falls back to room 1 and says so. */
++	long long live_room = 1;
++	{
++		livehime::net::Request request;
++		/* get_user_recommend needs no signature; the web-interface getList
++		 * answers -352 请求被拦截 without one. */
++		request.url = "https://api.live.bilibili.com/room/v1/room/get_user_recommend?page=1&page_size=5";
++		request.headers["User-Agent"] =
++			"Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/605.1.15 (KHTML, like Gecko) "
++			"Version/17.0 Safari/605.1.15";
++		request.headers["Referer"] = "https://live.bilibili.com/";
++		livehime::net::Response response = livehime::net::SendSync(request);
++		nlohmann::json parsed = nlohmann::json::parse(response.body, nullptr, false);
++		line("[liveList] status=" + std::to_string(response.status) + " code=" +
++		     std::to_string(parsed.is_discarded() ? -999 : parsed.value("code", -999)));
++		if (!parsed.is_discarded() && parsed.contains("data") && parsed["data"].is_array()) {
++			for (const auto &entry : parsed["data"]) {
++				const long long id = entry.value("roomid", 0LL);
++				const long long online = entry.value("online", 0LL);
++				if (id > 0 && online > 0) {
++					live_room = id;
++					line("[liveList] using room " + std::to_string(id) + " online=" +
++					     std::to_string(online) + " title=" +
++					     entry.value("title", std::string()).substr(0, 40));
++					break;
++				}
++			}
++		}
++		if (live_room == 1)
++			line("[liveList] no live room found; falling back to room 1");
++	}
++
++	/* 0b. Room info through the call the client uses. The room id has to be a
++	 *     canonical one: get_info?room_id=1 answers data.room_id=5440, because
++	 *     room 1 is an alias, and the parser's `data.room_id == roomID` guard
++	 *     rejects that — exactly as BilibiliLiveClient.swift:246 does. Room
++	 *     5440 is the canonical id for short room 1 and is used here for that
++	 *     reason; the signed-in path (room_id_by_uid) needs an account, so this
++	 *     is the public half of "拉到房间信息". */
++	{
++		std::mutex mutex;
++		std::condition_variable cv;
++		bool ready = false;
++		livehime::live::Result<livehime::live::RoomInfo> got;
++		livehime::live::FetchRoomInfo(5440, [&](livehime::live::Result<livehime::live::RoomInfo> result) {
++			std::lock_guard<std::mutex> lock(mutex);
++			got = std::move(result);
++			ready = true;
++			cv.notify_all();
++		});
++		std::unique_lock<std::mutex> lock(mutex);
++		cv.wait_for(lock, std::chrono::seconds(20), [&] { return ready; });
++		line("");
++		if (!ready)
++			line("[FetchRoomInfo 5440] TIMED OUT");
++		else if (!got.ok)
++			line("[FetchRoomInfo 5440] failed: " + got.error.fields.dump());
++		else
++			line("[FetchRoomInfo 5440] ok roomId=" + std::to_string(got.value.room_id) +
++			     " shortId=" + std::to_string(got.value.short_room_id) + " uid=" +
++			     std::to_string(got.value.uid) + " liveStatus=" +
++			     std::to_string(got.value.live_status) + " areaId=" +
++			     std::to_string(got.value.area_id) + " title=" + got.value.title.substr(0, 40));
++	}
++
++	/* 0c. The danmaku WebSocket goes before the QR login, deliberately. The
++	 *     session observer installed in livehime_core_start stops the client
++	 *     whenever the state becomes qrCode or signedOut — CBridge.swift:47-48
++	 *     does the same — so a run that starts the QR login first would stop
++	 *     this connection a few milliseconds in and we would be measuring the
++	 *     observer instead of the handshake. */
++	line("");
++	line("[danmaku] Start(room " + std::to_string(live_room) +
++	     ", uid 0) -> expect connecting then connected, then room events");
++	livehime::dispatch::Post([live_room] {
++		livehime::live::DanmakuClient::Instance().Start(live_room, 0);
++	});
++	std::this_thread::sleep_for(std::chrono::seconds(35));
++	line("[danmaku] 35 s elapsed; room events land in OBS's log as "
++	     "\"[livehime] live event -> room\"");
+ 	line("");
+ 
+ 	std::string user_agent =
+-- 
+2.54.0 (Apple Git-157)
+

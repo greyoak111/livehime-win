@@ -1,0 +1,75 @@
+From da6e6b47d87ab120d9105f400b0f813f8c2e00be Mon Sep 17 00:00:00 2001
+From: DeepSeek Harness <noreply@deepseek.com>
+Date: Sat, 26 Sep 2026 01:29:33 +0800
+Subject: [PATCH 08/18] Log the danmaku status by value, and attempt a live
+ handshake in the self-test
+
+Two danmakuStatus events in a row said only that the status had changed, not
+what it changed to, which is the difference between "the WebSocket handshake
+completed" and "it quietly did not". The event name alone made a VM run
+undecidable; the value makes it decidable, so the UI logs it.
+
+With that in place the self-test also starts the danmaku client for room 1,
+which is public and needs no account. What it observed, verbatim from OBS's
+log:
+
+  [livehime] danmaku status -> connecting
+  [livehime] account state -> qrCode
+  [livehime] danmaku status -> stopped
+
+So the handshake does NOT complete. connecting -> stopped rather than
+connecting -> reconnecting points at FetchDanmakuInfo, which is the step before
+the socket: a transport failure would retry with backoff and report
+reconnecting. The same endpoint answered 200/0 to the self-test's own
+WBI-signed request moments earlier, so the failure is in the client's own
+connect-info path rather than in net/ or the signature. That is the next thing
+to diagnose, and it is recorded here rather than smoothed over.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ plugins/livehime/core/win/livehime-core.cpp | 9 +++++++++
+ plugins/livehime/src/account-panel.cpp      | 8 ++++++++
+ 2 files changed, 17 insertions(+)
+
+diff --git a/plugins/livehime/core/win/livehime-core.cpp b/plugins/livehime/core/win/livehime-core.cpp
+index 8587799..6a42ad3 100644
+--- a/plugins/livehime/core/win/livehime-core.cpp
++++ b/plugins/livehime/core/win/livehime-core.cpp
+@@ -287,6 +287,15 @@ void SelfTest()
+ 	line("[session] StartQrLogin() -> expect an account state -> qrCode");
+ 	livehime::dispatch::Post([] { Session::Instance().StartQrLogin(); });
+ 
++	/* 8. The danmaku WebSocket. This is the port's hardest piece and the one
++	 *    the offline harness could only fake, and it needs no account: room 1
++	 *    is public, so the handshake either completes or it does not. The
++	 *    status callback goes to the UI, which logs it, so the evidence is
++	 *    "[livehime] live event -> danmakuStatus" in OBS's own log. */
++	line("");
++	line("[danmaku] Start(room 1, uid 0) -> expect danmakuStatus connecting -> connected");
++	livehime::dispatch::Post([] { livehime::live::DanmakuClient::Instance().Start(1, 0); });
++
+ 	line("");
+ 	line("done");
+ }
+diff --git a/plugins/livehime/src/account-panel.cpp b/plugins/livehime/src/account-panel.cpp
+index c6ec7c2..ffa35f1 100644
+--- a/plugins/livehime/src/account-panel.cpp
++++ b/plugins/livehime/src/account-panel.cpp
+@@ -199,6 +199,14 @@ void AccountPanel::applyEvent(const QJsonObject &event)
+ 		emit eventReceived(event);
+ 		return;
+ 	}
++	if (name == "danmakuStatus") {
++		/* The danmaku connection is this port's most fragile piece and the one
++		 * bit of it a VM run can prove: its status is the difference between
++		 * "the WebSocket handshake completed" and "it quietly did not", so the
++		 * value goes in the log rather than only the event name. */
++		blog(LOG_INFO, "[livehime] danmaku status -> %s",
++		     event.value("status").toString().toUtf8().constData());
++	}
+ 	blog(LOG_INFO, "[livehime] live event -> %s", name.toUtf8().constData());
+ 
+ 	if (name == "sessionMaintenance") {
+-- 
+2.54.0 (Apple Git-157)
+

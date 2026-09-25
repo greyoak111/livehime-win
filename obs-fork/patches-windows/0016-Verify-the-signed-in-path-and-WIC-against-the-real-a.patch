@@ -1,0 +1,110 @@
+From 15bb94f7b45e60a4a12b6d86881f1a398e924e3b Mon Sep 17 00:00:00 2001
+From: DeepSeek Harness <noreply@deepseek.com>
+Date: Sat, 26 Sep 2026 02:50:21 +0800
+Subject: [PATCH 16/18] Verify the signed-in path and WIC against the real
+ account
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The owner scanned the login QR. What the self-test recorded, verbatim:
+
+  === signed in: mid 364662067, room 1738567607 ===
+  [signed-in FetchRoom]             ok roomId=1738567607 areaId=1062 title=干活，写文
+  [signed-in LoadShieldKeywords]    ok, 0 keywords
+  [signed-in IsIdentifiedByFaceAuth] ok, identified=true
+  [signed-in LoadEmoticons]         ok, {"packs":[{"key":"upower_[doge_金箍]",...}]}
+
+So 扫码登录 and 拉到房间信息 are both live-verified now, not request-verified:
+the session went through the page's own QR code into `ready`, and FetchRoom
+walked the room_id_by_uid leg that needs an account. The run happened twice and
+the second one read liveStatus=1 where the first read 0.
+
+WIC is verified too, and cleanly: after the login the emote picker pulled the
+room's emotes and the cache holds 225 files, of which **225 carry the PNG magic
+and 0 do not**, with **0 of them over 160 px** in their IHDR. That is exactly
+what Emoticons.swift:203-214 asks for — the encoder ran on every picture, the
+scaler bounded every one, and not a single container fell back to the raw
+bytes. The remaining gap I recorded last commit is closed.
+
+The self-test's room picker now takes the busiest entry rather than the first,
+and prefers room 5050 when get_info says it is streaming. `online` is a heat
+value: the hottest room in the recommend list was sending four danmaku a minute,
+which proves the socket and exercises nothing downstream of it.
+
+Nothing was written to the account: LIVEHIME_SELFTEST_WRITE stayed unset, so
+UpdateTitle, SendDanmaku, StartLive and StopLive have still not run against it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ plugins/livehime/core/win/livehime-core.cpp | 45 ++++++++++++++++++---
+ 1 file changed, 39 insertions(+), 6 deletions(-)
+
+diff --git a/plugins/livehime/core/win/livehime-core.cpp b/plugins/livehime/core/win/livehime-core.cpp
+index a5ac6de..bb26381 100644
+--- a/plugins/livehime/core/win/livehime-core.cpp
++++ b/plugins/livehime/core/win/livehime-core.cpp
+@@ -176,21 +176,54 @@ void SelfTest()
+ 		nlohmann::json parsed = nlohmann::json::parse(response.body, nullptr, false);
+ 		line("[liveList] status=" + std::to_string(response.status) + " code=" +
+ 		     std::to_string(parsed.is_discarded() ? -999 : parsed.value("code", -999)));
++		/* The busiest entry, not the first one. `online` is a heat value, not a
++		 * viewer count, and the first entry of this list turned out to be a
++		 * room that answers with one or two danmaku a minute — enough to prove
++		 * the socket works and not enough to exercise the parts that only run
++		 * when someone actually chats. */
++		long long best_online = 0;
+ 		if (!parsed.is_discarded() && parsed.contains("data") && parsed["data"].is_array()) {
+ 			for (const auto &entry : parsed["data"]) {
+ 				const long long id = entry.value("roomid", 0LL);
+ 				const long long online = entry.value("online", 0LL);
+-				if (id > 0 && online > 0) {
++				if (id > 0 && online > best_online) {
++					best_online = online;
+ 					live_room = id;
+-					line("[liveList] using room " + std::to_string(id) + " online=" +
+-					     std::to_string(online) + " title=" +
+-					     entry.value("title", std::string()).substr(0, 40));
+-					break;
+ 				}
+ 			}
+ 		}
+-		if (live_room == 1)
++		if (live_room != 1)
++			line("[liveList] busiest is room " + std::to_string(live_room) + " online=" +
++			     std::to_string(best_online));
++		else
+ 			line("[liveList] no live room found; falling back to room 1");
++
++		/* `online` is a heat value and the hottest room in this list turned out
++		 * to send four danmaku a minute, which proves the socket and exercises
++		 * nothing downstream of it. Room 5050 is a known-loud room: take it
++		 * when get_info says it is actually streaming (live_status 1), and say
++		 * which one was chosen either way so a quiet run is never mistaken for
++		 * a broken one. */
++		{
++			livehime::net::Request probe;
++			probe.url = livehime::net::AppendQuery(
++				"https://api.live.bilibili.com/room/v1/Room/get_info", "room_id=5050");
++			probe.headers["User-Agent"] =
++				"Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/605.1.15 (KHTML, like "
++				"Gecko) Version/17.0 Safari/605.1.15";
++			probe.headers["Referer"] = "https://live.bilibili.com/";
++			nlohmann::json p2 =
++				nlohmann::json::parse(livehime::net::SendSync(probe).body, nullptr, false);
++			const int status = p2.is_discarded()
++						   ? -1
++						   : p2.value("data", nlohmann::json::object())
++							     .value("live_status", -1);
++			line("[liveList] room 5050 live_status=" + std::to_string(status));
++			if (status == 1) {
++				live_room = 5050;
++				line("[liveList] using the known-loud room 5050 instead");
++			}
++		}
+ 	}
+ 
+ 	/* 0b. Room info through the call the client uses. The room id has to be a
+-- 
+2.54.0 (Apple Git-157)
+

@@ -1,0 +1,2833 @@
+From 35681a3fa0230fec4ede0f8a4f0a9edab624685c Mon Sep 17 00:00:00 2001
+From: DeepSeek Harness <noreply@deepseek.com>
+Date: Sat, 26 Sep 2026 03:23:42 +0800
+Subject: [PATCH 17/18] Point the updater at the Windows releases, and
+ implement it
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Two separate things were pointing at the macOS repository.
+
+The core's update entry points were honest failures; they now run a real
+updater against api.github.com/repos/greyoak111/livehime-win. Verified the way
+that can actually be verified, by asking it: an auto-check fifteen seconds after
+launch reports
+
+  [livehime] update -> checking
+  [livehime] update -> failed reason: network
+  [livehime] update failed: network HTTP 404
+
+A 404 is the evidence. livehime-win has no releases yet, so /releases/latest
+404s; had it still been asking livehime-macos it would have found releases and
+answered upToDate or available instead. The per-platform releases link in
+update-page.cpp is fixed too — it was the fallback for "open the releases page",
+so with automatic updates off a Windows user was being sent to the macOS
+download.
+
+What the updater is: feed parsing, a streaming downloader (net::Send buffers a
+whole body, so the archive is streamed with 64 KiB WinHTTP reads straight to
+disk and through an incremental SHA-256 on a worker thread), an in-file zip
+reader over the already-linked zlib (Zip64, CRC per entry, refuses traversal,
+absolute names, ADS, device names, encrypted and bzip2 entries), and an
+install.cmd helper that outlives the process because Windows will not let a
+running obs64.exe be overwritten. The swap is two renames inside one directory,
+so it is same-volume by construction, with the old tree kept as
+<root>.livehime-previous for rollback. OBS portable mode is refused before the
+download, because its scenes live inside the tree an update would replace.
+
+Publisher verification is absent and not faked: nothing on Windows is signed
+yet and a zip carries no Authenticode signature, so SHA-256 plus the staged
+executable's version resource and PE machine type is as far as this can honestly
+go.
+
+Two build fixes along the way: updater.cpp used INTERNET_PORT, URL_COMPONENTS,
+WinHttpCrackUrl and HINTERNET without including <winhttp.h> (its author's clang
+check passed against a hand-written stub, which is exactly the gap a stub
+leaves), and EmitUnsupportedEvent was dead code that MSVC C4505 would fail a /WX
+build on.
+
+The update event now logs its status and reason, for the same reason danmaku
+does: "up to date" without saying where it looked cannot be told apart from
+having quietly asked the wrong repository.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ plugins/livehime/CMakeLists.txt              |   19 +-
+ plugins/livehime/core/win/livehime-core.cpp  |   41 +-
+ plugins/livehime/core/win/update/updater.cpp | 2459 ++++++++++++++++++
+ plugins/livehime/core/win/update/updater.h   |  123 +
+ plugins/livehime/src/feature-panel.cpp       |    9 +
+ plugins/livehime/src/update-page.cpp         |    9 +
+ 6 files changed, 2629 insertions(+), 31 deletions(-)
+ create mode 100644 plugins/livehime/core/win/update/updater.cpp
+ create mode 100644 plugins/livehime/core/win/update/updater.h
+
+diff --git a/plugins/livehime/CMakeLists.txt b/plugins/livehime/CMakeLists.txt
+index 8dcc514..c99c058 100644
+--- a/plugins/livehime/CMakeLists.txt
++++ b/plugins/livehime/CMakeLists.txt
+@@ -133,6 +133,8 @@ elseif(WIN32)
+     core/win/live/liveclient.h
+     core/win/live/danmaku.cpp
+     core/win/live/danmaku.h
++    core/win/update/updater.cpp
++    core/win/update/updater.h
+     core/win/web/webview.cpp
+     core/win/web/webview.h
+   )
+@@ -214,13 +216,18 @@ elseif(WIN32)
+   # user32/dwmapi: window level and capture affinity for the floating chat and
+   # the per-window capture exceptions (the Windows counterpart of NSWindow's
+   # sharingType). version: the version resource UpdatePage::currentVersion()
+-  # reads.
+-  # winhttp: the whole net/ layer, including the danmaku WebSocket upgrade.
+-  # bcrypt: MD5/SHA-256/HMAC and the CSPRNG for net/crypto.
++  # reads, and update/updater.cpp reads the same ProductVersion/FileVersion
++  # strings out of it for the running app, the staged tree and a rollback.
++  # winhttp: the whole net/ layer, including the danmaku WebSocket upgrade and
++  # the update download, which streams the archive itself because net::Send
++  # buffers a whole body in memory.
++  # bcrypt: MD5/SHA-256/HMAC and the CSPRNG for net/crypto, plus the
++  # incremental SHA-256 update/updater.cpp runs over an archive as it arrives.
+   # advapi32: CredRead/CredWrite/CredDelete for auth/credentials.
+-  # crypt32: SHA-256, which the update check needs once that lands.
+-  # ZLIB: the danmaku protocol's version-2 packet bodies. Version 3 would be
+-  # brotli, which neither Windows nor obs-deps ships; see
++  # crypt32: DPAPI (CryptProtectData) for that store's file overflow.
++  # ZLIB: the danmaku protocol's version-2 packet bodies, and the inflate the
++  # update's zip reader unpacks a release with. Version 3 would be brotli,
++  # which neither Windows nor obs-deps ships; see
+   # docs/port-spec/danmaku-protocol.md.
+   target_link_libraries(
+     livehime
+diff --git a/plugins/livehime/core/win/livehime-core.cpp b/plugins/livehime/core/win/livehime-core.cpp
+index bb26381..3e6e9aa 100644
+--- a/plugins/livehime/core/win/livehime-core.cpp
++++ b/plugins/livehime/core/win/livehime-core.cpp
+@@ -6,10 +6,9 @@
+  * {"event":"unsupported"}.
+  *
+  * The pieces not yet ported keep answering honestly rather than pretending:
+- * see kPendingWebView, kPendingCaptions and kPendingUpdates below. An entry
+- * point that cannot do its job emits its real failure, because the stub's one
+- * virtue — never claiming a success it did not achieve — has to survive the
+- * port. */
++ * see kPendingWebView and kPendingCaptions below. An entry point that cannot
++ * do its job emits its real failure, because the stub's one virtue — never
++ * claiming a success it did not achieve — has to survive the port. */
+ 
+ #include <nlohmann/json.hpp>
+ 
+@@ -35,6 +34,7 @@
+ #include "net/http.h"
+ #include "net/signing.h"
+ #include "platform/dispatch.h"
++#include "update/updater.h"
+ #include "web/webview.h"
+ 
+ using livehime::Emit;
+@@ -64,10 +64,6 @@ void EmitWebFailure(const char *what, const std::string &reason)
+ 		  {"detail", std::string(what) + ": " + reason}});
+ }
+ 
+-void EmitUnsupportedEvent(const char *what)
+-{
+-	Emit(json{{"event", "unsupported"}, {"status", "unsupported"}, {"core", "win"}, {"what", what}});
+-}
+ 
+ void EmitPendingState(const char *detail)
+ {
+@@ -1053,42 +1049,37 @@ int livehime_core_page_click(const char *key, double x, double y)
+ 	return livehime::web::ClickPage(key ? key : "", x, y) ? 1 : 0;
+ }
+ 
+-/* ── Updates (not in this milestone) ────────────────────────────────────── */
++/* ── Updates ─────────────────────────────────────────────────────────────── */
++
++/* The five entry points live in update/updater.cpp: the feed is the Windows
++ * releases repository (github.com/greyoak111/livehime-win), the asset is the
++ * zipped install tree, and the swap is done by a generated install.cmd that
++ * waits for this process to exit. update/updater.h has what is verified and
++ * what is not. */
+ 
+ void livehime_core_update_check(int beta)
+ {
+-	(void)beta;
+-	Emit(json{{"event", "update"},
+-		  {"status", "failed"},
+-		  {"supported", false},
+-		  {"reason", "unsupported"},
+-		  {"core", "win"},
+-		  {"message", "Updates are not available in the Windows port yet."}});
++	livehime::update::Check(beta != 0);
+ }
+ 
+ void livehime_core_update_download(void)
+ {
+-	Emit(json{{"event", "update"},
+-		  {"status", "failed"},
+-		  {"supported", false},
+-		  {"reason", "unsupported"},
+-		  {"core", "win"}});
++	livehime::update::Download();
+ }
+ 
+ int livehime_core_update_install(int relaunch)
+ {
+-	(void)relaunch;
+-	return 0;
++	return livehime::update::Install(relaunch != 0) ? 1 : 0;
+ }
+ 
+ int livehime_core_update_rollback(void)
+ {
+-	return 0;
++	return livehime::update::Rollback() ? 1 : 0;
+ }
+ 
+ void livehime_core_update_state(void)
+ {
+-	Emit(json{{"event", "update"}, {"status", "idle"}, {"supported", false}, {"core", "win"}});
++	livehime::update::EmitState();
+ }
+ 
+ /* ── Diagnostics probe ──────────────────────────────────────────────────── */
+diff --git a/plugins/livehime/core/win/update/updater.cpp b/plugins/livehime/core/win/update/updater.cpp
+new file mode 100644
+index 0000000..6a1095a
+--- /dev/null
++++ b/plugins/livehime/core/win/update/updater.cpp
+@@ -0,0 +1,2459 @@
++/* LiveHime app updates on Windows — the C++ counterpart of AppUpdater.swift
++ * and AppUpdateBridge.swift. What it does and why is in update/updater.h; this
++ * file is laid out in the order the work happens:
++ *
++ *   feed      the GitHub release JSON of greyoak111/livehime-win (net::Send)
++ *   app       what this build is: version resource, machine type, install tree
++ *   download  the streaming worker: archive -> SHA-256 -> zip -> staged tree
++ *   install   install.cmd, the helper that swaps the tree after the app quits
++ *   state     the events the Updates tab reads
++ *
++ * Nothing here leaves a success it did not earn: every path that cannot finish
++ * emits {"event":"update","status":"failed","reason":…,"message":…} with the
++ * real reason, and `supported` is false whenever this build must not replace
++ * itself. */
++
++#include "updater.h"
++
++#include <windows.h>
++#include <winhttp.h> /* INTERNET_PORT, URL_COMPONENTS, WinHttpCrackUrl, HINTERNET */
++#include <bcrypt.h>
++/* The order libobs/util/platform-windows.c uses for shlobj.h, which wants the
++ * shell and COM declarations in front of it; objbase.h is also where
++ * CoTaskMemFree lives (WIN32_LEAN_AND_MEAN keeps windows.h from pulling it
++ * in). */
++#include <shellapi.h>
++#include <objbase.h>
++#include <shlobj.h>
++#include <zlib.h>
++
++#include <nlohmann/json.hpp>
++
++#include <algorithm>
++#include <atomic>
++#include <condition_variable>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <cwchar>
++#include <fstream>
++#include <functional>
++#include <limits>
++#include <mutex>
++#include <optional>
++#include <string>
++#include <thread>
++#include <vector>
++
++#include "../core/emit.h"
++#include "../net/crypto.h"
++#include "../net/http.h"
++#include "../platform/dispatch.h"
++
++/* bcrypt.h does not bring this along on its own (net/crypto.cpp defines it the
++ * same way). */
++#ifndef NT_SUCCESS
++#define NT_SUCCESS(Status) (((NTSTATUS)(Status)) >= 0)
++#endif
++
++namespace livehime {
++namespace update {
++namespace {
++
++/* ── the feed ───────────────────────────────────────────────────────────── */
++
++/* AppUpdater.swift:55-57 pointed these at livehime-macos; this is the Windows
++ * repository. The API needs no authentication for public releases, and the
++ * archive URL the feed carries is used but never emitted or logged. */
++constexpr const char *kReleasesPage = "https://github.com/greyoak111/livehime-win/releases";
++constexpr const char *kLatestFeed = "https://api.github.com/repos/greyoak111/livehime-win/releases/latest";
++constexpr const char *kListFeed = "https://api.github.com/repos/greyoak111/livehime-win/releases?per_page=20";
++
++/* AppUpdater.swift:92-100: each release carries one archive per architecture,
++ * "LiveHimeMacApp-v<version>-arm64.zip" there; the Windows release publishes
++ * the zipped install tree under the same shape (update/updater.h). */
++constexpr const char *kAssetPrefix = "LiveHimeWinRundir-";
++#if defined(_M_ARM64)
++constexpr const char *kArchitecture = "arm64";
++#else
++/* OBS on Windows is 64-bit only: x64, or arm64 above. */
++constexpr const char *kArchitecture = "x64";
++#endif
++
++/* The Swift's timeoutInterval: 20 (AppUpdater.swift:139). */
++constexpr int kFeedTimeoutMs = 20000;
++
++/* The transfer: 64 KiB reads, into the archive file and out of it again, and
++ * the same redirect ceiling net/http.h uses for the hop from github.com to its
++ * object store. */
++constexpr size_t kDownloadChunk = 64 * 1024;
++constexpr int kMaxRedirects = 5;
++
++/* ── the install tree ───────────────────────────────────────────────────── */
++
++/* Where the executable sits inside the tree, and therefore what the tree is.
++ * Both build_<target>/rundir/<config> and the `cmake --install` tree of
++ * build-aux/livehime-win/build-win.ps1 use OBS's own destinations
++ * (cmake/windows/defaults.cmake: bin/64bit, obs-plugins/64bit, data). */
++constexpr const wchar_t *kExeFolderName = L"64bit";
++constexpr const wchar_t *kBinFolderName = L"bin";
++constexpr const wchar_t *kExeName = L"obs64.exe";
++
++/* The staged and previous trees are siblings of the install tree: the helper's
++ * swap is a rename, and a rename cannot cross volumes. */
++constexpr const wchar_t *kStagedSuffix = L".livehime-staged-";
++constexpr const wchar_t *kPreviousSuffix = L".livehime-previous";
++
++/* AppUpdater.swift:213-218 — what a settings backup holds, what a rollback
++ * across OBS major versions restores, and how many backups are kept. The two
++ * lists are comma-separated on one argument to install.cmd, which splits them
++ * with `for`. */
++constexpr const char *kConfigItems = "basic,plugin_config,plugin_manager,user.ini,global.ini";
++constexpr const char *kRestoredItems = "basic,user.ini,global.ini";
++constexpr size_t kKeptBackups = 8;
++
++/* ── failures ───────────────────────────────────────────────────────────── */
++
++/* AppUpdater.swift:18-45. `reason` is what the UI looks up in the two locale
++ * files (data/locale/en-US.ini, zh-CN.ini) as LiveHime.Update.Failed.<reason>;
++ * `message` is the detail that goes to the OBS log. An empty reason means no
++ * failure. */
++struct Failure {
++	std::string reason;
++	std::string message;
++
++	bool Ok() const { return reason.empty(); }
++};
++
++Failure Network(const std::string &message)
++{
++	return Failure{"network", message};
++}
++Failure NoArchive(const std::string &message)
++{
++	return Failure{"noArchive", message};
++}
++Failure Checksum(const std::string &message)
++{
++	return Failure{"checksum", message};
++}
++Failure InvalidApp(const std::string &message)
++{
++	return Failure{"invalidApp", message};
++}
++Failure Location(const std::string &message)
++{
++	return Failure{"location", message};
++}
++Failure Unsupported(const std::string &message)
++{
++	return Failure{"unsupported", message};
++}
++
++/* ── text and paths ─────────────────────────────────────────────────────── */
++
++std::wstring Widen(const std::string &utf8)
++{
++	if (utf8.empty())
++		return {};
++	int len = MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(), static_cast<int>(utf8.size()), nullptr, 0);
++	std::wstring out(static_cast<size_t>(len), L'\0');
++	MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(), static_cast<int>(utf8.size()), &out[0], len);
++	return out;
++}
++
++std::string Narrow(const std::wstring &wide)
++{
++	if (wide.empty())
++		return {};
++	int bytes = WideCharToMultiByte(CP_UTF8, 0, wide.c_str(), static_cast<int>(wide.size()), nullptr, 0, nullptr,
++					nullptr);
++	std::string out(static_cast<size_t>(bytes), '\0');
++	WideCharToMultiByte(CP_UTF8, 0, wide.c_str(), static_cast<int>(wide.size()), &out[0], bytes, nullptr, nullptr);
++	return out;
++}
++
++std::string Utf8(const std::filesystem::path &path)
++{
++	return path.u8string();
++}
++
++/* The same trimming SessionCoordinator.swift:271 needed for a title: version
++ * resource strings and test input can carry ASCII whitespace around them. */
++std::string Trim(const std::string &text)
++{
++	size_t begin = text.find_first_not_of(" \t\r\n\f\v");
++	if (begin == std::string::npos)
++		return {};
++	size_t end = text.find_last_not_of(" \t\r\n\f\v");
++	return text.substr(begin, end - begin + 1);
++}
++
++bool SameName(const std::filesystem::path &path, const wchar_t *name)
++{
++	const std::wstring leaf = path.filename().wstring();
++	return _wcsicmp(leaf.c_str(), name) == 0;
++}
++
++bool EndsWith(const std::string &text, const std::string &suffix)
++{
++	return text.size() >= suffix.size() && text.compare(text.size() - suffix.size(), suffix.size(), suffix) == 0;
++}
++
++bool StartsWith(const std::string &text, const std::string &prefix)
++{
++	return text.size() >= prefix.size() && text.compare(0, prefix.size(), prefix) == 0;
++}
++
++/* The macOS code wrote the tag straight into a directory name
++ * (AppUpdater.swift:245). A tag is arbitrary text from the feed, so the path
++ * form keeps only what cannot mean a directory of its own. */
++std::wstring PathVersion(const std::string &version)
++{
++	std::wstring out;
++	for (unsigned char c : version) {
++		const bool safe = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
++				  c == '.' || c == '_' || c == '-';
++		out += safe ? static_cast<wchar_t>(c) : L'_';
++	}
++	return out.empty() ? std::wstring(L"unknown") : out;
++}
++
++std::filesystem::path ExeIn(const std::filesystem::path &root)
++{
++	return root / kBinFolderName / kExeFolderName / kExeName;
++}
++
++std::filesystem::path StagedTree(const std::filesystem::path &root, const std::string &version)
++{
++	return root.parent_path() / (root.filename().wstring() + kStagedSuffix + PathVersion(version));
++}
++
++std::filesystem::path PreviousTree(const std::filesystem::path &root)
++{
++	return root.parent_path() / (root.filename().wstring() + kPreviousSuffix);
++}
++
++/* ── versions ───────────────────────────────────────────────────────────── */
++
++/* AppUpdater.swift:80-90: dotted versions compare numerically, a missing part
++ * counts as zero ("0.2.7" is not older than "0.2.7.0"), and every run of
++ * digits is one part ("0.2.10-beta1" -> 0,2,10,1). Swift's `Int($0) ?? 0`
++ * turns a part that does not fit an Int into zero, which is exactly what the
++ * accumulation below does at the same 64-bit boundary; leading zeros are not an
++ * overflow, here or there. Only ASCII digits count, where Swift also accepted
++ * non-ASCII ones, which cannot appear in a version we publish. */
++std::vector<long long> VersionParts(const std::string &version)
++{
++	std::vector<long long> parts;
++	size_t i = 0;
++	while (i < version.size()) {
++		if (version[i] < '0' || version[i] > '9') {
++			++i;
++			continue;
++		}
++		const size_t begin = i;
++		while (i < version.size() && version[i] >= '0' && version[i] <= '9')
++			++i;
++
++		long long value = 0;
++		bool overflow = false;
++		for (size_t at = begin; at < i; ++at) {
++			const int digit = version[at] - '0';
++			if (value > (std::numeric_limits<long long>::max() - digit) / 10) {
++				overflow = true;
++				break;
++			}
++			value = value * 10 + digit;
++		}
++		parts.push_back(overflow ? 0 : value);
++	}
++	return parts;
++}
++
++bool IsNewer(const std::string &candidate, const std::string &current)
++{
++	const std::vector<long long> a = VersionParts(candidate);
++	const std::vector<long long> b = VersionParts(current);
++	const size_t count = std::max(a.size(), b.size());
++	for (size_t i = 0; i < count; ++i) {
++		const long long x = i < a.size() ? a[i] : 0;
++		const long long y = i < b.size() ? b[i] : 0;
++		if (x != y)
++			return x > y;
++	}
++	return false;
++}
++
++/* AppUpdater.swift:187-189: the OBS major version an app is built on. */
++std::string ObsMajor(const std::string &version)
++{
++	const size_t dot = version.find('.');
++	return dot == std::string::npos ? version : version.substr(0, dot);
++}
++
++/* ── reading a release out of the feed ──────────────────────────────────── */
++
++struct Release {
++	std::string version;
++	std::string notes;
++	std::string page;
++	std::string archive;
++	std::string sha256;
++	long long size = 0;
++	bool prerelease = false;
++};
++
++/* The Swift read every field with `as? T` and fell back, so a feed with a
++ * wrong type in one field is tolerated rather than fatal. */
++std::string StringField(const nlohmann::json &object, const char *key)
++{
++	auto it = object.find(key);
++	return it != object.end() && it->is_string() ? it->get<std::string>() : std::string();
++}
++
++bool BoolField(const nlohmann::json &object, const char *key, bool fallback = false)
++{
++	auto it = object.find(key);
++	return it != object.end() && it->is_boolean() ? it->get<bool>() : fallback;
++}
++
++long long IntegerField(const nlohmann::json &object, const char *key)
++{
++	auto it = object.find(key);
++	return it != object.end() && it->is_number_integer() ? it->get<long long>() : 0;
++}
++
++/* AppUpdater.swift:118-136: one release object becomes the app archive for
++ * this architecture, its published digest and what the UI shows. */
++bool ReleaseFromObject(const nlohmann::json &root, Release &release, Failure &failure)
++{
++	if (!root.is_object() || !root.contains("tag_name") || !root["tag_name"].is_string()) {
++		failure = Network("invalid release feed");
++		return false;
++	}
++
++	const std::string tag = root["tag_name"].get<std::string>();
++	release.version = StartsWith(tag, "v") ? tag.substr(1) : tag;
++
++	if (release.version.empty()) {
++		failure = Network("the release has no version");
++		return false;
++	}
++
++	const std::string suffix = std::string("-") + kArchitecture + ".zip";
++	const nlohmann::json *asset = nullptr;
++	if (root.contains("assets") && root["assets"].is_array()) {
++		for (const nlohmann::json &candidate : root["assets"]) {
++			if (!candidate.is_object())
++				continue;
++			const std::string name = StringField(candidate, "name");
++			if (StartsWith(name, kAssetPrefix) && EndsWith(name, suffix)) {
++				asset = &candidate;
++				break;
++			}
++		}
++	}
++	if (!asset) {
++		failure = NoArchive(std::string("the release has no ") + kArchitecture + " archive");
++		return false;
++	}
++	release.archive = StringField(*asset, "browser_download_url");
++	if (release.archive.empty()) {
++		failure = NoArchive("the release's archive has no download address");
++		return false;
++	}
++
++	/* "digest" is GitHub's own "sha256:<hex>" for an uploaded asset. It is the
++	 * only integrity statement this release makes; AppUpdater.swift:128-131
++	 * read the same field. */
++	const std::string digest = StringField(*asset, "digest");
++	if (StartsWith(digest, "sha256:")) {
++		release.sha256 = digest.substr(std::strlen("sha256:"));
++		std::transform(release.sha256.begin(), release.sha256.end(), release.sha256.begin(),
++			       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
++	}
++
++	release.notes = StringField(root, "body");
++	release.page = StringField(root, "html_url");
++	if (release.page.empty())
++		release.page = kReleasesPage;
++	release.size = IntegerField(*asset, "size");
++	release.prerelease = BoolField(root, "prerelease");
++	return true;
++}
++
++/* AppUpdater.swift:104-116: an object is one release; a list is filtered
++ * (drafts always out, pre-releases unless `beta`) and the newest entry wins.
++ * Entries without an archive for this architecture drop out rather than
++ * failing the feed. */
++bool ReleaseFromFeed(const std::string &body, bool beta, Release &release, Failure &failure)
++{
++	const nlohmann::json parsed = nlohmann::json::parse(body, nullptr, false);
++	if (parsed.is_discarded()) {
++		failure = Network("the release feed is not JSON");
++		return false;
++	}
++	if (parsed.is_object())
++		return ReleaseFromObject(parsed, release, failure);
++	if (!parsed.is_array()) {
++		failure = Network("invalid release feed");
++		return false;
++	}
++
++	bool found = false;
++	Release newest;
++	for (const nlohmann::json &entry : parsed) {
++		if (!entry.is_object() || BoolField(entry, "draft"))
++			continue;
++		if (!beta && BoolField(entry, "prerelease"))
++			continue;
++		Release candidate;
++		Failure ignored;
++		if (!ReleaseFromObject(entry, candidate, ignored))
++			continue;
++		if (!found || IsNewer(candidate.version, newest.version)) {
++			newest = candidate;
++			found = true;
++		}
++	}
++	if (!found) {
++		failure = NoArchive("no usable release in the feed");
++		return false;
++	}
++	release = newest;
++	return true;
++}
++
++/* ── what this build is ─────────────────────────────────────────────────── */
++
++struct AppInfo {
++	std::filesystem::path exe;
++	/* The directory that is replaced by an update: the one holding
++	 * bin\64bit\obs64.exe. Empty when the executable is not in that layout, in
++	 * which case nothing is installed over it. */
++	std::filesystem::path root;
++	std::string product; /* ProductVersion: LIVEHIME_APP_VERSION */
++	std::string obs;     /* FileVersion: the OBS version this build is based on */
++	std::string name;    /* ProductName: "the same app" */
++	uint16_t machine = 0;
++};
++
++/* The shell folders every path below is built from: %LOCALAPPDATA% for the
++ * downloads (the macOS code used ~/Library/Caches) and %APPDATA% for the
++ * settings (the config root libobs already uses with
++ * OBS_USER_CONFIG_SUBDIR=LiveHime). SHGetKnownFolderPath answers in UTF-16, so
++ * a user name outside the current code page still resolves; an empty result
++ * fails the operation that needed it instead of writing somewhere relative. */
++std::filesystem::path KnownFolder(REFKNOWNFOLDERID id)
++{
++	PWSTR raw = nullptr;
++	if (FAILED(SHGetKnownFolderPath(id, 0, nullptr, &raw)) || !raw)
++		return {};
++	std::filesystem::path path(raw);
++	CoTaskMemFree(raw);
++	return path;
++}
++
++const std::filesystem::path &LocalAppData()
++{
++	static const std::filesystem::path path = KnownFolder(FOLDERID_LocalAppData);
++	return path;
++}
++
++const std::filesystem::path &RoamingAppData()
++{
++	static const std::filesystem::path path = KnownFolder(FOLDERID_RoamingAppData);
++	return path;
++}
++
++std::filesystem::path UpdatesFolder()
++{
++	const std::filesystem::path &base = LocalAppData();
++	return base.empty() ? base : base / L"LiveHime" / L"Updates";
++}
++
++std::filesystem::path BackupsFolder()
++{
++	const std::filesystem::path &base = RoamingAppData();
++	return base.empty() ? base : base / L"LiveHime" / L"backups";
++}
++
++std::filesystem::path ConfigFolder()
++{
++	const std::filesystem::path &base = RoamingAppData();
++	return base.empty() ? base : base / L"LiveHime" / L"obs-studio";
++}
++
++/* One string out of an executable's version resource, read the way
++ * update-page.cpp:45-85 reads the running version. An empty result means the
++ * file has no such string, which every caller treats as "cannot verify". */
++std::wstring ModuleField(const std::filesystem::path &module, const wchar_t *field)
++{
++	DWORD ignored = 0;
++	const DWORD size = GetFileVersionInfoSizeW(module.c_str(), &ignored);
++	if (!size)
++		return {};
++
++	std::vector<char> block(size);
++	if (!GetFileVersionInfoW(module.c_str(), 0, size, block.data()))
++		return {};
++
++	struct LangCodePage {
++		WORD language;
++		WORD codePage;
++	};
++	LangCodePage *translations = nullptr;
++	UINT translations_size = 0;
++	if (!VerQueryValueW(block.data(), L"\\VarFileInfo\\Translation", reinterpret_cast<LPVOID *>(&translations),
++			    &translations_size) ||
++	    !translations || translations_size < sizeof(LangCodePage))
++		return {};
++
++	wchar_t query[64] = {};
++	swprintf_s(query, L"\\StringFileInfo\\%04x%04x\\%s", translations[0].language, translations[0].codePage, field);
++
++	wchar_t *value = nullptr;
++	UINT value_size = 0;
++	if (!VerQueryValueW(block.data(), query, reinterpret_cast<LPVOID *>(&value), &value_size) || !value ||
++	    !value_size)
++		return {};
++	return std::wstring(value, wcsnlen(value, static_cast<size_t>(value_size)));
++}
++
++/* The COFF machine type of a PE file (IMAGE_FILE_HEADER.Machine). The staged
++ * tree has to be the same architecture as the running app; the asset name
++ * already selects one, and this is the check that the asset really is it. */
++uint16_t ModuleMachine(const std::filesystem::path &module)
++{
++	std::ifstream file(module, std::ios::binary);
++	if (!file)
++		return 0;
++
++	unsigned char dos[64] = {};
++	if (!file.read(reinterpret_cast<char *>(dos), sizeof(dos)))
++		return 0;
++	if (dos[0] != 'M' || dos[1] != 'Z')
++		return 0;
++
++	const uint32_t pe = static_cast<uint32_t>(dos[0x3C]) | (static_cast<uint32_t>(dos[0x3D]) << 8) |
++			    (static_cast<uint32_t>(dos[0x3E]) << 16) | (static_cast<uint32_t>(dos[0x3F]) << 24);
++
++	file.seekg(static_cast<std::streamoff>(pe));
++	unsigned char header[6] = {};
++	if (!file.read(reinterpret_cast<char *>(header), sizeof(header)))
++		return 0;
++	if (header[0] != 'P' || header[1] != 'E' || header[2] != 0 || header[3] != 0)
++		return 0;
++	return static_cast<uint16_t>(header[4] | (header[5] << 8));
++}
++
++/* The tree has to be a directory with a name and a parent of its own: an
++ * install is a rename in that parent, and a drive's root can be neither renamed
++ * nor staged beside. Anything else has no install tree to replace. */
++bool UsableRoot(const std::filesystem::path &root)
++{
++	return !root.empty() && !root.filename().empty() && root.parent_path() != root;
++}
++
++/* OBS's portable mode keeps the whole config root inside the install tree:
++ * frontend/obs-main.cpp enables it from one of these marker files in the tree's
++ * root, and frontend/OBSApp.cpp:1726 then reads and writes <root>\config. A
++ * user's scenes, profiles and plugin settings would be replaced along with the
++ * tree — the new archive has none of them — so an update is refused rather than
++ * performed as a silent settings reset. */
++bool PortableTree(const std::filesystem::path &root)
++{
++	static const wchar_t *kMarkers[] = {L"portable_mode", L"obs_portable_mode", L"portable_mode.txt",
++					    L"obs_portable_mode.txt"};
++	std::error_code ec;
++	if (std::filesystem::exists(root / L"config", ec) && !ec)
++		return true;
++	for (const wchar_t *marker : kMarkers) {
++		std::error_code inner;
++		if (std::filesystem::exists(root / marker, inner) && !inner)
++			return true;
++	}
++	return false;
++}
++
++/* What to tell the user when the tree cannot be replaced at all. */
++constexpr const char *kPortableReason =
++	"LiveHime keeps its settings inside the install tree (portable mode); an update would replace them";
++
++AppInfo ReadApp(const std::filesystem::path &exe)
++{
++	AppInfo app;
++	app.exe = exe;
++	app.product = Trim(Narrow(ModuleField(exe, L"ProductVersion")));
++	app.obs = Trim(Narrow(ModuleField(exe, L"FileVersion")));
++	app.name = Trim(Narrow(ModuleField(exe, L"ProductName")));
++	app.machine = ModuleMachine(exe);
++
++	/* The tree is the directory holding bin\64bit\obs64.exe. Anything else is
++	 * refused rather than guessed at: an install renames this directory, and a
++	 * wrong guess would move the wrong files. */
++	const std::filesystem::path folder = exe.parent_path();
++	if (!SameName(folder, kExeFolderName) || !SameName(folder.parent_path(), kBinFolderName) ||
++	    !SameName(exe, kExeName))
++		return app;
++	const std::filesystem::path root = folder.parent_path().parent_path();
++	if (!UsableRoot(root))
++		return app;
++	app.root = root;
++	return app;
++}
++
++/* The running executable, read once. GetModuleFileNameW(nullptr) from inside
++ * this DLL answers the host process's own path, which is what "the running
++ * app" means for every check here. */
++const AppInfo &ThisApp()
++{
++	static const AppInfo app = [] {
++		std::vector<wchar_t> buffer(32768, L'\0');
++		const DWORD length = GetModuleFileNameW(nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
++		if (length == 0 || length >= buffer.size())
++			return AppInfo{};
++		return ReadApp(std::filesystem::path(std::wstring(buffer.data(), length)));
++	}();
++	return app;
++}
++
++/* AppUpdater.swift:66-68: the running app's version, "0" when the version
++ * resource cannot be read at all. Same source as UpdatePage::currentVersion,
++ * so the two can never disagree. */
++std::string CurrentVersion()
++{
++	const AppInfo &app = ThisApp();
++	return app.product.empty() ? std::string("0") : app.product;
++}
++
++/* AppUpdater.swift:72-75: a development build does not replace itself, unless
++ * a test feed is set. The Windows reading of "development build" is in
++ * update/updater.h: a version resource whose ProductVersion is its FileVersion
++ * was configured without LIVEHIME_APP_VERSION — upstream OBS Studio, or this
++ * source built without the LiveHime branding. */
++std::optional<std::string> FeedOverride()
++{
++	const char *value = std::getenv("LIVEHIME_UPDATE_FEED");
++	if (!value || !*value)
++		return std::nullopt;
++	return std::string(value);
++}
++
++bool InstallSupported(const AppInfo &app)
++{
++	if (FeedOverride())
++		return true;
++	return !app.product.empty() && app.product != app.obs;
++}
++
++/* AppUpdater.swift:193-198: the version a rollback would return to — the kept
++ * previous tree, when it is this app at an older version. Read once: it cannot
++ * change while this process runs, because installing requires quitting. */
++const std::string &PreviousVersion()
++{
++	static const std::string version = [] {
++		const AppInfo &app = ThisApp();
++		if (app.root.empty())
++			return std::string();
++		const AppInfo previous = ReadApp(ExeIn(PreviousTree(app.root)));
++		if (previous.product.empty() || previous.name != app.name)
++			return std::string();
++		return IsNewer(CurrentVersion(), previous.product) ? previous.product : std::string();
++	}();
++	return version;
++}
++
++/* ── the archive: digest, download, unpack ──────────────────────────────── */
++
++/* Incremental SHA-256 over BCrypt, like net/crypto.cpp — but Sha256Hex() there
++ * is one-shot, and an archive is hundreds of megabytes: the digest is fed the
++ * bytes as they are written instead of reading the file back afterwards. */
++class Sha256 {
++public:
++	Sha256()
++	{
++		if (!NT_SUCCESS(BCryptOpenAlgorithmProvider(&alg_, BCRYPT_SHA256_ALGORITHM, nullptr, 0)))
++			return;
++		DWORD object_size = 0, produced = 0;
++		if (!NT_SUCCESS(BCryptGetProperty(alg_, BCRYPT_OBJECT_LENGTH, reinterpret_cast<PUCHAR>(&object_size),
++						  sizeof(object_size), &produced, 0)) ||
++		    !NT_SUCCESS(BCryptGetProperty(alg_, BCRYPT_HASH_LENGTH, reinterpret_cast<PUCHAR>(&digest_size_),
++						  sizeof(digest_size_), &produced, 0))) {
++			BCryptCloseAlgorithmProvider(alg_, 0);
++			alg_ = nullptr;
++			return;
++		}
++		object_.resize(object_size);
++		if (!NT_SUCCESS(BCryptCreateHash(alg_, &hash_, object_.data(), object_size, nullptr, 0, 0))) {
++			BCryptCloseAlgorithmProvider(alg_, 0);
++			alg_ = nullptr;
++			hash_ = nullptr;
++		}
++	}
++
++	~Sha256()
++	{
++		if (hash_)
++			BCryptDestroyHash(hash_);
++		if (alg_)
++			BCryptCloseAlgorithmProvider(alg_, 0);
++	}
++
++	Sha256(const Sha256 &) = delete;
++	Sha256 &operator=(const Sha256 &) = delete;
++
++	bool Ready() const { return hash_ != nullptr; }
++
++	void Update(const char *data, size_t size)
++	{
++		if (hash_ && size)
++			BCryptHashData(hash_, reinterpret_cast<PUCHAR>(const_cast<char *>(data)),
++				       static_cast<ULONG>(size), 0);
++	}
++
++	/* Lowercase hex of everything fed so far; empty when the hash never
++	 * started or could not finish, which the caller reports as a checksum
++	 * failure rather than installing anything. */
++	std::string Finish()
++	{
++		if (!hash_)
++			return {};
++		std::vector<uint8_t> digest(digest_size_);
++		if (!NT_SUCCESS(BCryptFinishHash(hash_, digest.data(), digest_size_, 0)))
++			return {};
++		return crypto::ToHex(digest.data(), digest.size());
++	}
++
++private:
++	BCRYPT_ALG_HANDLE alg_ = nullptr;
++	BCRYPT_HASH_HANDLE hash_ = nullptr;
++	std::vector<uint8_t> object_;
++	DWORD digest_size_ = 0;
++};
++
++/* ── the streaming download ─────────────────────────────────────────────── */
++
++/* net/http.h's Send() buffers a whole response in a std::string and answers on
++ * the main thread. That is right for the feed and wrong for a few hundred
++ * megabytes, so the asset is streamed here instead, on the worker thread: one
++ * GET, 64 KiB reads, straight to disk and through the digest. The plumbing
++ * below (URL crack, redirect by hand, status and header queries) is http.cpp's,
++ * which is file-local there and cannot be reached from here. */
++
++struct UrlParts {
++	std::wstring host;
++	std::wstring path; /* path + query */
++	INTERNET_PORT port = 0;
++	bool secure = false;
++	bool valid = false;
++};
++
++UrlParts ParseUrl(const std::string &url)
++{
++	UrlParts out;
++	const std::wstring wide = Widen(url);
++	if (wide.empty())
++		return out;
++
++	URL_COMPONENTS components = {};
++	components.dwStructSize = sizeof(components);
++	components.dwSchemeLength = static_cast<DWORD>(-1);
++	components.dwHostNameLength = static_cast<DWORD>(-1);
++	components.dwUrlPathLength = static_cast<DWORD>(-1);
++	components.dwExtraInfoLength = static_cast<DWORD>(-1);
++	if (!WinHttpCrackUrl(wide.c_str(), 0, 0, &components))
++		return out;
++
++	out.host.assign(components.lpszHostName, components.dwHostNameLength);
++	out.path.assign(components.lpszUrlPath, components.dwUrlPathLength);
++	if (components.dwExtraInfoLength)
++		out.path.append(components.lpszExtraInfo, components.dwExtraInfoLength);
++	out.port = components.nPort;
++	out.secure = components.nScheme == INTERNET_SCHEME_HTTPS;
++	out.valid = true;
++	return out;
++}
++
++/* The download's own WinHTTP session, closed however the function leaves. */
++struct SessionHandle {
++	explicit SessionHandle(HINTERNET handle) : handle(handle) {}
++	~SessionHandle()
++	{
++		if (handle)
++			WinHttpCloseHandle(handle);
++	}
++	SessionHandle(const SessionHandle &) = delete;
++	SessionHandle &operator=(const SessionHandle &) = delete;
++
++	HINTERNET handle = nullptr;
++};
++
++/* One open request; closes both handles on the way out, which is also what a
++ * redirect hop does before it tries the next address. */
++struct Connection {
++	~Connection()
++	{
++		if (request)
++			WinHttpCloseHandle(request);
++		if (connect)
++			WinHttpCloseHandle(connect);
++	}
++	Connection() = default;
++	Connection(const Connection &) = delete;
++	Connection &operator=(const Connection &) = delete;
++
++	HINTERNET request = nullptr;
++	HINTERNET connect = nullptr;
++};
++
++bool HeaderNumber(HINTERNET request, DWORD query, DWORD &value)
++{
++	DWORD size = sizeof(value);
++	return WinHttpQueryHeaders(request, query | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX, &value,
++				   &size, WINHTTP_NO_HEADER_INDEX) != FALSE;
++}
++
++std::wstring HeaderString(HINTERNET request, DWORD query)
++{
++	DWORD size = 0;
++	WinHttpQueryHeaders(request, query, WINHTTP_HEADER_NAME_BY_INDEX, nullptr, &size, WINHTTP_NO_HEADER_INDEX);
++	if (!size)
++		return {};
++
++	std::wstring value(size / sizeof(wchar_t), L'\0');
++	if (!WinHttpQueryHeaders(request, query, WINHTTP_HEADER_NAME_BY_INDEX, &value[0], &size,
++				 WINHTTP_NO_HEADER_INDEX))
++		return {};
++	value.resize(wcsnlen(value.c_str(), value.size()));
++	return value;
++}
++
++/* A redirect target: absolute, or a path on the host that sent it. */
++std::string ResolveRedirect(const std::string &base, const std::wstring &location)
++{
++	std::string target = Narrow(location);
++	if (!target.empty() && target[0] == '/') {
++		const size_t scheme = base.find("://");
++		const size_t host_end = base.find('/', scheme == std::string::npos ? 0 : scheme + 3);
++		target = base.substr(0, host_end) + target;
++	}
++	return target;
++}
++
++/* Streams `url` into `target`, feeding every byte to `hasher` as it is written.
++ * `progress` is called at each whole percent when `total` is known (zero when
++ * the release did not say how large the archive is). */
++bool DownloadAsset(const std::string &url, const std::filesystem::path &target, long long total,
++		   const std::atomic<bool> &cancel, Sha256 &hasher, const std::function<void(double)> &progress,
++		   long long &received, Failure &failure)
++{
++	const std::wstring agent = L"LiveHime/" + Widen(CurrentVersion()) + L" (Windows; OBS)";
++	SessionHandle session(WinHttpOpen(agent.c_str(), WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_NO_PROXY_NAME,
++					  WINHTTP_NO_PROXY_BYPASS, 0));
++	if (!session.handle) {
++		failure = Network("WinHTTP could not be started");
++		return false;
++	}
++	/* Connect 10 s, send 15 s, receive 15 s: a stalled transfer is noticed
++	 * while there is still a caller left to tell about it. */
++	WinHttpSetTimeouts(session.handle, 10000, 10000, 15000, 15000);
++
++	std::ofstream file(target, std::ios::binary | std::ios::trunc);
++	if (!file) {
++		failure = Location("cannot write the download to " + Utf8(target));
++		return false;
++	}
++
++	std::string current = url;
++	const bool started_secure = StartsWith(current, "https://");
++	int last_percent = -1;
++
++	for (int hop = 0; hop <= kMaxRedirects; ++hop) {
++		const UrlParts parts = ParseUrl(current);
++		if (!parts.valid) {
++			failure = Network("the release gives an invalid download address");
++			return false;
++		}
++
++		Connection connection;
++		connection.connect = WinHttpConnect(session.handle, parts.host.c_str(), parts.port, 0);
++		if (!connection.connect) {
++			failure = Network("cannot reach the release host");
++			return false;
++		}
++		connection.request = WinHttpOpenRequest(connection.connect, L"GET", parts.path.c_str(), nullptr,
++							WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
++							parts.secure ? WINHTTP_FLAG_SECURE : 0);
++		if (!connection.request) {
++			failure = Network("cannot open the download request");
++			return false;
++		}
++
++		/* Redirects are followed here rather than by WinHTTP, so the one that
++		 * leaves github.com for its object store can be looked at. */
++		DWORD policy = WINHTTP_OPTION_REDIRECT_POLICY_NEVER;
++		WinHttpSetOption(connection.request, WINHTTP_OPTION_REDIRECT_POLICY, &policy, sizeof(policy));
++
++		/* Identity, always: the published SHA-256 is over the bytes as they
++		 * were uploaded, so nothing may transparently decompress them. */
++		const std::wstring headers = L"Accept: application/octet-stream\r\nAccept-Encoding: identity\r\n";
++		if (!WinHttpSendRequest(connection.request, headers.c_str(), static_cast<DWORD>(headers.size()),
++					WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||
++		    !WinHttpReceiveResponse(connection.request, nullptr)) {
++			failure = Network("the download could not be started (winhttp " +
++					  std::to_string(GetLastError()) + ")");
++			return false;
++		}
++
++		DWORD status = 0;
++		if (!HeaderNumber(connection.request, WINHTTP_QUERY_STATUS_CODE, status)) {
++			failure = Network("the release host answered nothing readable");
++			return false;
++		}
++		if (status >= 300 && status < 400) {
++			const std::wstring location = HeaderString(connection.request, WINHTTP_QUERY_LOCATION);
++			if (location.empty()) {
++				failure = Network("the release host redirected without a target");
++				return false;
++			}
++			current = ResolveRedirect(current, location);
++			if (started_secure && !StartsWith(current, "https://")) {
++				failure = Network("the release host redirected to an insecure address");
++				return false;
++			}
++			continue;
++		}
++		if (status != 200) {
++			failure = Network("the release host answered HTTP " + std::to_string(status));
++			return false;
++		}
++
++		DWORD length = 0;
++		if (HeaderNumber(connection.request, WINHTTP_QUERY_CONTENT_LENGTH, length) && length > 0 && total > 0 &&
++		    static_cast<long long>(length) != total) {
++			failure = Checksum("the download is " + std::to_string(length) + " bytes, not " +
++					   std::to_string(total));
++			return false;
++		}
++
++		std::vector<char> buffer(kDownloadChunk);
++		for (;;) {
++			if (cancel.load()) {
++				failure = Network("the update was cancelled");
++				return false;
++			}
++			DWORD available = 0;
++			if (!WinHttpQueryDataAvailable(connection.request, &available) || available == 0)
++				break;
++			const DWORD want = static_cast<DWORD>(std::min<size_t>(available, buffer.size()));
++			DWORD read = 0;
++			if (!WinHttpReadData(connection.request, buffer.data(), want, &read) || read == 0)
++				break;
++
++			file.write(buffer.data(), static_cast<std::streamsize>(read));
++			if (!file) {
++				failure = Location("cannot write the download to " + Utf8(target));
++				return false;
++			}
++			hasher.Update(buffer.data(), static_cast<size_t>(read));
++			received += static_cast<long long>(read);
++
++			if (total > 0 && progress) {
++				const int percent = static_cast<int>(received * 100 / total);
++				if (percent != last_percent) {
++					last_percent = percent;
++					progress(std::min(1.0,
++							  static_cast<double>(received) / static_cast<double>(total)));
++				}
++			}
++		}
++
++		file.flush();
++		if (!file) {
++			failure = Location("cannot write the download to " + Utf8(target));
++			return false;
++		}
++		/* A connection dropped mid-body is a short file; so is a proxy that
++		 * cut the answer off. The digest below would catch both, but the size
++		 * says so more precisely. */
++		if (total > 0 && received != total) {
++			failure = Checksum("the download ended after " + std::to_string(received) + " of " +
++					   std::to_string(total) + " bytes");
++			return false;
++		}
++		return true;
++	}
++
++	failure = Network("the download redirected too many times");
++	return false;
++}
++
++/* ══ zip reader (BEGIN ZIP READER — everything down to END ZIP READER is free
++ * of Windows headers on purpose, so it can be compiled and exercised on any
++ * platform with zlib; the one place a zip name becomes a path is EntryPath) ══
++ *
++ * The macOS code unpacks with /usr/bin/ditto -x -k. Windows has no equivalent
++ * that is always there — tar.exe arrived in Windows 10 1803, Expand-Archive
++ * needs PowerShell and an execution policy that allows it — and both would be a
++ * second process to supervise for a job that is a loop over a central
++ * directory. zlib is already linked (the danmaku protocol's version-2 bodies),
++ * so the archive is read here: the central directory, then stored or deflated
++ * entries, each checked against the CRC-32 and the size the archive declares.
++ * Zip64 is understood (the locator and the extra field) because a large release
++ * may well need it. */
++
++struct ZipEntry {
++	std::string name;
++	uint16_t method = 0;
++	uint32_t crc = 0;
++	uint64_t compressed = 0;
++	uint64_t uncompressed = 0;
++	uint64_t offset = 0;
++	/* The language-encoding flag: the name is UTF-8 rather than the machine's
++	 * own code page. */
++	bool utf8 = false;
++};
++
++uint16_t ReadU16(const unsigned char *bytes)
++{
++	return static_cast<uint16_t>(bytes[0] | (bytes[1] << 8));
++}
++
++uint32_t ReadU32(const unsigned char *bytes)
++{
++	return static_cast<uint32_t>(bytes[0]) | (static_cast<uint32_t>(bytes[1]) << 8) |
++	       (static_cast<uint32_t>(bytes[2]) << 16) | (static_cast<uint32_t>(bytes[3]) << 24);
++}
++
++uint64_t ReadU64(const unsigned char *bytes)
++{
++	return static_cast<uint64_t>(ReadU32(bytes)) | (static_cast<uint64_t>(ReadU32(bytes + 4)) << 32);
++}
++
++/* The archive's central directory: the one place that says where every entry
++ * is. Returns false with the reason in `failure`, which is invalidApp because
++ * at that point the bytes have already passed their digest and still do not
++ * describe an install tree. */
++bool ReadCentralDirectory(std::ifstream &file, uint64_t file_size, std::vector<ZipEntry> &entries, Failure &failure)
++{
++	if (file_size < 22) {
++		failure = InvalidApp("the archive is too small to be a zip");
++		return false;
++	}
++
++	/* The end-of-central-directory record is the last 22 bytes plus a comment
++	 * of up to 64 KiB. */
++	const uint64_t tail_size = std::min<uint64_t>(file_size, 22 + 0xFFFF);
++	std::vector<unsigned char> tail(static_cast<size_t>(tail_size));
++	file.seekg(static_cast<std::streamoff>(file_size - tail_size));
++	if (!file.read(reinterpret_cast<char *>(tail.data()), static_cast<std::streamsize>(tail.size()))) {
++		failure = InvalidApp("the archive could not be read");
++		return false;
++	}
++
++	int64_t eocd = -1;
++	for (int64_t i = static_cast<int64_t>(tail.size()) - 22; i >= 0; --i) {
++		if (ReadU32(&tail[static_cast<size_t>(i)]) == 0x06054b50u) {
++			eocd = i;
++			break;
++		}
++	}
++	if (eocd < 0) {
++		failure = InvalidApp("the archive has no end-of-central-directory record");
++		return false;
++	}
++
++	uint64_t count = ReadU16(&tail[static_cast<size_t>(eocd) + 10]);
++	uint64_t directory_size = ReadU32(&tail[static_cast<size_t>(eocd) + 12]);
++	uint64_t directory_offset = ReadU32(&tail[static_cast<size_t>(eocd) + 16]);
++
++	/* Zip64: every one of those fields saturates to its all-ones value and the
++	 * real numbers are in the zip64 record the locator points at. */
++	if (count == 0xFFFFu || directory_size == 0xFFFFFFFFu || directory_offset == 0xFFFFFFFFu) {
++		const int64_t locator = eocd - 20;
++		if (locator < 0 || ReadU32(&tail[static_cast<size_t>(locator)]) != 0x07064b50u) {
++			failure = InvalidApp("the archive is zip64 without a locator");
++			return false;
++		}
++		const uint64_t zip64 = ReadU64(&tail[static_cast<size_t>(locator) + 8]);
++		if (zip64 + 56 > file_size) {
++			failure = InvalidApp("the archive's zip64 record is outside the file");
++			return false;
++		}
++		unsigned char head[56] = {};
++		file.seekg(static_cast<std::streamoff>(zip64));
++		if (!file.read(reinterpret_cast<char *>(head), sizeof(head)) || ReadU32(head) != 0x06064b50u) {
++			failure = InvalidApp("the archive's zip64 record could not be read");
++			return false;
++		}
++		count = ReadU64(head + 32);
++		directory_size = ReadU64(head + 40);
++		directory_offset = ReadU64(head + 48);
++	}
++
++	if (directory_offset + directory_size > file_size || directory_size > SIZE_MAX) {
++		failure = InvalidApp("the archive's central directory is outside the file");
++		return false;
++	}
++
++	std::vector<unsigned char> directory(static_cast<size_t>(directory_size));
++	file.seekg(static_cast<std::streamoff>(directory_offset));
++	if (!file.read(reinterpret_cast<char *>(directory.data()), static_cast<std::streamsize>(directory.size()))) {
++		failure = InvalidApp("the archive's central directory could not be read");
++		return false;
++	}
++
++	size_t at = 0;
++	for (uint64_t index = 0; index < count; ++index) {
++		if (at + 46 > directory.size() || ReadU32(&directory[at]) != 0x02014b50u) {
++			failure = InvalidApp("the archive's central directory is damaged");
++			return false;
++		}
++
++		ZipEntry entry;
++		const uint16_t flags = ReadU16(&directory[at + 8]);
++		if (flags & 0x0001u) {
++			failure = InvalidApp("the archive is encrypted");
++			return false;
++		}
++		entry.utf8 = (flags & 0x0800u) != 0;
++		entry.method = ReadU16(&directory[at + 10]);
++		entry.crc = ReadU32(&directory[at + 16]);
++		entry.compressed = ReadU32(&directory[at + 20]);
++		entry.uncompressed = ReadU32(&directory[at + 24]);
++		const uint16_t name_length = ReadU16(&directory[at + 28]);
++		const uint16_t extra_length = ReadU16(&directory[at + 30]);
++		const uint16_t comment_length = ReadU16(&directory[at + 32]);
++		entry.offset = ReadU32(&directory[at + 42]);
++		if (at + 46 + name_length + extra_length + comment_length > directory.size()) {
++			failure = InvalidApp("the archive's central directory is truncated");
++			return false;
++		}
++		entry.name.assign(reinterpret_cast<const char *>(&directory[at + 46]), name_length);
++
++		if (entry.uncompressed == 0xFFFFFFFFu || entry.compressed == 0xFFFFFFFFu ||
++		    entry.offset == 0xFFFFFFFFu) {
++			const unsigned char *extra = &directory[at + 46 + name_length];
++			bool found = false;
++			for (size_t field = 0; field + 4 <= extra_length;) {
++				const uint16_t id = ReadU16(extra + field);
++				const uint16_t size = ReadU16(extra + field + 2);
++				field += 4;
++				if (field + size > extra_length) {
++					failure = InvalidApp("the archive's zip64 extra field is damaged");
++					return false;
++				}
++				if (id == 0x0001u) {
++					/* The three values appear in this order, each only
++					 * when its 32-bit field saturated. */
++					const unsigned char *values = extra + field;
++					size_t left = size;
++					if (entry.uncompressed == 0xFFFFFFFFu) {
++						if (left < 8) {
++							failure =
++								InvalidApp("the archive's zip64 extra field is short");
++							return false;
++						}
++						entry.uncompressed = ReadU64(values);
++						values += 8;
++						left -= 8;
++					}
++					if (entry.compressed == 0xFFFFFFFFu) {
++						if (left < 8) {
++							failure =
++								InvalidApp("the archive's zip64 extra field is short");
++							return false;
++						}
++						entry.compressed = ReadU64(values);
++						values += 8;
++						left -= 8;
++					}
++					if (entry.offset == 0xFFFFFFFFu) {
++						if (left < 8) {
++							failure =
++								InvalidApp("the archive's zip64 extra field is short");
++							return false;
++						}
++						entry.offset = ReadU64(values);
++					}
++					found = true;
++					break;
++				}
++				field += size;
++			}
++			if (!found) {
++				failure = InvalidApp("a zip64 entry has no zip64 extra field");
++				return false;
++			}
++		}
++
++		entries.push_back(std::move(entry));
++		at += 46 + name_length + extra_length + comment_length;
++	}
++	return true;
++}
++
++/* A Windows device name as a path component would address the device, not a
++ * file, however it is spelled (CON, CON.txt, con). Nothing in a release archive
++ * should ever be one. */
++bool IsDeviceName(const std::string &component)
++{
++	static const char *kNames[] = {"con",  "prn",  "aux",  "nul",  "com1", "com2", "com3", "com4",
++				       "com5", "com6", "com7", "com8", "com9", "lpt1", "lpt2", "lpt3",
++				       "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9"};
++	const size_t dot = component.find('.');
++	std::string stem = dot == std::string::npos ? component : component.substr(0, dot);
++	std::transform(stem.begin(), stem.end(), stem.begin(),
++		       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
++	for (const char *name : kNames) {
++		if (stem == name)
++			return true;
++	}
++	return false;
++}
++
++/* Turns one entry name into a relative path, or refuses it. A zip may use
++ * either separator (Windows tools write '\'), and nothing in it is trusted: an
++ * absolute name, a drive letter, a colon (an NTFS alternate data stream), a
++ * device name or a ".." component would otherwise write outside the
++ * destination. A name that is absolute is refused rather than reinterpreted,
++ * because no archive this project publishes has one and a release that does is
++ * not the release it claims to be. */
++bool EntryRelativePath(const std::string &name, std::string &relative, Failure &failure)
++{
++	if (name.empty()) {
++		failure = InvalidApp("the archive holds an entry with no name");
++		return false;
++	}
++	if (name[0] == '/' || name[0] == '\\') {
++		failure = InvalidApp("the archive holds an absolute entry name (" + name + ")");
++		return false;
++	}
++
++	std::string out;
++	size_t at = 0;
++	while (at < name.size()) {
++		size_t end = name.find_first_of("/\\", at);
++		if (end == std::string::npos)
++			end = name.size();
++		const std::string component = name.substr(at, end - at);
++		at = end + 1;
++		if (component.empty() || component == ".")
++			continue;
++		if (component == "..") {
++			failure = InvalidApp("the archive holds an entry that escapes the install tree (" + name + ")");
++			return false;
++		}
++		if (component.find(':') != std::string::npos) {
++			failure = InvalidApp("the archive holds an entry with a colon in its name (" + name + ")");
++			return false;
++		}
++		if (IsDeviceName(component)) {
++			failure = InvalidApp("the archive holds an entry named after a device (" + name + ")");
++			return false;
++		}
++		if (!out.empty())
++			out += '/';
++		out += component;
++	}
++	if (out.empty()) {
++		failure = InvalidApp("the archive holds an entry with no name");
++		return false;
++	}
++	relative = out;
++	return true;
++}
++
++#ifdef _WIN32
++/* One of the two code pages a zip name can be in, decided by the archive's own
++ * encoding flag. */
++std::wstring FromCodePage(const std::string &text, UINT code_page)
++{
++	if (text.empty())
++		return {};
++	const int size = MultiByteToWideChar(code_page, 0, text.c_str(), static_cast<int>(text.size()), nullptr, 0);
++	if (size <= 0)
++		return Widen(text);
++	std::wstring out(static_cast<size_t>(size), L'\0');
++	MultiByteToWideChar(code_page, 0, text.c_str(), static_cast<int>(text.size()), &out[0], size);
++	return out;
++}
++
++/* Windows paths are UTF-16, so a name from the archive is converted rather than
++ * reinterpreted. A name in neither code page cannot turn into an empty path:
++ * FromCodePage falls back to the UTF-8 reading, which substitutes U+FFFD for
++ * bytes it cannot use and can therefore never escape the destination. */
++std::filesystem::path EntryPath(const std::string &name, bool utf8)
++{
++	return std::filesystem::path(FromCodePage(name, utf8 ? CP_UTF8 : CP_ACP));
++}
++#else
++/* Off Windows the name is already a path; this branch is what lets the zip
++ * reader be compiled and exercised elsewhere. */
++std::filesystem::path EntryPath(const std::string &name, bool)
++{
++	return std::filesystem::path(name);
++}
++#endif
++
++/* One file entry: its local header says how long the two variable-length fields
++ * in front of the data are, and then comes the data itself. Copied when stored,
++ * inflated when deflated, and in both cases checked against the CRC-32 and the
++ * size the central directory declared. */
++bool ExtractEntry(std::ifstream &file, const ZipEntry &entry, const std::filesystem::path &target, Failure &failure)
++{
++	unsigned char header[30] = {};
++	file.clear();
++	file.seekg(static_cast<std::streamoff>(entry.offset));
++	if (!file.read(reinterpret_cast<char *>(header), sizeof(header)) || ReadU32(header) != 0x04034b50u) {
++		failure = InvalidApp("the archive's entry " + entry.name + " has no local header");
++		return false;
++	}
++	const uint16_t name_length = ReadU16(header + 26);
++	const uint16_t extra_length = ReadU16(header + 28);
++	file.seekg(static_cast<std::streamoff>(entry.offset) + 30 + name_length + extra_length);
++
++	std::ofstream out(target, std::ios::binary | std::ios::trunc);
++	if (!out) {
++		failure = Location("cannot write " + Utf8(target));
++		return false;
++	}
++
++	uLong crc = crc32(0L, Z_NULL, 0);
++	uint64_t written = 0;
++	std::vector<unsigned char> input(static_cast<size_t>(std::min<uint64_t>(kDownloadChunk, entry.compressed + 1)));
++	std::vector<unsigned char> output(kDownloadChunk);
++
++	/* Reads up to `want` compressed bytes; false when the archive ends early. */
++	const auto refill = [&file, &input](uint64_t &left, uInt &available, unsigned char *&next) {
++		const size_t want = static_cast<size_t>(std::min<uint64_t>(left, input.size()));
++		file.read(reinterpret_cast<char *>(input.data()), static_cast<std::streamsize>(want));
++		if (file.gcount() != static_cast<std::streamsize>(want))
++			return false;
++		left -= want;
++		next = input.data();
++		available = static_cast<uInt>(want);
++		return true;
++	};
++
++	if (entry.method == 0) {
++		/* Stored: the compressed bytes are the file. */
++		uint64_t left = entry.compressed;
++		unsigned char *next = nullptr;
++		uInt available = 0;
++		while (left > 0 || available > 0) {
++			if (available == 0 && !refill(left, available, next)) {
++				failure = InvalidApp("the archive ends inside " + entry.name);
++				return false;
++			}
++			out.write(reinterpret_cast<const char *>(next), static_cast<std::streamsize>(available));
++			crc = crc32(crc, next, available);
++			written += available;
++			available = 0;
++		}
++	} else if (entry.method == 8) {
++		z_stream stream = {};
++		if (inflateInit2(&stream, -MAX_WBITS) != Z_OK) {
++			failure = InvalidApp("zlib could not start an inflate stream");
++			return false;
++		}
++
++		uint64_t left = entry.compressed;
++		bool truncated = false;
++		for (;;) {
++			if (stream.avail_in == 0) {
++				/* Nothing buffered and nothing left in the archive, with
++				 * the deflate stream not finished: the entry is cut off. */
++				if (left == 0 || !refill(left, stream.avail_in, stream.next_in)) {
++					truncated = true;
++					break;
++				}
++			}
++
++			stream.next_out = output.data();
++			stream.avail_out = static_cast<uInt>(output.size());
++			const int status = inflate(&stream, Z_NO_FLUSH);
++			if (status != Z_OK && status != Z_STREAM_END) {
++				inflateEnd(&stream);
++				failure = InvalidApp("the archive's entry " + entry.name + " does not inflate (zlib " +
++						     std::to_string(status) + ")");
++				return false;
++			}
++
++			const size_t produced = output.size() - stream.avail_out;
++			if (produced) {
++				out.write(reinterpret_cast<const char *>(output.data()),
++					  static_cast<std::streamsize>(produced));
++				crc = crc32(crc, output.data(), static_cast<uInt>(produced));
++				written += produced;
++				if (!out) {
++					inflateEnd(&stream);
++					failure = Location("cannot write " + Utf8(target));
++					return false;
++				}
++			}
++			if (status == Z_STREAM_END)
++				break;
++		}
++		inflateEnd(&stream);
++
++		if (truncated) {
++			failure = InvalidApp("the archive ends inside " + entry.name);
++			return false;
++		}
++	} else {
++		failure = InvalidApp("the archive's entry " + entry.name + " uses compression method " +
++				     std::to_string(entry.method));
++		return false;
++	}
++
++	out.close();
++	if (!out) {
++		failure = Location("cannot write " + Utf8(target));
++		return false;
++	}
++	if (written != entry.uncompressed) {
++		failure = InvalidApp("the archive's entry " + entry.name + " unpacked to " + std::to_string(written) +
++				     " of " + std::to_string(entry.uncompressed) + " bytes");
++		return false;
++	}
++	if (static_cast<uint32_t>(crc) != entry.crc) {
++		failure = InvalidApp("the archive's entry " + entry.name + " failed its CRC");
++		return false;
++	}
++	return true;
++}
++
++bool ExtractZip(const std::filesystem::path &archive, const std::filesystem::path &destination, Failure &failure)
++{
++	std::ifstream file(archive, std::ios::binary);
++	if (!file) {
++		failure = Location("cannot read the download at " + Utf8(archive));
++		return false;
++	}
++	file.seekg(0, std::ios::end);
++	const std::streamoff end = file.tellg();
++	if (end <= 0) {
++		failure = InvalidApp("the downloaded archive is empty");
++		return false;
++	}
++
++	std::vector<ZipEntry> entries;
++	if (!ReadCentralDirectory(file, static_cast<uint64_t>(end), entries, failure))
++		return false;
++	if (entries.empty()) {
++		failure = InvalidApp("the downloaded archive has no entries");
++		return false;
++	}
++
++	std::error_code ec;
++	std::filesystem::create_directories(destination, ec);
++	if (ec) {
++		failure = Location("cannot create " + Utf8(destination));
++		return false;
++	}
++
++	for (const ZipEntry &entry : entries) {
++		std::string relative;
++		if (!EntryRelativePath(entry.name, relative, failure))
++			return false;
++
++		const std::filesystem::path target = destination / EntryPath(relative, entry.utf8);
++		if (entry.name.back() == '/' || entry.name.back() == '\\') {
++			std::filesystem::create_directories(target, ec);
++			if (ec) {
++				failure = Location("cannot create " + Utf8(target));
++				return false;
++			}
++			continue;
++		}
++		std::filesystem::create_directories(target.parent_path(), ec);
++		if (ec) {
++			failure = Location("cannot create " + Utf8(target.parent_path()));
++			return false;
++		}
++		if (!ExtractEntry(file, entry, target, failure))
++			return false;
++	}
++	return true;
++}
++/* ══ END ZIP READER ══ */
++
++/* ── events (main thread only) ──────────────────────────────────────────── */
++
++/* What every update event carries (AppUpdateBridge.swift:13-20) plus the
++ * event's own fields. Merge keeps its base's value on a collision, so the
++ * event's fields go in as the base: status, version and the rest of the
++ * event win over anything added here. */
++void EmitUpdate(const nlohmann::json &fields)
++{
++	const AppInfo &app = ThisApp();
++	nlohmann::json defaults{{"event", "update"},
++				{"current", CurrentVersion()},
++				{"supported", InstallSupported(app)},
++				{"obsCurrent", app.obs}};
++	const std::string &previous = PreviousVersion();
++	if (!previous.empty())
++		defaults["previous"] = previous;
++	Emit(Merge(fields, defaults));
++}
++
++void EmitFailure(const Failure &failure)
++{
++	EmitUpdate(nlohmann::json{{"status", "failed"}, {"reason", failure.reason}, {"message", failure.message}});
++}
++
++/* ── the state the Updates tab sees (main thread only) ──────────────────── */
++
++std::optional<Release> g_release; /* what the last check found */
++std::filesystem::path g_staged;   /* the verified staged tree, empty when none */
++std::string g_staged_version;     /* the version that tree holds */
++bool g_busy = false;              /* a check or a download is running */
++bool g_cleaned = false;           /* leftovers of earlier updates were removed */
++
++/* AppUpdateBridge.swift:22-27: the release fields, plus the OBS version of the
++ * staged tree so the tab can say an OBS upgrade is coming. */
++nlohmann::json ReleaseFields(const Release &release)
++{
++	nlohmann::json fields{{"version", release.version},
++			      {"notes", release.notes},
++			      {"page", release.page},
++			      {"size", release.size},
++			      {"prerelease", release.prerelease}};
++	if (!g_staged.empty()) {
++		const AppInfo staged = ReadApp(ExeIn(g_staged));
++		if (!staged.obs.empty())
++			fields["obsNew"] = staged.obs;
++	}
++	return fields;
++}
++
++/* Which directory inside the unpacked archive is the tree: its top level, or
++ * the single folder wrapping everything, which is how AppUpdater.swift:258-261
++ * found the one .app in the unpacked folder. */
++bool StagedRoot(const std::filesystem::path &unpacked, std::filesystem::path &root, Failure &failure)
++{
++	std::error_code ec;
++	if (std::filesystem::exists(ExeIn(unpacked), ec) && !ec) {
++		root = unpacked;
++		return true;
++	}
++
++	std::filesystem::path found;
++	int matches = 0;
++	/* Stepped with the error_code overload rather than a range-for, so a
++	 * directory that cannot be read reports a failure instead of throwing out
++	 * of the worker thread. */
++	std::filesystem::directory_iterator it(unpacked, ec), end;
++	for (; !ec && it != end; it.increment(ec)) {
++		const std::filesystem::directory_entry &entry = *it;
++		std::error_code inner;
++		if (!entry.is_directory(inner) || inner)
++			continue;
++		if (std::filesystem::exists(ExeIn(entry.path()), inner) && !inner) {
++			found = entry.path();
++			++matches;
++		}
++	}
++	if (ec || matches != 1) {
++		failure = InvalidApp("the archive does not hold bin\\64bit\\obs64.exe");
++		return false;
++	}
++	root = found;
++	return true;
++}
++
++/* AppUpdater.swift:276-296 without the code signature it cannot check here
++ * (update/updater.h): the same app (the product name is Windows' nearest
++ * equivalent of the bundle identifier), at the version the release names, built
++ * for the machine this process runs on. */
++bool VerifyTree(const std::filesystem::path &root, const std::string &version, Failure &failure)
++{
++	const AppInfo &app = ThisApp();
++	const AppInfo staged = ReadApp(ExeIn(root));
++
++	if (staged.product.empty()) {
++		failure = InvalidApp("the new version has no readable version resource");
++		return false;
++	}
++	if (app.name.empty() || staged.name != app.name) {
++		failure = InvalidApp("the new version is \"" + staged.name + "\", not \"" + app.name + "\"");
++		return false;
++	}
++	if (staged.product != version) {
++		failure = InvalidApp("the new version says " + staged.product + ", not " + version);
++		return false;
++	}
++	if (app.machine == 0 || staged.machine != app.machine) {
++		char machine[8] = {};
++		sprintf_s(machine, "%04x", staged.machine);
++		failure = InvalidApp(std::string("the new version is built for machine type 0x") + machine +
++				     ", not for this one");
++		return false;
++	}
++	return true;
++}
++
++/* ── the worker ─────────────────────────────────────────────────────────── */
++
++/* One job: the release to fetch and the two paths it works with. */
++struct Job {
++	Release release;
++	std::filesystem::path archive;
++	std::filesystem::path staged;
++};
++
++std::mutex g_job_mutex;
++std::condition_variable g_job_cv;
++std::optional<Job> g_job;
++bool g_job_stopping = false;
++std::thread g_job_thread;
++std::atomic<bool> g_cancel{false};
++
++/* The end of a download, on the main thread. */
++void FinishDownload(const Job &job, const Failure &failure)
++{
++	g_busy = false;
++	if (!failure.Ok()) {
++		EmitFailure(failure);
++		return;
++	}
++	g_staged = job.staged;
++	g_staged_version = job.release.version;
++	nlohmann::json fields = ReleaseFields(job.release);
++	fields["status"] = "ready";
++	EmitUpdate(fields);
++}
++
++/* Download, verify, unpack and verify again. AppUpdater.swift:243-264 did the
++ * same four steps on a background task; this thread is the counterpart, and
++ * every answer goes back through dispatch::Post. */
++void RunJob(const Job &job)
++{
++	/* Nothing a failed job leaves behind is worth keeping: a partial archive
++	 * or a half-unpacked tree would only be something a later run has to
++	 * wonder about. */
++	const auto report = [&job](const Failure &failure) {
++		std::error_code cleanup;
++		std::filesystem::remove(job.archive, cleanup);
++		std::filesystem::remove_all(job.staged, cleanup);
++		const Job copy = job;
++		dispatch::Post([copy, failure] { FinishDownload(copy, failure); });
++	};
++
++	std::error_code ec;
++	std::filesystem::create_directories(job.archive.parent_path(), ec);
++	if (ec) {
++		report(Location("cannot create " + Utf8(job.archive.parent_path())));
++		return;
++	}
++	/* A stale archive or tree from an interrupted run is in the way, not
++	 * useful: the digest decides what is installed, and re-downloading is
++	 * cheaper than trusting a file that was never finished. */
++	std::filesystem::remove(job.archive, ec);
++	std::filesystem::remove_all(job.staged, ec);
++
++	Sha256 hasher;
++	if (!hasher.Ready()) {
++		report(Network("SHA-256 could not be started"));
++		return;
++	}
++	const std::string version = job.release.version;
++	const auto progress = [&version](double fraction) {
++		dispatch::Post([version, fraction] {
++			EmitUpdate(nlohmann::json{{"status", "downloading"},
++						  {"progress", fraction},
++						  {"version", version}});
++		});
++	};
++
++	long long received = 0;
++	Failure failure;
++	if (!DownloadAsset(job.release.archive, job.archive, job.release.size, g_cancel, hasher, progress, received,
++			   failure)) {
++		report(failure);
++		return;
++	}
++
++	/* AppUpdater.swift:244-254: a release that publishes no digest, or whose
++	 * archive does not match it, is not installed at all. */
++	if (job.release.sha256.empty()) {
++		report(Checksum("the release publishes no SHA-256 for its archive"));
++		return;
++	}
++	const std::string actual = hasher.Finish();
++	if (actual.empty() || actual != job.release.sha256) {
++		report(Checksum("the archive is " + (actual.empty() ? std::string("unreadable") : actual) + ", not " +
++				job.release.sha256));
++		return;
++	}
++
++	if (!ExtractZip(job.archive, job.staged, failure)) {
++		report(failure);
++		return;
++	}
++	/* The Swift removed the archive once it was unpacked (:257); keeping it
++	 * would leave a few hundred megabytes in the user's profile. */
++	std::filesystem::remove(job.archive, ec);
++
++	std::filesystem::path root;
++	if (!StagedRoot(job.staged, root, failure)) {
++		report(failure);
++		return;
++	}
++	if (!VerifyTree(root, version, failure)) {
++		report(failure);
++		return;
++	}
++
++	Job finished = job;
++	finished.staged = root;
++	dispatch::Post([finished] { FinishDownload(finished, Failure{}); });
++}
++
++void JobLoop()
++{
++	for (;;) {
++		Job job;
++		{
++			std::unique_lock<std::mutex> lock(g_job_mutex);
++			g_job_cv.wait(lock, [] { return g_job_stopping || g_job.has_value(); });
++			/* Stopping is checked before the job, and under the same lock the
++			 * shutdown takes: a job still queued when the DLL unloads is
++			 * dropped rather than started, because the shutdown is waiting to
++			 * join this thread. */
++			if (g_job_stopping)
++				return;
++			if (!g_job)
++				continue;
++			job = std::move(*g_job);
++			g_job.reset();
++		}
++		RunJob(job);
++	}
++}
++
++/* Starts the worker on first use. False when it could not be started at all,
++ * which the caller reports as a failure rather than leaving a busy state that
++ * never ends. */
++bool EnqueueJob(Job job)
++{
++	{
++		std::lock_guard<std::mutex> lock(g_job_mutex);
++		if (g_job_stopping)
++			return false;
++		if (!g_job_thread.joinable()) {
++			try {
++				g_job_thread = std::thread(JobLoop);
++			} catch (const std::system_error &) {
++				return false;
++			}
++		}
++		/* One job runs at a time (g_busy), and from here on only a shutdown
++		 * sets this, so a cancel that arrives now is one that means it. */
++		g_cancel = false;
++		g_job = std::move(job);
++	}
++	g_job_cv.notify_one();
++	return true;
++}
++
++/* Joins the worker when the DLL unloads, the way live/liveclient.cpp's encode
++ * thread does: a worker still inside this plugin's code after DllMain(DETACH)
++ * would run unmapped memory. The cancel flag stops a transfer in flight instead
++ * of waiting out the rest of the archive. Declared after the state it touches,
++ * so it is destroyed while that state is still alive. */
++struct WorkerShutdown {
++	~WorkerShutdown()
++	{
++		std::thread worker;
++		{
++			std::lock_guard<std::mutex> lock(g_job_mutex);
++			g_job_stopping = true;
++			g_cancel = true;
++			worker = std::move(g_job_thread);
++		}
++		g_job_cv.notify_all();
++		if (worker.joinable())
++			worker.join();
++	}
++};
++WorkerShutdown g_worker_shutdown;
++
++/* ── leftovers and settings backups ─────────────────────────────────────── */
++
++/* AppUpdater.swift:167-173 removed everything earlier updates left behind but
++ * the previous app. Here the previous tree is a sibling of the install tree, so
++ * the downloads folder holds nothing worth keeping except the version being
++ * staged, and a staged tree this process is not using is a leftover of an
++ * interrupted run. */
++void CleanStagedTrees(const std::filesystem::path &root)
++{
++	std::error_code ec;
++	const std::wstring prefix = root.filename().wstring() + kStagedSuffix;
++	std::filesystem::directory_iterator it(root.parent_path(), ec), end;
++	for (; !ec && it != end; it.increment(ec)) {
++		const std::filesystem::directory_entry &entry = *it;
++		std::error_code inner;
++		if (!entry.is_directory(inner) || inner)
++			continue;
++		if (entry.path().filename().wstring().rfind(prefix, 0) != 0)
++			continue;
++		if (!g_staged.empty() && entry.path() == g_staged)
++			continue;
++		std::filesystem::remove_all(entry.path(), ec);
++	}
++}
++
++void CleanUp()
++{
++	std::error_code ec;
++	const std::filesystem::path updates = UpdatesFolder();
++	if (!updates.empty()) {
++		std::filesystem::directory_iterator it(updates, ec), end;
++		for (; !ec && it != end; it.increment(ec)) {
++			const std::filesystem::directory_entry &entry = *it;
++			if (!g_staged_version.empty() &&
++			    entry.path().filename().wstring() == PathVersion(g_staged_version))
++				continue;
++			std::filesystem::remove_all(entry.path(), ec);
++		}
++	}
++	const AppInfo &app = ThisApp();
++	if (!app.root.empty())
++		CleanStagedTrees(app.root);
++}
++
++std::string BackupStamp()
++{
++	SYSTEMTIME now = {};
++	GetLocalTime(&now);
++	char text[32] = {};
++	sprintf_s(text, "%04d-%02d-%02d %02d%02d%02d", now.wYear, now.wMonth, now.wDay, now.wHour, now.wMinute,
++		  now.wSecond);
++	return text;
++}
++
++/* AppUpdater.swift:220-223: "<yyyy-MM-dd HHmmss> v<app> OBS <obs>". */
++std::string BackupLabel()
++{
++	const AppInfo &app = ThisApp();
++	return "v" + CurrentVersion() + " OBS " + (app.obs.empty() ? std::string("?") : app.obs);
++}
++
++/* AppUpdater.swift:233-240: keep the newest backups, leaving room for one
++ * more. The name starts with the timestamp, so the newest is the largest. */
++void PruneBackups()
++{
++	const std::filesystem::path folder = BackupsFolder();
++	if (folder.empty())
++		return;
++	std::error_code ec;
++	std::vector<std::wstring> names;
++	std::filesystem::directory_iterator it(folder, ec), end;
++	for (; !ec && it != end; it.increment(ec)) {
++		const std::wstring name = it->path().filename().wstring();
++		if (!name.empty() && name[0] != L'.')
++			names.push_back(name);
++	}
++	std::sort(names.begin(), names.end(), std::greater<std::wstring>());
++	for (size_t i = kKeptBackups - 1; i < names.size(); ++i)
++		std::filesystem::remove_all(folder / names[i], ec);
++}
++
++/* AppUpdater.swift:226-231: the newest backup taken while `version` was
++ * installed, which a rollback across OBS major versions restores. */
++std::filesystem::path NewestBackup(const std::string &version)
++{
++	const std::filesystem::path folder = BackupsFolder();
++	if (folder.empty())
++		return {};
++	const std::string needle = " v" + version + " OBS ";
++	std::error_code ec;
++	std::wstring best;
++	std::filesystem::directory_iterator it(folder, ec), end;
++	for (; !ec && it != end; it.increment(ec)) {
++		const std::filesystem::path name = it->path().filename();
++		if (Utf8(name).find(needle) == std::string::npos)
++			continue;
++		const std::wstring wide = name.wstring();
++		if (best.empty() || wide > best)
++			best = wide;
++	}
++	return best.empty() ? std::filesystem::path() : folder / best;
++}
++
++/* The Swift asked whether the app's directory was writable
++ * (AppUpdater.swift:320-322) and failed with "location" when it was not. The
++ * Windows install renames that directory and renames the staged one into its
++ * place, so its parent has to be writable too — and the only question that
++ * settles it is whether a file can be created. */
++bool WritableFolder(const std::filesystem::path &folder, std::string &why)
++{
++	if (folder.empty()) {
++		why = "the folder is unknown";
++		return false;
++	}
++	const std::filesystem::path probe =
++		folder / (L".livehime-write-test-" + std::to_wstring(GetCurrentProcessId()) + L".tmp");
++	HANDLE file = CreateFileW(probe.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
++				  FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, nullptr);
++	if (file == INVALID_HANDLE_VALUE) {
++		why = "no permission to write in " + Utf8(folder);
++		return false;
++	}
++	CloseHandle(file);
++	return true;
++}
++
++/* ── the helper that does the swap ──────────────────────────────────────── */
++
++/* install.cmd. AppUpdater.swift:314-376 wrote install.sh and started it with
++ * `nohup /bin/sh` for exactly this reason: Windows will not let a running
++ * obs64.exe be replaced, so something that outlives the process has to do it.
++ * What differs from the shell script is only the vocabulary — tasklist for the
++ * process check, move for mv, xcopy for ditto.
++ *
++ * The script is plain ASCII and takes every value as an argument, because they
++ * arrive on cmd.exe's UTF-16 command line: a user name or an install path
++ * outside the console's code page survives, where a batch file with the paths
++ * written into it could lose them. cmd.exe reads a batch file line by line, so
++ * the file is written with CRLF.
++ *
++ * The two renames are inside one directory and therefore same-volume by
++ * construction. The retry loop covers the moment Windows still holds a handle
++ * on the executable that just exited; `ping -n 2` is the portable one-second
++ * sleep (timeout.exe refuses to run with redirected input). tasklist's CSV form
++ * is matched on the quoted pid field, so a process whose *name* contains those
++ * digits is not mistaken for it. */
++constexpr const char *kInstallScript = R"BAT(@echo off
++rem LiveHime update: wait for LiveHime to exit, back up the settings, swap the
++rem install tree (keeping the old one on failure), restore the settings a
++rem rollback across an OBS major version needs, then reopen.
++rem
++rem Written by livehime.dll before it starts this script. Output goes to
++rem install.log beside it.
++rem
++rem 1 pid  2 install tree  3 staged tree  4 previous tree  5 relaunch
++rem 6 config folder  7 backup folder  8 settings to restore  9 items to back up
++rem 10 items to restore  11 executable to start
++setlocal
++set "PID=%~1"
++shift
++set "ROOT=%~1"
++shift
++set "STAGED=%~1"
++shift
++set "PREVIOUS=%~1"
++shift
++set "RELAUNCH=%~1"
++shift
++set "CONFIG=%~1"
++shift
++set "SAVED=%~1"
++shift
++set "RESTORE=%~1"
++shift
++set "ITEMS=%~1"
++shift
++set "RESTORED=%~1"
++shift
++set "EXE=%~1"
++
++rem 1. Wait for the process being replaced to exit for good.
++:wait
++tasklist /FI "PID eq %PID%" /FO CSV /NH 2>nul | find ",\"%PID%\"," >nul
++if not errorlevel 1 (
++	ping -n 2 127.0.0.1 >nul
++	goto wait
++)
++
++rem 2. Back up what OBS migrates forward, after the exit, so the ini files are
++rem    in their final state. A backup that cannot be written stops the update
++rem    before anything has been moved.
++if not exist "%SAVED%" mkdir "%SAVED%"
++for %%I in (%ITEMS%) do call :save "%%I" || goto :failed
++
++rem 3. Swap the tree. What is replaced becomes the version a rollback returns
++rem    to; the older previous tree is dropped, as AppUpdater.swift:337 does.
++set "TRIES=0"
++:swap
++set /a TRIES+=1
++if exist "%PREVIOUS%" rmdir /S /Q "%PREVIOUS%"
++move "%ROOT%" "%PREVIOUS%" >nul 2>&1
++if errorlevel 1 (
++	if %TRIES% LSS 20 (
++		ping -n 2 127.0.0.1 >nul
++		goto swap
++	)
++	echo could not move "%ROOT%" aside
++	goto :failed
++)
++move "%STAGED%" "%ROOT%" >nul 2>&1
++if errorlevel 1 (
++	echo could not move the new version into "%ROOT%"
++	move "%PREVIOUS%" "%ROOT%" >nul 2>&1
++	goto :failed
++)
++
++rem 4. A rollback across an OBS major version brings the older settings back:
++rem    OBS migrates scenes forward only, never back.
++if not "%RESTORE%"=="" if exist "%RESTORE%" (
++	for %%I in (%RESTORED%) do call :restore "%%I"
++)
++
++rem 5. Reopen. The environment is inherited, so LIVEHIME_* variables (a test
++rem    feed, for instance) reach the new process without being passed on.
++echo update installed
++if "%RELAUNCH%"=="1" start "" "%EXE%"
++endlocal
++exit /b 0
++
++rem One config item, folder or file, whichever it is. `exit /b` without a code
++rem hands back the errorlevel of the copy; xcopy answers 1 when there was
++rem nothing to copy (an empty folder), which is not a failure, so only 2 and up
++rem are.
++:save
++if exist "%CONFIG%\%~1\" (
++	xcopy /E /I /Y /Q "%CONFIG%\%~1" "%SAVED%\%~1" >nul
++	if errorlevel 2 exit /b
++	exit /b 0
++)
++if exist "%CONFIG%\%~1" (
++	copy /Y "%CONFIG%\%~1" "%SAVED%\%~1" >nul
++	exit /b
++)
++exit /b 0
++
++:restore
++if exist "%CONFIG%\%~1\" rmdir /S /Q "%CONFIG%\%~1"
++if exist "%RESTORE%\%~1\" xcopy /E /I /Y /Q "%RESTORE%\%~1" "%CONFIG%\%~1" >nul
++if exist "%RESTORE%\%~1" copy /Y "%RESTORE%\%~1" "%CONFIG%\%~1" >nul
++exit /b 0
++
++:failed
++echo the update failed; the install tree was left as it was
++endlocal
++exit /b 1
++)BAT";
++
++bool WriteInstallScript(const std::filesystem::path &script, std::string &why)
++{
++	std::ofstream out(script, std::ios::binary | std::ios::trunc);
++	if (!out) {
++		why = "cannot write " + Utf8(script);
++		return false;
++	}
++	for (const char *at = kInstallScript; *at;) {
++		if (*at == '\n') {
++			out.write("\r\n", 2);
++			++at;
++			continue;
++		}
++		out.put(*at++);
++	}
++	out.close();
++	if (!out) {
++		why = "cannot write " + Utf8(script);
++		return false;
++	}
++	return true;
++}
++
++/* Starts the helper: cmd.exe with the script, every value as an argument, and
++ * the script's own output redirected into install.log. CREATE_NO_WINDOW keeps
++ * the console off the user's screen, and the working directory is the download
++ * folder rather than the install tree, so nothing this process leaves behind
++ * holds a handle on what is about to be renamed.
++ *
++ * A job object around OBS that kills its children when it closes would take the
++ * helper with it. CREATE_BREAKAWAY_FROM_JOB is deliberately not used: when the
++ * job does not allow breaking away, CreateProcess fails outright and there
++ * would be no update at all instead of a working one in the common case. */
++bool StartHelper(const std::filesystem::path &script, const std::filesystem::path &log,
++		 const std::vector<std::string> &arguments, const std::filesystem::path &working_directory,
++		 std::string &why)
++{
++	wchar_t system_directory[MAX_PATH] = {};
++	if (!GetSystemDirectoryW(system_directory, MAX_PATH)) {
++		why = "the system directory could not be read";
++		return false;
++	}
++
++	/* The /s form is the one that survives a path with spaces: cmd strips the
++	 * first and last quote of what follows /c and runs the rest verbatim. */
++	std::wstring line = L"\"" + script.wstring() + L"\"";
++	for (const std::string &argument : arguments)
++		line += L" \"" + Widen(argument) + L"\"";
++	line += L" 1>\"" + log.wstring() + L"\" 2>&1";
++
++	const std::wstring command = L"\"" + (std::filesystem::path(system_directory) / L"cmd.exe").wstring() +
++				     L"\" /d /s /c \"" + line + L"\"";
++	std::vector<wchar_t> mutable_command(command.begin(), command.end());
++	mutable_command.push_back(L'\0');
++
++	STARTUPINFOW startup = {};
++	startup.cb = sizeof(startup);
++	PROCESS_INFORMATION process = {};
++	if (!CreateProcessW(nullptr, mutable_command.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr,
++			    working_directory.c_str(), &startup, &process)) {
++		why = "the installer could not be started (win32 " + std::to_string(GetLastError()) + ")";
++		return false;
++	}
++	CloseHandle(process.hThread);
++	CloseHandle(process.hProcess);
++	return true;
++}
++
++/* AppUpdater.swift:310-376 in Windows terms: `staged` becomes the install tree
++ * once this process is gone, and the tree it replaces becomes …livehime-
++ * previous, which a rollback returns to. Nothing is emitted on success — the
++ * caller quits, exactly as the Swift's install does. */
++bool ScheduleInstall(const std::string &version, const std::filesystem::path &staged, bool relaunch,
++		     const std::filesystem::path &restore, Failure &failure)
++{
++	const AppInfo &app = ThisApp();
++	if (!UsableRoot(app.root)) {
++		failure = Location("LiveHime does not run from an install tree that can be replaced");
++		return false;
++	}
++	if (PortableTree(app.root)) {
++		failure = Location(kPortableReason);
++		return false;
++	}
++	std::error_code ec;
++	if (!std::filesystem::exists(ExeIn(staged), ec) || ec) {
++		failure = InvalidApp("the staged version is gone");
++		return false;
++	}
++
++	const std::filesystem::path updates = UpdatesFolder();
++	const std::filesystem::path backups = BackupsFolder();
++	if (updates.empty() || backups.empty()) {
++		failure = Location("the local application folder could not be found");
++		return false;
++	}
++	const std::filesystem::path folder = updates / PathVersion(version);
++	std::filesystem::create_directories(folder, ec);
++	if (ec) {
++		failure = Location("cannot create " + Utf8(folder));
++		return false;
++	}
++
++	/* The settings backup beside the config it copies, newest kept
++	 * (AppUpdater.swift:354-359). */
++	std::filesystem::create_directories(backups, ec);
++	if (ec) {
++		failure = Location("cannot create " + Utf8(backups));
++		return false;
++	}
++	PruneBackups();
++	const std::filesystem::path saved = backups / Widen(BackupStamp() + " " + BackupLabel());
++
++	const std::filesystem::path script = folder / L"install.cmd";
++	const std::filesystem::path log = folder / L"install.log";
++	std::string why;
++	if (!WriteInstallScript(script, why)) {
++		failure = Location(why);
++		return false;
++	}
++
++	std::vector<std::string> arguments;
++	arguments.push_back(std::to_string(GetCurrentProcessId()));
++	arguments.push_back(Utf8(app.root));
++	arguments.push_back(Utf8(staged));
++	arguments.push_back(Utf8(PreviousTree(app.root)));
++	arguments.push_back(relaunch ? "1" : "0");
++	arguments.push_back(Utf8(ConfigFolder()));
++	arguments.push_back(Utf8(saved));
++	arguments.push_back(restore.empty() ? std::string() : Utf8(restore));
++	arguments.push_back(kConfigItems);
++	arguments.push_back(kRestoredItems);
++	arguments.push_back(Utf8(ExeIn(app.root)));
++
++	if (!StartHelper(script, log, arguments, folder, why)) {
++		failure = Location(why);
++		return false;
++	}
++	return true;
++}
++
++/* ── the entry points ───────────────────────────────────────────────────── */
++
++/* The C interface promises the main thread (livehime-core.h); the Swift hopped
++ * to it when it was called from anywhere else (AppUpdateBridge.swift:36-42),
++ * and so does this. Everything below that touches g_* runs on the main thread. */
++void OnMain(std::function<void()> body)
++{
++	if (dispatch::OnMainThread()) {
++		body();
++		return;
++	}
++	dispatch::Post(std::move(body));
++}
++
++/* AppUpdateBridge.swift:59-81: what the last check found decides the event. */
++void ReportRelease(const Release &release)
++{
++	if (!g_staged.empty() && g_staged_version == release.version) {
++		nlohmann::json fields = ReleaseFields(release);
++		fields["status"] = "ready";
++		EmitUpdate(fields);
++		return;
++	}
++	if (IsNewer(release.version, CurrentVersion())) {
++		nlohmann::json fields = ReleaseFields(release);
++		fields["status"] = "available";
++		EmitUpdate(fields);
++		return;
++	}
++	EmitUpdate(nlohmann::json{{"status", "upToDate"}, {"version", release.version}});
++}
++
++void FinishCheck(const std::string &body, bool beta)
++{
++	g_busy = false;
++	Release release;
++	Failure failure;
++	if (!ReleaseFromFeed(body, beta, release, failure)) {
++		EmitFailure(failure);
++		return;
++	}
++	g_release = release;
++	ReportRelease(release);
++}
++
++/* A test feed on disk: the Swift pointed LIVEHIME_UPDATE_FEED at a file URL,
++ * so both a plain Windows path and file:///C:/… are accepted. */
++std::filesystem::path TestFeedPath(const std::string &feed)
++{
++	std::string text = feed;
++	if (StartsWith(text, "file://")) {
++		text = text.substr(std::strlen("file://"));
++		/* file:///C:/x leaves three separators before the drive letter. */
++		if (text.size() >= 3 && text[0] == '/' && text[2] == ':')
++			text = text.substr(1);
++	}
++	std::replace(text.begin(), text.end(), '/', '\\');
++	return Widen(text);
++}
++
++void CheckLocalFeed(const std::string &feed, bool beta)
++{
++	const std::filesystem::path path = TestFeedPath(feed);
++	std::ifstream in(path, std::ios::binary);
++	if (!in) {
++		g_busy = false;
++		EmitFailure(Network("cannot read the test feed " + Utf8(path)));
++		return;
++	}
++	in.seekg(0, std::ios::end);
++	const std::streamoff size = in.tellg();
++	in.seekg(0);
++	if (size <= 0) {
++		g_busy = false;
++		EmitFailure(Network("the test feed " + Utf8(path) + " is empty"));
++		return;
++	}
++	std::string body(static_cast<size_t>(size), '\0');
++	in.read(&body[0], static_cast<std::streamsize>(size));
++	body.resize(static_cast<size_t>(in.gcount()));
++	FinishCheck(body, beta);
++}
++
++void CheckOnMain(bool beta)
++{
++	if (g_busy)
++		return;
++	if (!g_cleaned && g_staged.empty()) {
++		/* Leftovers of the last update (AppUpdateBridge.swift:52-56). */
++		CleanUp();
++		g_cleaned = true;
++	}
++	g_busy = true;
++	EmitUpdate(nlohmann::json{{"status", "checking"}});
++
++	const std::optional<std::string> override = FeedOverride();
++	if (override && !StartsWith(*override, "http://") && !StartsWith(*override, "https://")) {
++		CheckLocalFeed(*override, beta);
++		return;
++	}
++
++	/* The feed is small, so it goes through net::Send, which answers on the
++	 * main thread. The API needs no authentication for a public repository,
++	 * and nothing here carries a token. */
++	net::Request request;
++	request.url = override ? *override : (beta ? kListFeed : kLatestFeed);
++	request.timeout_ms = kFeedTimeoutMs;
++	request.headers["Accept"] = "application/vnd.github+json";
++	request.headers["User-Agent"] = "LiveHime/" + CurrentVersion();
++	net::Send(request, [beta](net::Response response) {
++		if (response.status == 0) {
++			g_busy = false;
++			EmitFailure(Network(response.error.empty() ? std::string("no response") : response.error));
++			return;
++		}
++		if (response.status != 200) {
++			g_busy = false;
++			EmitFailure(Network("HTTP " + std::to_string(response.status)));
++			return;
++		}
++		FinishCheck(response.body, beta);
++	});
++}
++
++void DownloadOnMain()
++{
++	if (g_busy || !g_release)
++		return;
++	const Release release = *g_release;
++	if (!IsNewer(release.version, CurrentVersion()))
++		return;
++	if (!InstallSupported(ThisApp())) {
++		EmitFailure(Unsupported("development build"));
++		return;
++	}
++	if (!g_staged.empty() && g_staged_version == release.version) {
++		nlohmann::json fields = ReleaseFields(release);
++		fields["status"] = "ready";
++		EmitUpdate(fields);
++		return;
++	}
++
++	/* Everything that decides whether an install can happen at all is asked
++	 * before a few hundred megabytes are fetched, not after: the download is
++	 * useless if the tree cannot be replaced, and the user should hear that in
++	 * a second rather than in ten minutes. */
++	const AppInfo &app = ThisApp();
++	std::string why;
++	if (!UsableRoot(app.root) || !WritableFolder(app.root, why) || !WritableFolder(app.root.parent_path(), why)) {
++		EmitFailure(Location(why.empty() ? std::string("LiveHime cannot replace this install tree") : why));
++		return;
++	}
++	if (PortableTree(app.root)) {
++		EmitFailure(Location(kPortableReason));
++		return;
++	}
++	const std::filesystem::path updates = UpdatesFolder();
++	if (updates.empty()) {
++		EmitFailure(Location("the local application folder could not be found"));
++		return;
++	}
++
++	Job job;
++	job.release = release;
++	job.archive = updates / PathVersion(release.version) / L"app.zip";
++	job.staged = StagedTree(app.root, release.version);
++
++	g_busy = true;
++	EmitUpdate(nlohmann::json{{"status", "downloading"}, {"progress", 0.0}, {"version", release.version}});
++	if (!EnqueueJob(std::move(job))) {
++		g_busy = false;
++		EmitFailure(Location("the update worker could not be started"));
++	}
++}
++
++bool InstallOnMain(bool relaunch)
++{
++	if (g_busy || g_staged.empty())
++		return false;
++
++	/* Verified again: the tree has been on disk since the download, and this
++	 * is the last moment it can be refused. */
++	Failure failure;
++	if (!VerifyTree(g_staged, g_staged_version, failure)) {
++		EmitFailure(failure);
++		return false;
++	}
++	if (!ScheduleInstall(g_staged_version, g_staged, relaunch, std::filesystem::path(), failure)) {
++		EmitFailure(failure);
++		return false;
++	}
++	g_staged.clear();
++	g_staged_version.clear();
++	return true;
++}
++
++bool RollbackOnMain()
++{
++	if (g_busy)
++		return false;
++
++	const AppInfo &app = ThisApp();
++	const std::string version = PreviousVersion();
++	if (version.empty()) {
++		EmitFailure(InvalidApp("no previous version"));
++		return false;
++	}
++
++	Failure failure;
++	const std::filesystem::path previous = PreviousTree(app.root);
++	if (!VerifyTree(previous, version, failure)) {
++		EmitFailure(failure);
++		return false;
++	}
++
++	/* AppUpdater.swift:383-399: the kept tree moves to where an install expects
++	 * its staged tree, and the settings of that version come back when the OBS
++	 * major version differs, because OBS migrates scenes forward only. */
++	const std::filesystem::path staged = StagedTree(app.root, version);
++	std::error_code ec;
++	std::filesystem::remove_all(staged, ec);
++	std::filesystem::rename(previous, staged, ec);
++	if (ec) {
++		EmitFailure(Location("the previous version could not be staged"));
++		return false;
++	}
++
++	std::filesystem::path restore;
++	const AppInfo kept = ReadApp(ExeIn(staged));
++	if (ObsMajor(kept.obs) != ObsMajor(app.obs))
++		restore = NewestBackup(version);
++
++	if (!ScheduleInstall(version, staged, true, restore, failure)) {
++		std::filesystem::rename(staged, previous, ec);
++		EmitFailure(failure);
++		return false;
++	}
++	g_staged.clear();
++	g_staged_version.clear();
++	return true;
++}
++
++} // namespace
++
++void Check(bool beta)
++{
++	OnMain([beta] { CheckOnMain(beta); });
++}
++
++void Download()
++{
++	OnMain(DownloadOnMain);
++}
++
++bool Install(bool relaunch)
++{
++	if (dispatch::OnMainThread())
++		return InstallOnMain(relaunch);
++	/* The answer has to be synchronous, so an off-thread call installs
++	 * nothing, exactly as the Swift's `guard Thread.isMainThread` does. */
++	return false;
++}
++
++bool Rollback()
++{
++	if (dispatch::OnMainThread())
++		return RollbackOnMain();
++	return false;
++}
++
++void EmitState()
++{
++	OnMain([] { EmitUpdate(nlohmann::json{{"status", "idle"}}); });
++}
++
++} // namespace update
++} // namespace livehime
+diff --git a/plugins/livehime/core/win/update/updater.h b/plugins/livehime/core/win/update/updater.h
+new file mode 100644
+index 0000000..5d712ad
+--- /dev/null
++++ b/plugins/livehime/core/win/update/updater.h
+@@ -0,0 +1,123 @@
++/* App updates from GitHub Releases — the Windows counterpart of
++ * AppUpdater.swift and AppUpdateBridge.swift (the five livehime_core_update_*
++ * entry points).
++ *
++ * The feed is the **Windows** releases repository, not the macOS one:
++ *
++ *   page    https://github.com/greyoak111/livehime-win/releases
++ *   latest  https://api.github.com/repos/greyoak111/livehime-win/releases/latest
++ *   list    https://api.github.com/repos/greyoak111/livehime-win/releases?per_page=20
++ *
++ * LIVEHIME_UPDATE_FEED overrides the feed the way it does in the Swift: an
++ * http(s) value is fetched, anything else (a plain path, or file:///…) is read
++ * as a local file holding one release object or a list of them, which is what
++ * the tests point at.
++ *
++ * The asset. A macOS update replaces a signed .app that Sparkle relaunches.
++ * There is no Sparkle here and no installer yet, so the Windows asset is the
++ * zipped install tree:
++ *
++ *   LiveHimeWinRundir-v<version>-x64.zip
++ *   LiveHimeWinRundir-v<version>-arm64.zip
++ *
++ * Entries are relative to the tree's root, so the archive starts with
++ * bin/64bit/obs64.exe, obs-plugins/64bit/livehime.dll, data/… — the shape both
++ * build_<target>/rundir/<config> and build_<target>/install/LiveHime (the
++ * `--install` tree of build-aux/livehime-win/build-win.ps1) already have. A
++ * single wrapping top-level folder is accepted too, mirroring the Swift's "find
++ * the .app in the unpacked folder".
++ *
++ * What install does, concretely. Windows will not let a running obs64.exe be
++ * overwritten, so the swap goes through a helper, exactly as the Swift's
++ * install.sh does:
++ *
++ *   1. the archive is downloaded to %LOCALAPPDATA%\LiveHime\Updates\<version>\
++ *      app.zip and unpacked, while LiveHime runs, into a staged tree beside the
++ *      install tree: <parent>\<name>.livehime-staged-<version>;
++ *   2. livehime_core_update_install() writes install.cmd next to the download
++ *      and starts it with cmd.exe /d /s /c (no console window). The caller
++ *      then quits LiveHime, as it does on macOS;
++ *   3. install.cmd waits for that process to exit, backs up the settings OBS
++ *      migrates forward (%APPDATA%\LiveHime\obs-studio -> %APPDATA%\LiveHime\
++ *      backups\<stamp> v<version> OBS <obs>), renames the install tree aside to
++ *      <parent>\<name>.livehime-previous, renames the staged tree into place,
++ *      restores the older settings when a rollback crossed an OBS major
++ *      version, and starts obs64.exe again when asked to. Its output is
++ *      install.log beside it;
++ *   4. the tree it replaced stays as …livehime-previous, which is what
++ *      livehime_core_update_rollback() puts back (and what "previous" in every
++ *      update event names).
++ *
++ * Both renames are inside the same directory, so they are same-volume by
++ * construction and effectively atomic: an install directory whose parent is
++ * not writable (C:\Program Files without elevation) is reported as a `location`
++ * failure *before* anything is downloaded, rather than half-applied. A tree in
++ * OBS's portable mode is refused the same way, because its settings live in
++ * <root>\config and an update would replace them.
++ *
++ * What is verified, and what is not. The Swift checks the archive's SHA-256,
++ * the bundle identifier, the version and the signing certificate. Here:
++ *
++ *   - the SHA-256 the release publishes (GitHub's asset digest) is computed
++ *     while the archive is written, and a mismatch fails the download;
++ *   - the staged bin/64bit/obs64.exe must carry the release's version as
++ *     ProductVersion, the running build's ProductName, and the running build's
++ *     machine type — the ProductVersion check is the same single source of
++ *     truth update-page.cpp reads for the running version, and ProductName is
++ *     the closest Windows has to "the same bundle identifier";
++ *   - PUBLISHER VERIFICATION IS ABSENT. Nothing on Windows is code-signed yet
++ *     and a zip has no Authenticode signature to verify, so nothing here
++ *     proves who built the archive beyond TLS to github.com. The macOS build
++ *     checks a certificate; this one cannot, and does not pretend to.
++ *
++ * "supported" (the UI's development-build check) is the Windows reading of the
++ * Swift's ".dev" bundle identifier: a build whose ProductVersion equals its
++ * FileVersion was configured without LIVEHIME_APP_VERSION — upstream OBS
++ * Studio, or this source built without the branding — and a LiveHime release
++ * must not replace it. A test feed makes it supported anyway, as on macOS.
++ *
++ * Threading. Every function here is called from the C entry points, which are
++ * on the main thread by contract; they re-post when they are not. The feed is
++ * small and goes through net::Send, which answers on the main thread. The
++ * download is hundreds of megabytes, so it runs on one worker thread of this
++ * file's own — net/http.h's Send() buffers a whole body in memory — and reports
++ * progress back with dispatch::Post; the file's shutdown guard joins that
++ * thread when the DLL unloads, the way live/liveclient.cpp's encode thread
++ * does. No URL that carries anything secret is ever logged or emitted: the
++ * GitHub API needs no authentication for public releases. */
++
++#pragma once
++
++namespace livehime {
++namespace update {
++
++/* livehime_core_update_check: looks for a newer release; with `beta`,
++ * pre-releases count too. Emits "checking", then "upToDate", "available" (with
++ * version, notes, page, size, prerelease) or "failed". */
++void Check(bool beta);
++
++/* livehime_core_update_download: fetches, verifies and unpacks the release the
++ * last check found. Emits "downloading" with "progress" (0-1), then "ready" or
++ * "failed". */
++void Download();
++
++/* livehime_core_update_install: arranges for the staged tree to replace this
++ * install once LiveHime quits. Returns true when the installer is waiting — the
++ * caller then quits, and with `relaunch` LiveHime reopens afterwards. Returns
++ * false when there is nothing to install or it could not be started, having
++ * emitted "failed". */
++bool Install(bool relaunch);
++
++/* livehime_core_update_rollback: arranges for the previous tree to come back
++ * once LiveHime quits and to reopen afterwards (the caller then quits).
++ * Returns false, having emitted "failed", when there is nothing to roll back
++ * to. */
++bool Rollback();
++
++/* livehime_core_update_state: the idle event with current, obsCurrent,
++ * supported and, when there is one, previous (the version a rollback would
++ * return to). */
++void EmitState();
++
++} // namespace update
++} // namespace livehime
+diff --git a/plugins/livehime/src/feature-panel.cpp b/plugins/livehime/src/feature-panel.cpp
+index 1ac4a4f..1d03981 100644
+--- a/plugins/livehime/src/feature-panel.cpp
++++ b/plugins/livehime/src/feature-panel.cpp
+@@ -269,6 +269,15 @@ void FeaturePanel::applyEvent(const QJsonObject &event)
+ 		return;
+ 	}
+ 	if (name == "update") {
++		/* Which release feed answered, and with what. The Windows and macOS
++		 * builds publish from separate repositories, so a run that reports
++		 * "up to date" without saying where it looked cannot be told from one
++		 * that quietly asked the wrong repository. */
++		blog(LOG_INFO, "[livehime] update -> %s%s%s",
++		     event.value("status").toString().toUtf8().constData(),
++		     event.contains("reason") ? " reason: " : "",
++		     event.contains("reason") ? event.value("reason").toString().toUtf8().constData() : "");
++
+ 		updates_->handleEvent(event);
+ 		return;
+ 	}
+diff --git a/plugins/livehime/src/update-page.cpp b/plugins/livehime/src/update-page.cpp
+index 14f109c..37c422e 100644
+--- a/plugins/livehime/src/update-page.cpp
++++ b/plugins/livehime/src/update-page.cpp
+@@ -95,7 +95,16 @@ QString UpdatePage::currentVersion()
+ }
+ 
+ namespace {
++/* Which repository publishes this build's releases. This is the fallback for
++ * the "open the releases page" link, used before any check has run and
++ * whenever automatic updates are off — so getting it wrong sends a user of one
++ * platform to the other platform's download. The macOS and Windows ports are
++ * separate repositories. */
++#ifdef _WIN32
++const QString kReleases = QStringLiteral("https://github.com/greyoak111/livehime-win/releases");
++#else
+ const QString kReleases = QStringLiteral("https://github.com/greyoak111/livehime-macos/releases");
++#endif
+ /* Automatic checks: shortly after launch, then every six hours. */
+ constexpr int kFirstCheckMs = 15 * 1000;
+ constexpr int kCheckIntervalMs = 6 * 60 * 60 * 1000;
+-- 
+2.54.0 (Apple Git-157)
+

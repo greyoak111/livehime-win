@@ -1,0 +1,157 @@
+From 9dab8e949c511efb80f977a06f950ab590742f7f Mon Sep 17 00:00:00 2001
+From: DeepSeek Harness <noreply@deepseek.com>
+Date: Sat, 26 Sep 2026 00:09:42 +0800
+Subject: [PATCH 04/18] Show the LiveHime name and version in the Windows title
+ and resource
+
+Patch 0005 of the macOS series defines LIVEHIME_APP_TITLE_NAME and
+LIVEHIME_APP_TITLE_VERSION in frontend/cmake/os-macos.cmake and passes
+LIVEHIME_APP_VERSION from build-macos.sh. Windows had neither, so the title
+bar fell back to upstream's "OBS 32.2.2" and the version resource reported
+ProductVersion 32.2.2 where the macOS bundle reports its marketing version.
+
+Add LIVEHIME_APP_VERSION to cmake/windows/defaults.cmake, compute
+LIVEHIME_PRODUCT_VERSION in frontend/cmake/os-windows.cmake the way
+cmake/macos/helpers.cmake computes the bundle's MARKETING_VERSION, use it for
+ProductVersion in obs.rc.in, and set the same two title macros. FileVersion
+and FILEVERSION keep the OBS version the build is actually based on, so
+Explorer still shows what is underneath.
+
+build-win.ps1 passes LIVEHIME_APP_VERSION=0.2.10 to match build-macos.sh, and
+its header now records the two things the first real Windows build needed: ATL
+for frontend-tools, obs-qsv11 and the virtualcam module, and an initialised
+deps/libdshowcapture submodule.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ build-aux/livehime-win/build-win.ps1 | 32 +++++++++++++++++++++++-----
+ cmake/windows/defaults.cmake         |  3 +++
+ frontend/cmake/os-windows.cmake      | 19 +++++++++++++++++
+ frontend/cmake/windows/obs.rc.in     |  2 +-
+ 4 files changed, 50 insertions(+), 6 deletions(-)
+
+diff --git a/build-aux/livehime-win/build-win.ps1 b/build-aux/livehime-win/build-win.ps1
+index f17c0d2..5849cb4 100644
+--- a/build-aux/livehime-win/build-win.ps1
++++ b/build-aux/livehime-win/build-win.ps1
+@@ -13,12 +13,33 @@
+ #
+ # Requirements, all installed by `.github/scripts/Build-Windows.ps1`'s helper
+ # (winget, driven by .github/scripts/.Wingetfile):
+-#   Visual Studio 2026 (generator "Visual Studio 18 2026"), CMake 3.28+, Git,
+-#   PowerShell 7.2+, and the obs-deps packages the windows-<target> preset
+-#   downloads. Run this from a shell where winget works.
++#   Visual Studio 2022+ with the "Desktop development with C++" workload,
++#   CMake 3.28+, Git, PowerShell 7.2+, and the obs-deps packages the
++#   windows-<target> preset downloads. Run this from a shell where winget works.
+ #
+-# Status: NOT YET RUN ON WINDOWS. The plugin builds from portable Qt C++ plus a
+-# stub core; see docs/WINDOWS_PORT.md for what is real and what is not.
++# ATL IS REQUIRED AND IS NOT IN .Wingetfile. GitHub's windows-2022 runner image
++# ships it preinstalled, so upstream CI never has to ask; a bare Build Tools
++# install does not. Without it three plugins fail with C1083 on atlbase.h:
++#   plugins/frontend-tools   (captions-mssapi.cpp -> sphelper.h -> atlbase.h)
++#   plugins/obs-qsv11
++#   plugins/win-dshow/virtualcam-module
++# Install it once, elevated, with:
++#   & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\setup.exe" `
++#       modify --installPath "<VS install path>" `
++#       --add Microsoft.VisualStudio.Component.VC.ATL --quiet --norestart --wait
++# The rest of the build is unaffected: everything else compiles without ATL.
++#
++# The source tree must have submodules. A plain `git clone --depth 1` leaves
++# deps/libdshowcapture empty and CMake then fails on a missing
++# dshowcapture.hpp, so run once before configuring:
++#   git submodule update --init --recursive --depth 1
++#
++# Status: RUN ON WINDOWS. Verified on Windows 11 ARM64 (Parallels) against
++# Visual Studio 2022 Build Tools 17.14 with the x64 preset under emulation:
++# obs64.exe and livehime.dll both build, obs64.exe reports ProductName
++# "LiveHime" / ProductVersion 0.2.10, creates %APPDATA%\LiveHime\obs-studio,
++# and its log records "[livehime] control dock loaded". See
++# docs/WINDOWS_PORT.md for what is real and what is still a stub.
+ 
+ [CmdletBinding()]
+ param(
+@@ -81,6 +102,7 @@ try {
+         '-DOBS_VERSION_OVERRIDE=32.2.2'
+         '-DLIVEHIME_APP_NAME=LiveHime'
+         '-DLIVEHIME_APP_DISPLAY_NAME=LiveHime'
++        '-DLIVEHIME_APP_VERSION=0.2.10'
+         '-DLIVEHIME_COMPANY_NAME=LiveHime'
+         '-DLIVEHIME_APP_ICON=cmake/windows/livehime-win.ico'
+         '-DOBS_USER_CONFIG_SUBDIR=LiveHime'
+diff --git a/cmake/windows/defaults.cmake b/cmake/windows/defaults.cmake
+index 8848db5..defb149 100644
+--- a/cmake/windows/defaults.cmake
++++ b/cmake/windows/defaults.cmake
+@@ -9,6 +9,8 @@ include_guard(GLOBAL)
+ #
+ #   LIVEHIME_APP_NAME          Product name in the version resource.
+ #   LIVEHIME_APP_DISPLAY_NAME  File description and product name strings.
++#   LIVEHIME_APP_VERSION       Marketing version in the window title and the
++#                              version resource. Empty keeps the OBS version.
+ #   LIVEHIME_COMPANY_NAME      Company name in the version resource.
+ #   OBS_USER_CONFIG_SUBDIR     Subdirectory of %APPDATA% used as the user
+ #                              config root. Empty keeps %APPDATA%\obs-studio.
+@@ -18,6 +20,7 @@ include_guard(GLOBAL)
+ # See docs/WINDOWS_PORT.md.
+ set(LIVEHIME_APP_NAME "OBS" CACHE STRING "Product name in the Windows version resource")
+ set(LIVEHIME_APP_DISPLAY_NAME "OBS Studio" CACHE STRING "File description and product name")
++set(LIVEHIME_APP_VERSION "" CACHE STRING "Application marketing version; empty uses the OBS version")
+ set(LIVEHIME_COMPANY_NAME "OBS" CACHE STRING "Company name in the Windows version resource")
+ set(LIVEHIME_APP_ICON "cmake/windows/obs-studio.ico" CACHE FILEPATH "Application icon (.ico) compiled into obs64.exe")
+ set(OBS_USER_CONFIG_SUBDIR "" CACHE STRING "Subdirectory of %APPDATA% used as the user config root")
+diff --git a/frontend/cmake/os-windows.cmake b/frontend/cmake/os-windows.cmake
+index e8c6e0c..21d017a 100644
+--- a/frontend/cmake/os-windows.cmake
++++ b/frontend/cmake/os-windows.cmake
+@@ -12,6 +12,16 @@ set(CMAKE_FIND_PACKAGE_PREFER_CONFIG FALSE)
+ find_package(Detours REQUIRED)
+ find_package(nlohmann_json 3.11 REQUIRED)
+ 
++# LiveHime: the Windows counterpart of the macOS branding in patch 0005.
++# ProductVersion carries the marketing version so the About box, the update
++# page and Explorer all agree with the macOS bundle, while FileVersion keeps
++# the OBS version this build is actually based on.
++if(LIVEHIME_APP_VERSION)
++  set(LIVEHIME_PRODUCT_VERSION "${LIVEHIME_APP_VERSION}")
++else()
++  set(LIVEHIME_PRODUCT_VERSION "${OBS_VERSION_CANONICAL}")
++endif()
++
+ configure_file(cmake/windows/obs.rc.in obs.rc)
+ 
+ target_sources(
+@@ -60,6 +70,15 @@ target_link_libraries(
+ 
+ target_compile_definitions(obs-studio PRIVATE PSAPI_VERSION=2)
+ 
++# LiveHime: same definitions the macOS build sets in frontend/cmake/os-macos.cmake.
++# Without LIVEHIME_APP_VERSION the window title stays upstream's "OBS <version>".
++if(LIVEHIME_APP_VERSION)
++  target_compile_definitions(
++    obs-studio
++    PRIVATE LIVEHIME_APP_TITLE_NAME="${LIVEHIME_APP_DISPLAY_NAME}" LIVEHIME_APP_TITLE_VERSION="${LIVEHIME_APP_VERSION}"
++  )
++endif()
++
+ target_link_options(obs-studio PRIVATE /IGNORE:4099 $<$<CONFIG:DEBUG>:/NODEFAULTLIB:MSVCRT>)
+ 
+ # Set commit for untagged version comparisons in the Windows updater
+diff --git a/frontend/cmake/windows/obs.rc.in b/frontend/cmake/windows/obs.rc.in
+index ee79ed6..3fb6e90 100644
+--- a/frontend/cmake/windows/obs.rc.in
++++ b/frontend/cmake/windows/obs.rc.in
+@@ -13,7 +13,7 @@ BEGIN
+       VALUE "InternalName", "obs"
+       VALUE "OriginalFilename", "obs"
+       VALUE "ProductName", "${LIVEHIME_APP_DISPLAY_NAME}"
+-      VALUE "ProductVersion", "${OBS_VERSION_CANONICAL}"
++      VALUE "ProductVersion", "${LIVEHIME_PRODUCT_VERSION}"
+       VALUE "Comments", "Free and open source software for video recording and live streaming"
+       VALUE "LegalCopyright", "${OBS_LEGAL_COPYRIGHT}"
+     END
+-- 
+2.54.0 (Apple Git-157)
+
