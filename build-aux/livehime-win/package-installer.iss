@@ -26,6 +26,10 @@
   #define AppArch "x64"
 #endif
 
+; ISPP defines, because the [Setup] directives of the same name are not
+; reachable from {#...}: AppName in [UninstallDelete] needs this one.
+#define MyAppName "LiveHime"
+
 [Setup]
 AppId={{8E1F2C74-6B3A-4A9D-9C1E-7F4B2A5D3C10}
 AppName=LiveHime
@@ -58,9 +62,21 @@ WizardStyle=modern
 UninstallDisplayName=LiveHime {#AppVersion}
 UninstallDisplayIcon={app}\bin\64bit\obs64.exe
 
+; Chinese is offered when the translation is present, and the installer builds
+; without it otherwise. Inno Setup ships only a handful of languages; Chinese is
+; an unofficial translation kept separately, so requiring it would make the
+; installer fail to compile on a stock install. Drop ChineseSimplified.isl into
+; this directory (or the Inno Setup Languages directory) to get a Chinese
+; wizard; the product's own strings are in the app, not here.
+#define ChineseIsl "ChineseSimplified.isl"
+#if FileExists(AddBackslash(CompilerPath) + "Languages\" + ChineseIsl) || FileExists(ChineseIsl)
 [Languages]
 Name: "chinese"; MessagesFile: "compiler:Languages\ChineseSimplified.isl"
 Name: "english"; MessagesFile: "compiler:Default.isl"
+#else
+[Languages]
+Name: "english"; MessagesFile: "compiler:Default.isl"
+#endif
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
@@ -82,5 +98,5 @@ Filename: "{app}\bin\64bit\obs64.exe"; Description: "{cm:LaunchProgram,LiveHime}
 [UninstallDelete]
 ; The updater keeps the replaced tree beside the install tree; an uninstall
 ; should not leave that behind.
-Type: filesandordirs; Name: "{app}\..\{#AppName}.livehime-previous"
-Type: filesandordirs; Name: "{app}\..\{#AppName}.livehime-staged-*"
+Type: filesandordirs; Name: "{app}\..\{#MyAppName}.livehime-previous"
+Type: filesandordirs; Name: "{app}\..\{#MyAppName}.livehime-staged-*"
