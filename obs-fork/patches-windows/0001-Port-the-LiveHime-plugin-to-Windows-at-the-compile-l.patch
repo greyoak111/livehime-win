@@ -1,0 +1,1699 @@
+From 31261bd71e2b6a49c1f77f123cf3f6c76d4f5312 Mon Sep 17 00:00:00 2001
+From: greyoak111 <greyoak111@users.noreply.github.com>
+Date: Fri, 25 Sep 2026 23:22:11 +0800
+Subject: [PATCH] Port the LiveHime plugin to Windows at the compile layer
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The macOS plugin hard-codes Darwin: plugins/livehime/CMakeLists.txt lists 21
+Swift files and five .framework libraries unconditionally, so cmake refuses to
+configure on Windows. The session core behind the Qt UI is Swift and imports
+WebKit, CryptoKit, Security, AppKit, ImageIO, UniformTypeIdentifiers,
+AVFoundation, Speech, CoreMedia, CoreImage and Compression with no #if os()
+fallback anywhere; the window layer is Objective-C++.
+
+Compile layer only — no session logic is implemented here:
+
+  plugins/livehime/CMakeLists.txt   select core/ and the window layer per
+                                    platform instead of assuming Darwin
+  plugins/livehime/src/window-native.cpp
+                                    Windows window behaviour (topmost level,
+                                    SetWindowDisplayAffinity, HWND ids, the
+                                    capture-exception proc)
+  plugins/livehime/core/win/livehime-core-stub.cpp
+                                    all 35 livehime_core_* entry points,
+                                    reporting "unsupported"; the UI links and
+                                    loads, the features do not
+  build-aux/livehime-win/build-win.ps1
+                                    Windows counterpart of build-macos.sh
+
+Branding, icon and config isolation, mirroring patch 0001 on macOS:
+
+  cmake/windows/defaults.cmake      LIVEHIME_APP_NAME / _DISPLAY_NAME /
+                                    _COMPANY_NAME / _APP_ICON and
+                                    OBS_USER_CONFIG_SUBDIR cache variables,
+                                    defaults reproducing upstream exactly
+  frontend/cmake/windows/obs.rc.in  version resource from those variables
+  cmake/windows/livehime-win.ico    from livehime-appicon.svg, six sizes
+  libobs/cmake/os-windows.cmake     OBS_USER_CONFIG_SUBDIR compile definition
+  libobs/util/platform-windows.c    user_config_subdir(): per-user paths gain
+                                    the subdirectory, %PROGRAMDATA% untouched
+
+The executable stays obs64.exe; only the product identity changes. Nothing has
+been built on Windows yet — see docs/WINDOWS_PORT.md.
+---
+ build-aux/livehime-win/build-win.ps1          | 111 +++++++
+ cmake/windows/defaults.cmake                  |  20 ++
+ cmake/windows/livehime-win.ico                | Bin 0 -> 29181 bytes
+ docs/WINDOWS_PORT.md                          | 124 ++++++++
+ frontend/cmake/windows/obs.rc.in              |   8 +-
+ libobs/cmake/os-windows.cmake                 |   8 +
+ libobs/util/platform-windows.c                |  41 ++-
+ plugins/livehime/CMakeLists.txt               | 174 +++++++----
+ .../livehime/core/win/livehime-core-stub.cpp  | 286 ++++++++++++++++++
+ plugins/livehime/src/window-native.cpp        | 180 +++++++++++
+ 10 files changed, 883 insertions(+), 69 deletions(-)
+ create mode 100644 build-aux/livehime-win/build-win.ps1
+ create mode 100644 cmake/windows/livehime-win.ico
+ create mode 100644 docs/WINDOWS_PORT.md
+ create mode 100644 plugins/livehime/core/win/livehime-core-stub.cpp
+ create mode 100644 plugins/livehime/src/window-native.cpp
+
+diff --git a/build-aux/livehime-win/build-win.ps1 b/build-aux/livehime-win/build-win.ps1
+new file mode 100644
+index 0000000..f17c0d2
+--- /dev/null
++++ b/build-aux/livehime-win/build-win.ps1
+@@ -0,0 +1,111 @@
++#!/usr/bin/env pwsh
++#
++# Configure and build the LiveHime Windows plugin inside OBS Studio.
++#
++# This is the Windows counterpart of build-aux/livehime/build-macos.sh. Like
++# that script it drives upstream OBS's own build path rather than inventing a
++# new one, and it only ever adds LiveHime options to the configure step.
++#
++#   Target          x64 (default) or arm64
++#   Configuration   RelWithDebInfo (default), Release, MinSizeRel, Debug
++#   Output          build_<Target>/install/LiveHime/…  (OBS's install tree)
++#                   build_<Target>/rundir/<Configuration>/obs64.exe for a run
++#
++# Requirements, all installed by `.github/scripts/Build-Windows.ps1`'s helper
++# (winget, driven by .github/scripts/.Wingetfile):
++#   Visual Studio 2026 (generator "Visual Studio 18 2026"), CMake 3.28+, Git,
++#   PowerShell 7.2+, and the obs-deps packages the windows-<target> preset
++#   downloads. Run this from a shell where winget works.
++#
++# Status: NOT YET RUN ON WINDOWS. The plugin builds from portable Qt C++ plus a
++# stub core; see docs/WINDOWS_PORT.md for what is real and what is not.
++
++[CmdletBinding()]
++param(
++    [ValidateSet('x64', 'arm64')]
++    [string] $Target = 'x64',
++
++    [ValidateSet('Debug', 'RelWithDebInfo', 'Release', 'MinSizeRel')]
++    [string] $Configuration = 'RelWithDebInfo',
++
++    # Skip the winget dependency step when the toolchain is already present.
++    [switch] $SkipDependencies,
++
++    # Use the windows-ci-<target> preset, which turns warnings into errors.
++    # Off by default: a first build on a new port has warnings.
++    [switch] $WarningsAsErrors
++)
++
++$ErrorActionPreference = 'Stop'
++
++if ( $PSVersionTable.PSVersion -lt '7.2.0' ) {
++    Write-Error 'This script requires PowerShell Core 7.2 or newer.'
++    exit 1
++}
++
++if ( ! ( [System.Environment]::Is64BitOperatingSystem ) ) {
++    Write-Error 'obs-studio requires a 64-bit system to build and run.'
++    exit 1
++}
++
++$SourceDir = Resolve-Path -Path "$PSScriptRoot/../.."
++$BuildDir  = Join-Path $SourceDir "build_$Target"
++
++# Reuse upstream's helpers so dependency installation and command logging stay
++# identical to a normal obs-studio build.
++$UtilityFunctions = Get-ChildItem -Path "$SourceDir/.github/scripts/utils.pwsh/*.ps1" -Recurse
++foreach ( $Utility in $UtilityFunctions ) {
++    . $Utility.FullName
++}
++
++Push-Location $SourceDir
++try {
++    if ( ! $SkipDependencies ) {
++        Log-Group "Installing build dependencies (winget)..."
++        Install-BuildDependencies -WingetFile "$SourceDir/.github/scripts/.Wingetfile"
++    }
++
++    $preset = if ( $WarningsAsErrors ) { "windows-ci-$Target" } else { "windows-$Target" }
++
++    # Mirrors build-macos.sh: upstream's defaults, plus only what LiveHime
++    # needs to differ. ENABLE_BROWSER=OFF and the version override match the
++    # macOS build so both report the same OBS version.
++    #
++    # The LIVEHIME_* / OBS_USER_CONFIG_SUBDIR values are the Windows
++    # counterpart of the LIVEHIME_APP_* block build-macos.sh passes. Defaults
++    # (see cmake/windows/defaults.cmake) keep plain OBS Studio behavior.
++    # The executable stays obs64.exe; only the product identity changes.
++    $cmakeArgs = @(
++        '--preset', $preset
++        '-DENABLE_BROWSER=OFF'
++        '-DOBS_VERSION_OVERRIDE=32.2.2'
++        '-DLIVEHIME_APP_NAME=LiveHime'
++        '-DLIVEHIME_APP_DISPLAY_NAME=LiveHime'
++        '-DLIVEHIME_COMPANY_NAME=LiveHime'
++        '-DLIVEHIME_APP_ICON=cmake/windows/livehime-win.ico'
++        '-DOBS_USER_CONFIG_SUBDIR=LiveHime'
++    )
++
++    Log-Group "Configuring obs-studio (LiveHime Windows, $Target)..."
++    Invoke-External cmake @cmakeArgs
++
++    Log-Group "Building obs-studio (LiveHime Windows, $Configuration)..."
++    Invoke-External cmake `
++        --build --preset "windows-$Target" `
++        --config $Configuration `
++        --parallel `
++        -- '/consoleLoggerParameters:Summary' '/noLogo'
++
++    Log-Group "Installing obs-studio..."
++    Invoke-External cmake `
++        --install $BuildDir `
++        --prefix (Join-Path $BuildDir 'install') `
++        --config $Configuration
++
++    Log-Group "Done."
++    Write-Output "Run tree:  $BuildDir/rundir/$Configuration/obs64.exe"
++    Write-Output "Plugin:    $BuildDir/rundir/$Configuration/obs-plugins/64bit/livehime.dll"
++}
++finally {
++    Pop-Location
++}
+diff --git a/cmake/windows/defaults.cmake b/cmake/windows/defaults.cmake
+index c2e1411..8848db5 100644
+--- a/cmake/windows/defaults.cmake
++++ b/cmake/windows/defaults.cmake
+@@ -2,6 +2,26 @@
+ 
+ include_guard(GLOBAL)
+ 
++# LiveHime: application identity and per-user configuration root. The defaults
++# keep upstream OBS behavior; the LiveHime build overrides them at configure
++# time. Mirrors cmake/macos/defaults.cmake, which does the same for the macOS
++# bundle.
++#
++#   LIVEHIME_APP_NAME          Product name in the version resource.
++#   LIVEHIME_APP_DISPLAY_NAME  File description and product name strings.
++#   LIVEHIME_COMPANY_NAME      Company name in the version resource.
++#   OBS_USER_CONFIG_SUBDIR     Subdirectory of %APPDATA% used as the user
++#                              config root. Empty keeps %APPDATA%\obs-studio.
++#
++# The executable stays obs64.exe even when the product is renamed: plugin
++# search paths, the crash handler and portable mode all key off that name.
++# See docs/WINDOWS_PORT.md.
++set(LIVEHIME_APP_NAME "OBS" CACHE STRING "Product name in the Windows version resource")
++set(LIVEHIME_APP_DISPLAY_NAME "OBS Studio" CACHE STRING "File description and product name")
++set(LIVEHIME_COMPANY_NAME "OBS" CACHE STRING "Company name in the Windows version resource")
++set(LIVEHIME_APP_ICON "cmake/windows/obs-studio.ico" CACHE FILEPATH "Application icon (.ico) compiled into obs64.exe")
++set(OBS_USER_CONFIG_SUBDIR "" CACHE STRING "Subdirectory of %APPDATA% used as the user config root")
++
+ set(OBS_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
+ set(OBS_OUTPUT_DIR "${CMAKE_CURRENT_BINARY_DIR}/rundir")
+ 
+diff --git a/cmake/windows/livehime-win.ico b/cmake/windows/livehime-win.ico
+new file mode 100644
+index 0000000000000000000000000000000000000000..2722abf4509616231e7f47a417158b1ee443be3a
+GIT binary patch
+literal 29181
+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
+BZ(jfa
+
+literal 0
+HcmV?d00001
+
+diff --git a/docs/WINDOWS_PORT.md b/docs/WINDOWS_PORT.md
+new file mode 100644
+index 0000000..f600cba
+--- /dev/null
++++ b/docs/WINDOWS_PORT.md
+@@ -0,0 +1,124 @@
++# LiveHime Windows port — what is real and what is not
++
++Status: **compile layer only.** The plugin compiles and links from this tree;
++the Bilibili session core behind it is a stub. Nothing here has been run on
++Windows yet. Read the table below before trusting any part of it.
++
++Source of truth for the macOS side: <https://github.com/greyoak111/livehime-macos>.
++This tree is that project's 53-patch series (`obs-fork/patches/`) applied to
++upstream OBS Studio `32.2.2` (`ba2f32bdf791005443988a4955e963663e16b1ed`), plus
++the compile-only changes listed below.
++
++## 1. Why this is a port and not a recompile
++
++The macOS plugin has three layers:
++
++```
++src/*.cpp           Qt UI            7,577 lines, 40 files   portable
++core/Sources/*.swift session core    6,822 lines, 33 files   Apple-only
++src/window-native.* window behaviour 149 lines (.mm)         Apple-only
++```
++
++`core/` and `window-native` are written against frameworks that do not exist
++on Windows, and there is **no `#if os(...)` / `#if canImport(...)` guard
++anywhere in `core/`** — the code was never meant to build outside Apple
++platforms. Counting the Swift imports:
++
++| Framework | Files | Windows |
++|---|---|---|
++| Foundation, XCTest | 17 files / 2,944 lines | available |
++| WebKit (`WKWebView`) | 5 | no |
++| CryptoKit | 5 | no |
++| Security (Keychain) | 3 | no |
++| AppKit | 3 | no |
++| ImageIO, UniformTypeIdentifiers | 3 | no |
++| AVFoundation | 2 | no |
++| Speech, CoreMedia, CoreImage, Compression | 4 | no |
++
++**16 files / 3,878 lines import at least one Apple-only framework.** The other
++17 files are Foundation-only and can move as they are.
++
++The Qt UI never touches bilibili directly: it calls 35 `livehime_core_*`
++functions declared in `core/include/livehime-core.h` and implemented in
++`CBridge.swift`. Those 35 symbols are what has to exist for the plugin to link.
++
++## 2. What this tree changes (compile layer only)
++
++| Path | Change |
++|---|---|
++| `plugins/livehime/CMakeLists.txt` | Was Darwin-only: listed 21 `.swift` files, `window-native.mm` and five `.framework`s unconditionally, so `cmake` failed on Windows. Now selects `core/` and the window layer per platform. |
++| `plugins/livehime/src/window-native.cpp` | New. Windows implementation of the five functions in `window-native.hpp` (topmost level, `SetWindowDisplayAffinity` for capture exclusion, HWND as the window id, the capture-exception proc). Each function documents how it differs from the Objective-C++ version. |
++| `plugins/livehime/core/win/livehime-core-stub.cpp` | New. All 35 `livehime_core_*` entry points, reporting `"unsupported"`/`"failed"`. It exists so the UI links and loads; it implements nothing. |
++| `build-aux/livehime-win/build-win.ps1` | New. Windows counterpart of `build-macos.sh`; drives upstream's `windows-<target>` preset and winget dependency step, and passes the LiveHime branding below. |
++
++### Branding, icon and config isolation
++
++The Windows counterpart of what patch `0001` does for the macOS bundle, using
++the same shape: cache variables with upstream-keeping defaults, overridden at
++configure time.
++
++| Path | Change |
++|---|---|
++| `cmake/windows/defaults.cmake` | New `LIVEHIME_APP_NAME`, `LIVEHIME_APP_DISPLAY_NAME`, `LIVEHIME_COMPANY_NAME`, `LIVEHIME_APP_ICON`, `OBS_USER_CONFIG_SUBDIR` cache variables. Defaults reproduce upstream OBS exactly. |
++| `frontend/cmake/windows/obs.rc.in` | Version resource strings now come from those variables instead of hardcoded `OBS` / `OBS Studio`; the icon path too. |
++| `cmake/windows/livehime-win.ico` | New. Rendered from `build-aux/livehime/icon/livehime-appicon.svg` (the same master the macOS icon comes from) at 16/32/48/64/128/256, PNG-compressed. |
++| `libobs/cmake/os-windows.cmake` | Adds the `OBS_USER_CONFIG_SUBDIR` compile definition to `util/platform-windows.c`, as `os-macos.cmake` does for `platform-cocoa.m`. |
++| `libobs/util/platform-windows.c` | New `user_config_subdir()`: per-user paths (`CSIDL_APPDATA`) gain the subdirectory, `%PROGRAMDATA%` paths are untouched. Mirrors `user_config_root()` in `platform-cocoa.m`. |
++
++Resulting layout, identical in shape to the macOS build's
++`~/Library/Application Support/LiveHime/obs-studio/…`:
++
++```
++%APPDATA%\LiveHime\obs-studio\basic|logs|plugin_config|global.ini …
++%APPDATA%\obs-studio\…                    ← a separately installed OBS Studio
++```
++
++**Deliberately not changed:**
++
++- **The executable name stays `obs64.exe`.** Renaming it would break plugin
++  search paths, the crash handler, portable mode and every shortcut. The macOS
++  build renames its executable, but the Windows surface is wider. The product
++  *identity* (version resource, icon, config root, window title) is LiveHime;
++  the process name is not, yet.
++- **The installer and code signing.** OBS's CPack/NSIS setup is untouched.
++- **Artwork padding.** The `.ico` keeps the macOS master's Apple-grid padding
++  (the tile is 824 of 1024 units). Windows icons usually fill more of the
++  frame, so this may want a Windows-specific crop later.
++
++## 3. What is left, in order
++
++1. **Build it on Windows.** Nothing below is verified until this works.
++   Needs Visual Studio 2026, CMake 3.28+, PowerShell 7.2+; the script installs
++   the rest with winget. Expect configure/build fixes in `window-native.cpp`
++   and the CMake branch — this is the first time either is compiled.
++2. **Port the Foundation-only core** (17 files / 2,944 lines):
++   `SessionCoordinator`, `QRLogin`, `ApiProbe`, `Diagnostics`, `LiveRoomActions`,
++   `CBridge`. They are the session state machine and the room actions, and they
++   need only an HTTP client, JSON and a credential store interface.
++3. **Replace the Apple-only APIs** (16 files / 3,878 lines):
++
++   | macOS | Windows |
++   |---|---|
++   | `WKWebView` (login, face verification, cover manager) | WebView2 |
++   | Keychain (`CredentialStore`, `SessionMaintenance`) | Credential Manager (`wincred`) |
++   | `CryptoKit` (signing, digests) | BCrypt / CNG |
++   | `AVFoundation` + `Speech` (captions) | WASAPI + Windows speech, or Whisper |
++   | `ImageIO` / `UniformTypeIdentifiers` / `CoreImage` (emoticons, QR) | WIC / stb_image |
++   | `Compression` (danmaku protocol) | zlib |
++
++4. **Packaging**: an installer (OBS's CPack/NSIS setup is untouched) and code
++   signing. Optionally a Windows-specific icon crop.
++5. **Release automation**: a GitHub Actions `windows-latest` job mirroring the
++   macOS release flow (prebuilt OBS, versioned archive, dependency inventory).
++
++## 4. Rebuilding this tree from scratch
++
++```sh
++git clone --depth 1 --branch 32.2.2 https://github.com/obsproject/obs-studio.git
++cd obs-studio
++git checkout -b livehime/main ba2f32bdf791005443988a4955e963663e16b1ed
++git am /path/to/livehime-macos/obs-fork/patches/*.patch
++# then apply the four compile-layer changes from section 2
++```
++
++All 53 patches apply cleanly to that commit — verified.
+diff --git a/frontend/cmake/windows/obs.rc.in b/frontend/cmake/windows/obs.rc.in
+index 6115c4e..ee79ed6 100644
+--- a/frontend/cmake/windows/obs.rc.in
++++ b/frontend/cmake/windows/obs.rc.in
+@@ -1,4 +1,4 @@
+-IDI_ICON1 ICON DISCARDABLE "cmake/windows/obs-studio.ico"
++IDI_ICON1 ICON DISCARDABLE "${LIVEHIME_APP_ICON}"
+ 
+ 1 VERSIONINFO
+ FILEVERSION ${OBS_VERSION_MAJOR},${OBS_VERSION_MINOR},${OBS_VERSION_PATCH},0
+@@ -7,12 +7,12 @@ BEGIN
+   BEGIN
+     BLOCK "040904B0"
+     BEGIN
+-      VALUE "CompanyName", "OBS"
+-      VALUE "FileDescription", "OBS Studio"
++      VALUE "CompanyName", "${LIVEHIME_COMPANY_NAME}"
++      VALUE "FileDescription", "${LIVEHIME_APP_DISPLAY_NAME}"
+       VALUE "FileVersion", "${OBS_VERSION_CANONICAL}"
+       VALUE "InternalName", "obs"
+       VALUE "OriginalFilename", "obs"
+-      VALUE "ProductName", "OBS Studio"
++      VALUE "ProductName", "${LIVEHIME_APP_DISPLAY_NAME}"
+       VALUE "ProductVersion", "${OBS_VERSION_CANONICAL}"
+       VALUE "Comments", "Free and open source software for video recording and live streaming"
+       VALUE "LegalCopyright", "${OBS_LEGAL_COPYRIGHT}"
+diff --git a/libobs/cmake/os-windows.cmake b/libobs/cmake/os-windows.cmake
+index 89a985b..9973e6b 100644
+--- a/libobs/cmake/os-windows.cmake
++++ b/libobs/cmake/os-windows.cmake
+@@ -67,6 +67,14 @@ set_source_files_properties(
+   PROPERTIES COMPILE_DEFINITIONS OBS_VERSION="${OBS_VERSION_CANONICAL}"
+ )
+ 
++# LiveHime: builds that set OBS_USER_CONFIG_SUBDIR keep all per-user state in
++# their own directory under %APPDATA% so they never share scenes, profiles or
++# plugin settings with a separately installed OBS Studio. Mirrors
++# libobs/cmake/os-macos.cmake. System-wide (%PROGRAMDATA%) paths are unchanged.
++if(OBS_USER_CONFIG_SUBDIR)
++  set_property(SOURCE util/platform-windows.c APPEND PROPERTY COMPILE_DEFINITIONS "OBS_USER_CONFIG_SUBDIR=\"${OBS_USER_CONFIG_SUBDIR}\"")
++endif()
++
+ target_link_libraries(
+   libobs
+   PRIVATE Avrt Dwmapi Dxgi winmm Rpcrt4 OBS::obfuscate OBS::winhandle OBS::COMutils
+diff --git a/libobs/util/platform-windows.c b/libobs/util/platform-windows.c
+index df4efb7..378cd2d 100644
+--- a/libobs/util/platform-windows.c
++++ b/libobs/util/platform-windows.c
+@@ -395,14 +395,41 @@ uint64_t os_gettime_ns(void)
+ 	return util_mul_div64(current_time.QuadPart, 1000000000, get_clockfreq());
+ }
+ 
++/* LiveHime: builds that set OBS_USER_CONFIG_SUBDIR keep all per-user state in
++ * their own directory so they never share scenes, profiles or plugin settings
++ * with a separately installed OBS Studio. System-wide (%PROGRAMDATA%) paths are
++ * unchanged. Mirrors user_config_root() in libobs/util/platform-cocoa.m.
++ *
++ * Returns the subdirectory to insert under the folder for per-user paths, or
++ * NULL to use the folder as-is. */
++static const char *user_config_subdir(int folder)
++{
++#ifdef OBS_USER_CONFIG_SUBDIR
++	if (folder == CSIDL_APPDATA && OBS_USER_CONFIG_SUBDIR[0] != '\0')
++		return OBS_USER_CONFIG_SUBDIR;
++#else
++	(void)folder;
++#endif
++	return NULL;
++}
++
+ /* returns [folder]\[name] on windows */
+ static int os_get_path_internal(char *dst, size_t size, const char *name, int folder)
+ {
+ 	wchar_t path_utf16[MAX_PATH];
++	const char *subdir;
+ 
+ 	SHGetFolderPathW(NULL, folder, NULL, SHGFP_TYPE_CURRENT, path_utf16);
+ 
+ 	if (os_wcs_to_utf8(path_utf16, 0, dst, size) != 0) {
++		subdir = user_config_subdir(folder);
++		if (subdir) {
++			if (strcat_s(dst, size, "\\") != 0)
++				return -1;
++			if (strcat_s(dst, size, subdir) != 0)
++				return -1;
++		}
++
+ 		if (!name || !*name) {
+ 			return (int)strlen(dst);
+ 		}
+@@ -422,13 +449,23 @@ static char *os_get_path_ptr_internal(const char *name, int folder)
+ 	char *ptr;
+ 	wchar_t path_utf16[MAX_PATH];
+ 	struct dstr path;
++	const char *subdir;
+ 
+ 	SHGetFolderPathW(NULL, folder, NULL, SHGFP_TYPE_CURRENT, path_utf16);
+ 
+ 	os_wcs_to_utf8_ptr(path_utf16, 0, &ptr);
+ 	dstr_init_move_array(&path, ptr);
+-	dstr_cat(&path, "\\");
+-	dstr_cat(&path, name);
++
++	subdir = user_config_subdir(folder);
++	if (subdir) {
++		dstr_cat(&path, "\\");
++		dstr_cat(&path, subdir);
++	}
++
++	if (name && *name) {
++		dstr_cat(&path, "\\");
++		dstr_cat(&path, name);
++	}
+ 	return path.array;
+ }
+ 
+diff --git a/plugins/livehime/CMakeLists.txt b/plugins/livehime/CMakeLists.txt
+index f03bb06..048419d 100644
+--- a/plugins/livehime/CMakeLists.txt
++++ b/plugins/livehime/CMakeLists.txt
+@@ -2,12 +2,78 @@ cmake_minimum_required(VERSION 3.28...3.30)
+ 
+ find_package(Qt6 REQUIRED Widgets)
+ 
+-add_library(livehime MODULE)
+-add_library(OBS::livehime ALIAS livehime)
++# ---------------------------------------------------------------------------
++# LiveHime plugin
++#
++# The plugin is split into three layers:
++#
++#   src/*.cpp          Qt UI (portable)
++#   core/              session/business core (implements the C bridge)
++#   src/window-native  per-OS window behaviour
++#
++# Upstream (livehime-macos) implements `core/` in Swift and `window-native` in
++# Objective-C++, and hard-codes AppKit/AVFoundation/CoreImage/Security/WebKit.
++# That links on macOS only, so this file selects the core and the window layer
++# per platform instead of assuming Darwin.
++#
++#   macOS    core = Swift (core/Sources/LiveHimeCore), window-native.mm
++#   Windows  core = core/win/livehime-core-stub.cpp,  window-native.cpp
++#
++# The Windows core is a stub: it implements the whole livehime-core.h C ABI so
++# the plugin compiles, links and loads, and reports "unsupported" to the UI.
++# Porting the real core is tracked in docs/WINDOWS_PORT.md.
++# ---------------------------------------------------------------------------
+ 
+-target_sources(
+-  livehime
+-  PRIVATE
++# Portable sources: identical on every platform.
++set(LIVEHIME_PORTABLE_SOURCES
++  src/account-panel.cpp
++  src/account-panel.hpp
++  src/automation.cpp
++  src/automation.hpp
++  src/canvas-box.cpp
++  src/canvas-box.hpp
++  src/caption-controller.cpp
++  src/caption-controller.hpp
++  src/caption-recorder.cpp
++  src/caption-recorder.hpp
++  src/probe-dialog.cpp
++  src/probe-dialog.hpp
++  src/update-page.cpp
++  src/update-page.hpp
++  src/caption-overlay.cpp
++  src/caption-overlay.hpp
++  src/captions-page.cpp
++  src/captions-page.hpp
++  src/danmaku-feed.cpp
++  src/danmaku-feed.hpp
++  src/danmaku-overlay.cpp
++  src/danmaku-overlay.hpp
++  src/emoji-picker.cpp
++  src/emoji-picker.hpp
++  src/emoticon-store.cpp
++  src/emoticon-store.hpp
++  src/feature-panel.cpp
++  src/feature-panel.hpp
++  src/floating-chat.cpp
++  src/floating-chat.hpp
++  src/livehime-dock.cpp
++  src/livehime-dock.hpp
++  src/overlay-frame.cpp
++  src/overlay-frame.hpp
++  src/plugin-main.cpp
++  src/plugin-settings.cpp
++  src/plugin-settings.hpp
++  src/stream-controller.cpp
++  src/stream-controller.hpp
++  src/window-native.hpp
++)
++
++if(APPLE)
++  set(LIVEHIME_PLATFORM_SOURCES src/window-native.mm)
++
++  # The session core is Swift on macOS and also a standalone SwiftPM package
++  # (core/Package.swift) for `swift test`.
++  set(LIVEHIME_CORE_SOURCES
+     core/include/livehime-core.h
+     core/Sources/LiveHimeCore/AppUpdateBridge.swift
+     core/Sources/LiveHimeCore/AppUpdater.swift
+@@ -30,53 +96,21 @@ target_sources(
+     core/Sources/LiveHimeCore/SessionMaintenance.swift
+     core/Sources/LiveHimeCore/WebLoginWindow.swift
+     core/Sources/LiveHimeCore/SessionCoordinator.swift
+-    src/account-panel.cpp
+-    src/account-panel.hpp
+-    src/automation.cpp
+-    src/automation.hpp
+-    src/canvas-box.cpp
+-    src/canvas-box.hpp
+-    src/caption-controller.cpp
+-    src/caption-controller.hpp
+-    src/caption-recorder.cpp
+-    src/caption-recorder.hpp
+-    src/probe-dialog.cpp
+-    src/probe-dialog.hpp
+-    src/update-page.cpp
+-    src/update-page.hpp
+-    src/caption-overlay.cpp
+-    src/caption-overlay.hpp
+-    src/captions-page.cpp
+-    src/captions-page.hpp
+-    src/danmaku-feed.cpp
+-    src/danmaku-feed.hpp
+-    src/danmaku-overlay.cpp
+-    src/danmaku-overlay.hpp
+-    src/emoji-picker.cpp
+-    src/emoji-picker.hpp
+-    src/emoticon-store.cpp
+-    src/emoticon-store.hpp
+-    src/feature-panel.cpp
+-    src/feature-panel.hpp
+-    src/floating-chat.cpp
+-    src/floating-chat.hpp
+-    src/livehime-dock.cpp
+-    src/livehime-dock.hpp
+-    src/overlay-frame.cpp
+-    src/overlay-frame.hpp
+-    src/plugin-main.cpp
+-    src/plugin-settings.cpp
+-    src/plugin-settings.hpp
+-    src/stream-controller.cpp
+-    src/stream-controller.hpp
+-    src/window-native.hpp
+-    src/window-native.mm
+-)
++  )
++elseif(WIN32)
++  set(LIVEHIME_PLATFORM_SOURCES src/window-native.cpp)
++  set(LIVEHIME_CORE_SOURCES
++    core/include/livehime-core.h
++    core/win/livehime-core-stub.cpp
++  )
++else()
++  message(FATAL_ERROR "livehime: unsupported platform (macOS and Windows only)")
++endif()
+ 
+-target_compile_options(
+-  livehime
+-  PRIVATE "$<$<AND:$<PLATFORM_ID:Darwin>,$<COMPILE_LANGUAGE:C,CXX>>:-Wno-quoted-include-in-framework-header>"
+-)
++add_library(livehime MODULE)
++add_library(OBS::livehime ALIAS livehime)
++
++target_sources(livehime PRIVATE ${LIVEHIME_PORTABLE_SOURCES} ${LIVEHIME_PLATFORM_SOURCES} ${LIVEHIME_CORE_SOURCES})
+ 
+ # Header-only vendor API; resolved at runtime through obs-websocket's proc handler.
+ target_include_directories(livehime PRIVATE "${CMAKE_SOURCE_DIR}/plugins/obs-websocket/lib")
+@@ -89,18 +123,32 @@ target_link_libraries(
+     OBS::frontend-api
+     OBS::libobs
+     Qt::Widgets
+-    compression
+-    "$<LINK_LIBRARY:FRAMEWORK,AppKit.framework>"
+-    "$<LINK_LIBRARY:FRAMEWORK,AVFoundation.framework>"
+-    "$<LINK_LIBRARY:FRAMEWORK,CoreImage.framework>"
+-    "$<LINK_LIBRARY:FRAMEWORK,Security.framework>"
+-    "$<LINK_LIBRARY:FRAMEWORK,WebKit.framework>"
+ )
+ 
+-set_target_properties_obs(livehime PROPERTIES FOLDER plugins/livehime PREFIX "" AUTOMOC ON)
+-
+-# The Swift session core (core/) is compiled into the plugin; it is also a
+-# standalone Swift package for `swift test`.
+-set_target_xcode_properties(livehime PROPERTIES SWIFT_VERSION 5.0 SWIFT_MODULE_NAME LiveHimeCore)
++if(APPLE)
++  target_compile_options(
++    livehime
++    PRIVATE "$<$<AND:$<PLATFORM_ID:Darwin>,$<COMPILE_LANGUAGE:C,CXX>>:-Wno-quoted-include-in-framework-header>"
++  )
++  target_link_libraries(
++    livehime
++    PRIVATE
++      compression
++      "$<LINK_LIBRARY:FRAMEWORK,AppKit.framework>"
++      "$<LINK_LIBRARY:FRAMEWORK,AVFoundation.framework>"
++      "$<LINK_LIBRARY:FRAMEWORK,CoreImage.framework>"
++      "$<LINK_LIBRARY:FRAMEWORK,Security.framework>"
++      "$<LINK_LIBRARY:FRAMEWORK,WebKit.framework>"
++  )
++  set_target_xcode_properties(livehime PROPERTIES SWIFT_VERSION 5.0 SWIFT_MODULE_NAME LiveHimeCore)
++  set_source_files_properties(src/window-native.mm PROPERTIES COMPILE_OPTIONS -fobjc-arc)
++elseif(WIN32)
++  target_compile_definitions(livehime PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
++  # user32/dwmapi: window level and capture affinity for the floating chat and
++  # the per-window capture exceptions (the Windows counterpart of NSWindow's
++  # sharingType). crypt32: SHA-256, which the update check needs once the real
++  # core lands.
++  target_link_libraries(livehime PRIVATE user32 dwmapi crypt32)
++endif()
+ 
+-set_source_files_properties(src/window-native.mm PROPERTIES COMPILE_OPTIONS -fobjc-arc)
++set_target_properties_obs(livehime PROPERTIES FOLDER plugins/livehime PREFIX "" AUTOMOC ON)
+diff --git a/plugins/livehime/core/win/livehime-core-stub.cpp b/plugins/livehime/core/win/livehime-core-stub.cpp
+new file mode 100644
+index 0000000..4b16770
+--- /dev/null
++++ b/plugins/livehime/core/win/livehime-core-stub.cpp
+@@ -0,0 +1,286 @@
++/* livehime-core-stub.cpp — Windows build of the LiveHime session core.
++ *
++ * The real core lives in core/Sources/LiveHimeCore/*.swift and is macOS-only:
++ * it imports WebKit, AppKit, Security, CryptoKit, AVFoundation, Speech,
++ * ImageIO, UniformTypeIdentifiers, CoreImage and Compression, with no
++ * `#if os(...)` fallback anywhere (see docs/WINDOWS_PORT.md).
++ *
++ * This file implements the entire livehime-core.h C ABI so the Qt UI compiles,
++ * links and loads on Windows, and so the port can land file by file behind it.
++ *
++ * Contract with the UI: every entry point reports
++ * {"state":"failed","event":...} / {"status":"unsupported"} through the state
++ * callback. Nothing is ever reported as success. The UI already handles these
++ * shapes — it must never show "signed in" or "live" on the strength of a stub.
++ *
++ * Replace function by function as the port proceeds; delete this file when the
++ * last one is gone.
++ */
++
++#include "livehime-core.h"
++
++#include <cstddef>
++#include <cstring>
++
++namespace {
++
++livehime_state_callback g_callback = nullptr;
++void *g_context = nullptr;
++
++/* Sends one JSON object to the UI. Safe with no callback (start not called). */
++void Emit(const char *json)
++{
++	if (g_callback && json)
++		g_callback(json, g_context);
++}
++
++/* The single message every unimplemented entry point reports. `what` names the
++ * entry point so a log or a screenshot says which one is still a stub. */
++void EmitUnsupported(const char *what)
++{
++	char buf[256];
++	std::size_t n = 0;
++	const char *pre = "{\"event\":\"unsupported\",\"status\":\"unsupported\",\"core\":\"stub\",\"what\":\"";
++	for (const char *p = pre; *p && n < sizeof(buf) - 1; ++p)
++		buf[n++] = *p;
++	for (const char *p = what; p && *p && n < sizeof(buf) - 2; ++p) {
++		/* `what` is a literal from this file: no escaping needed. */
++		buf[n++] = *p;
++	}
++	const char *post = "\"}";
++	for (const char *p = post; *p && n < sizeof(buf) - 1; ++p)
++		buf[n++] = *p;
++	buf[n] = '\0';
++	Emit(buf);
++}
++
++} // namespace
++
++extern "C" {
++
++/* ── Session ───────────────────────────────────────────────────────────── */
++
++void livehime_core_start(const char *keychain_service, livehime_state_callback callback, void *context)
++{
++	(void)keychain_service;
++	g_callback = callback;
++	g_context = context;
++	/* The UI waits for a state; report the terminal one rather than hanging. */
++	Emit("{\"state\":\"failed\",\"reason\":\"unsupported\",\"core\":\"stub\","
++	     "\"message\":\"The LiveHime session core is not ported to Windows yet.\"}");
++}
++
++void livehime_core_stop(void)
++{
++	g_callback = nullptr;
++	g_context = nullptr;
++}
++
++void livehime_core_start_qr_login(void) { EmitUnsupported("start_qr_login"); }
++void livehime_core_cancel_qr_login(void) {}
++void livehime_core_retry(void) { EmitUnsupported("retry"); }
++void livehime_core_sign_out(void) { Emit("{\"state\":\"signedOut\",\"core\":\"stub\"}"); }
++void livehime_core_start_web_login(void) { EmitUnsupported("start_web_login"); }
++
++/* ── Live room ─────────────────────────────────────────────────────────── */
++
++void livehime_core_load_areas(void)
++{
++	Emit("{\"event\":\"areas\",\"areas\":[]}");
++	EmitUnsupported("load_areas");
++}
++
++void livehime_core_start_live(long long area_id, long long parent_area_id)
++{
++	(void)area_id;
++	(void)parent_area_id;
++	Emit("{\"event\":\"liveError\",\"kind\":\"notReady\",\"core\":\"stub\","
++	     "\"message\":\"The LiveHime session core is not ported to Windows yet.\"}");
++}
++
++void livehime_core_stop_live(void) { Emit("{\"event\":\"liveStopped\",\"ok\":false,\"core\":\"stub\"}"); }
++
++void livehime_core_open_face_auth(const char *voucher)
++{
++	(void)voucher;
++	EmitUnsupported("open_face_auth");
++}
++
++void livehime_core_open_face_auth_qr(const char *url)
++{
++	(void)url;
++	EmitUnsupported("open_face_auth_qr");
++}
++
++void livehime_core_open_cover_page(void) { EmitUnsupported("open_cover_page"); }
++
++/* ── Live captions ─────────────────────────────────────────────────────── */
++
++int livehime_core_captions_supported(void)
++{
++	/* Reported as unsupported so the Captions tab disables itself instead of
++	 * offering a switch that does nothing. */
++	return 0;
++}
++
++void livehime_core_captions_start(const char *locale)
++{
++	(void)locale;
++	Emit("{\"event\":\"captions\",\"status\":\"unsupported\"}");
++}
++
++void livehime_core_captions_push(const float *samples, int count, double sample_rate)
++{
++	(void)samples;
++	(void)count;
++	(void)sample_rate;
++}
++
++void livehime_core_captions_stop(void) { Emit("{\"event\":\"captions\",\"status\":\"stopped\"}"); }
++
++/* ── Hosted-page test hooks ────────────────────────────────────────────── */
++
++void livehime_core_page_eval(const char *key, const char *script, livehime_page_result_callback done, void *context)
++{
++	(void)key;
++	(void)script;
++	if (done)
++		done("{\"error\":\"unsupported\"}", context);
++}
++
++int livehime_core_page_click(const char *key, double x, double y)
++{
++	(void)key;
++	(void)x;
++	(void)y;
++	return 0; /* no page open */
++}
++
++/* ── App updates ───────────────────────────────────────────────────────── */
++
++void livehime_core_update_check(int beta)
++{
++	(void)beta;
++	Emit("{\"event\":\"update\",\"status\":\"failed\",\"supported\":false,\"core\":\"stub\","
++	     "\"message\":\"Updates are not available in the Windows port yet.\"}");
++}
++
++void livehime_core_update_download(void)
++{
++	Emit("{\"event\":\"update\",\"status\":\"failed\",\"supported\":false,\"core\":\"stub\"}");
++}
++
++int livehime_core_update_install(int relaunch)
++{
++	(void)relaunch;
++	return 0;
++}
++
++int livehime_core_update_rollback(void)
++{
++	return 0;
++}
++
++void livehime_core_update_state(void)
++{
++	Emit("{\"event\":\"update\",\"status\":\"idle\",\"supported\":false,\"core\":\"stub\"}");
++}
++
++/* ── Interface probe ───────────────────────────────────────────────────── */
++
++void livehime_core_probe_run(long long room)
++{
++	(void)room;
++	Emit("{\"event\":\"probe\",\"status\":\"done\",\"passed\":0,\"failed\":0,\"skipped\":0,\"core\":\"stub\"}");
++	EmitUnsupported("probe_run");
++}
++
++/* ── Room activity ─────────────────────────────────────────────────────── */
++
++void livehime_core_send_danmaku(const char *text)
++{
++	(void)text;
++	Emit("{\"event\":\"danmakuSent\",\"ok\":false,\"core\":\"stub\"}");
++}
++
++void livehime_core_send_danmaku_reply(const char *text, long long reply_uid, const char *reply_danmaku_id)
++{
++	(void)text;
++	(void)reply_uid;
++	(void)reply_danmaku_id;
++	Emit("{\"event\":\"danmakuSent\",\"ok\":false,\"core\":\"stub\"}");
++}
++
++void livehime_core_send_emoticon(const char *key, long long reply_uid, const char *reply_danmaku_id)
++{
++	(void)key;
++	(void)reply_uid;
++	(void)reply_danmaku_id;
++	Emit("{\"event\":\"danmakuSent\",\"ok\":false,\"sticker\":true,\"core\":\"stub\"}");
++}
++
++void livehime_core_update_title(const char *title)
++{
++	(void)title;
++	Emit("{\"event\":\"titleUpdated\",\"ok\":false,\"core\":\"stub\"}");
++}
++
++void livehime_core_set_tts(int enabled)
++{
++	(void)enabled;
++}
++
++/* ── Emoticons ─────────────────────────────────────────────────────────── */
++
++void livehime_core_emoticons_load(void)
++{
++	Emit("{\"event\":\"emoticons\",\"ok\":false,\"core\":\"stub\","
++	     "\"message\":\"Emoticons are not ported to Windows yet.\"}");
++}
++
++void livehime_core_emoticon_image(const char *url)
++{
++	(void)url;
++	Emit("{\"event\":\"emoticonImage\",\"path\":\"\",\"core\":\"stub\"}");
++}
++
++/* ── Moderation ────────────────────────────────────────────────────────── */
++
++void livehime_core_mute_user(long long uid, int hours)
++{
++	(void)hours;
++	char buf[128];
++	/* Fixed shape; uid is numeric so no escaping is needed. */
++	std::size_t n = 0;
++	const char *pre = "{\"event\":\"userMuted\",\"ok\":false,\"uid\":";
++	for (const char *p = pre; *p && n < sizeof(buf) - 1; ++p)
++		buf[n++] = *p;
++	char num[32];
++	int i = 0;
++	long long v = uid < 0 ? 0 : uid;
++	do {
++		num[i++] = static_cast<char>('0' + (v % 10));
++		v /= 10;
++	} while (v && i < 30);
++	while (i > 0 && n < sizeof(buf) - 2)
++		buf[n++] = num[--i];
++	const char *post = ",\"core\":\"stub\"}";
++	for (const char *p = post; *p && n < sizeof(buf) - 1; ++p)
++		buf[n++] = *p;
++	buf[n] = '\0';
++	Emit(buf);
++}
++
++void livehime_core_load_shield_keywords(void)
++{
++	Emit("{\"event\":\"shieldKeywords\",\"ok\":false,\"keywords\":[],\"core\":\"stub\"}");
++}
++
++void livehime_core_set_shield_keyword(const char *keyword, int add)
++{
++	(void)keyword;
++	(void)add;
++	Emit("{\"event\":\"shieldKeywords\",\"ok\":false,\"keywords\":[],\"core\":\"stub\"}");
++}
++
++} // extern "C"
+diff --git a/plugins/livehime/src/window-native.cpp b/plugins/livehime/src/window-native.cpp
+new file mode 100644
+index 0000000..bc02d8e
+--- /dev/null
++++ b/plugins/livehime/src/window-native.cpp
+@@ -0,0 +1,180 @@
++/* window-native.cpp — Windows implementation of the window behaviour declared
++ * in window-native.hpp.
++ *
++ * The macOS version (window-native.mm, 149 lines of Objective-C++) maps onto
++ * NSWindow: level, non-activating panels, collection behaviour (all Spaces,
++ * over full-screen apps) and sharingType (whether screen capture may record
++ * the window). Windows has direct counterparts for some of that and none for
++ * others; the differences are called out per function.
++ *
++ * As on macOS, the capture-exception procedure below is per-window and is what
++ * keeps OBS's own "Hide OBS" screen capture from recording the LiveHime UI
++ * while still recording the floating chat, and vice versa.
++ */
++
++#include "window-native.hpp"
++
++#include <QAction>
++#include <QMenu>
++#include <QWidget>
++#include <QtGlobal>
++
++#include <obs.h>
++
++#include <map>
++#include <mutex>
++#include <string>
++
++#ifdef _WIN32
++#define WIN32_LEAN_AND_MEAN
++#define NOMINMAX
++#include <windows.h>
++#endif
++
++namespace {
++
++#ifdef _WIN32
++
++HWND HwndOf(QWidget *window)
++{
++	if (!window)
++		return nullptr;
++	return reinterpret_cast<HWND>(static_cast<quintptr>(window->winId()));
++}
++
++#endif
++
++std::mutex exceptionsMutex;
++std::map<std::string, std::pair<unsigned int, bool>> exceptions; /* key -> (id, visible) */
++
++void exceptionProcedure(void *, calldata_t *cd)
++{
++	std::string visible, hidden;
++	{
++		std::lock_guard<std::mutex> lock(exceptionsMutex);
++		for (const auto &entry : exceptions) {
++			std::string &list = entry.second.second ? visible : hidden;
++			if (!list.empty())
++				list += ",";
++			list += std::to_string(entry.second.first);
++		}
++	}
++	calldata_set_string(cd, "window_ids", visible.c_str());
++	calldata_set_string(cd, "hidden_window_ids", hidden.c_str());
++}
++
++} // namespace
++
++/* `floating`: stay above other apps' windows and over their full-screen
++ * windows. `capturable`: whether screen capture may record this window.
++ *
++ * macOS reaches into NSWindow (level, NSPanel style, collection behaviour,
++ * sharingType). The Windows counterparts:
++ *
++ *   level        SetWindowPos(HWND_TOPMOST / HWND_NOTOPMOST). Unlike the macOS
++ *                level, this survives deactivation on its own, so the
++ *                keepFloatingWhenInactive() observer the macOS file needs has
++ *                no equivalent here.
++ *   all Spaces   No public API. A topmost window is visible over full-screen
++ *                windows on the active virtual desktop; it is not mirrored to
++ *                the other virtual desktops the way macOS does.
++ *   sharingType  SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE), Windows 10
++ *                2004 and later. On older builds the call fails and the window
++ *                stays capturable — logged once, not treated as fatal.
++ */
++void ApplyNativeWindowOptions(QWidget *window, bool floating, bool capturable)
++{
++#ifdef _WIN32
++	HWND hwnd = HwndOf(window);
++	if (!hwnd)
++		return;
++
++	SetWindowPos(hwnd, floating ? HWND_TOPMOST : HWND_NOTOPMOST, 0, 0, 0, 0,
++		     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
++
++	if (!capturable) {
++		if (!SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE)) {
++			/* Typically ERROR_NOT_SUPPORTED on Windows 10 before 2004.
++			 * Report once per call site; the window simply remains
++			 * capturable there. */
++			blog(LOG_WARNING,
++			     "[livehime] SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE) failed (error %lu); "
++			     "this window can still be captured",
++			     static_cast<unsigned long>(GetLastError()));
++		}
++	} else {
++		SetWindowDisplayAffinity(hwnd, WDA_NONE);
++	}
++#else
++	(void)window;
++	(void)floating;
++	(void)capturable;
++#endif
++}
++
++/* Lets `menu` (and its submenus) open over another app's full-screen window,
++ * where the floating chat can sit.
++ *
++ * macOS has to rebuild each popup as a non-activating NSPanel that may join
++ * any Space. On Windows a popup is already a separate top-level window and a
++ * topmost one draws over full-screen windows, so this only raises the popup to
++ * topmost for the time it is shown. The recursion mirrors the macOS version so
++ * submenus get the same treatment.
++ */
++void AllowMenuOverFullScreen(QMenu *menu)
++{
++	if (!menu)
++		return;
++	QObject::connect(menu, &QMenu::aboutToShow, menu, [menu] {
++#ifdef _WIN32
++		HWND hwnd = HwndOf(menu);
++		if (hwnd)
++			SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
++#endif
++		const auto actions = menu->actions();
++		for (QAction *action : actions) {
++			QMenu *sub = QMenu::menuInAction(action);
++			if (sub && !sub->property("livehime.fullScreenMenu").toBool()) {
++				sub->setProperty("livehime.fullScreenMenu", true);
++				AllowMenuOverFullScreen(sub);
++			}
++		}
++	});
++}
++
++/* An opaque per-window id used by the capture exceptions below. On macOS this
++ * is the CGWindowID; here it is the HWND. The return type is 32-bit (the
++ * header is shared with macOS), so the handle is truncated deliberately — it
++ * is only ever compared for equality within a process, never dereferenced. */
++unsigned int NativeWindowNumber(QWidget *window)
++{
++#ifdef _WIN32
++	HWND hwnd = HwndOf(window);
++	return hwnd ? static_cast<unsigned int>(reinterpret_cast<quintptr>(hwnd) & 0xffffffffu) : 0;
++#else
++	(void)window;
++	return 0;
++#endif
++}
++
++/* Registers the global procedure OBS's screen capture calls to learn which
++ * windows to keep or drop. Same name and signature as the macOS build, so the
++ * rest of the plugin (and any capture source that already speaks it) works
++ * unchanged. */
++void RegisterCaptureExceptionProcedure()
++{
++	proc_handler_add(obs_get_proc_handler(),
++			 "void hide_obs_window_exceptions(out string window_ids, out string hidden_window_ids)",
++			 exceptionProcedure, nullptr);
++}
++
++void SetCaptureException(const char *key, unsigned int id, bool visible)
++{
++	if (!key)
++		return;
++	std::lock_guard<std::mutex> lock(exceptionsMutex);
++	if (id)
++		exceptions[key] = {id, visible};
++	else
++		exceptions.erase(key);
++}
+-- 
+2.54.0 (Apple Git-157)
+
