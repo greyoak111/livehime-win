@@ -3,13 +3,14 @@
 Unofficial third-party [LiveHime] client for Windows, built as an OBS Studio
 plugin. Ported from **[livehime-macos]**, which does the same for macOS.
 
-> **Status: working, and verified on Windows.** The Qt UI, the OBS integration
-> and the session core behind them are all real. Signing in with a Bilibili
-> account, loading the room, receiving danmaku and the emoticon pipeline were
-> each exercised against the live service on a Windows 11 ARM64 VM; going live,
-> stopping, sending a danmaku and editing the title build correct requests and
-> are verified as far as they can be without writing to an account.
-> **[docs/WINDOWS_PORT.md](docs/WINDOWS_PORT.md)** is the port map.
+> **Status: working, and verified on Windows — including going live.** The Qt
+> UI, the OBS integration and the session core behind them are all real. Signing
+> in with a Bilibili account, loading the room, receiving danmaku, the emoticon
+> pipeline and the updater were each exercised against the live service on a
+> Windows 11 ARM64 VM, and the account owner then took it end to end on their
+> own channel — going live, sending danmaku and ending the live, with the events
+> to match in the log. What is deliberately *not* done is listed in
+> **[docs/WINDOWS_PORT.md](docs/WINDOWS_PORT.md)**, the port map.
 
 Learning and community exchange only. Not affiliated with Bilibili or the OBS
 Project. No commercial use.
@@ -26,7 +27,7 @@ dock, and the domain knowledge in its Swift session core.
 ```
 # in this repository
 obs-fork/patches/            the macOS project's 53 patches, unchanged
-obs-fork/patches-windows/    the Windows port, 19 patches on top of them
+obs-fork/patches-windows/    the Windows port, 20 patches on top of them
 build-aux/livehime-win/
   build-win.ps1              the Windows build (a mirror — the series is authoritative)
   rebuild-and-package.ps1    clone, patch, build, installer
@@ -94,8 +95,8 @@ git am ../livehime-win/obs-fork/patches/*.patch
 git am ../livehime-win/obs-fork/patches-windows/*.patch
 ```
 
-All 53 macOS patches apply cleanly to that commit and all 19 Windows patches
-apply cleanly on top of them — 72 commits, no fuzz and no rejects.
+All 53 macOS patches apply cleanly to that commit and all 20 Windows patches
+apply cleanly on top of them — 73 commits, no fuzz and no rejects.
 
 `build-aux/livehime-win/verify-patches.sh` does exactly this in a scratch
 directory and then checks the result rather than trusting it: the C ABI's 35
@@ -104,9 +105,14 @@ core rather than the historical stub, the four specification documents are
 present, and the WebView2 SDK is correctly absent. It needs no network if you
 point `OBS_MIRROR` at a local obs-studio clone.
 
+Patches 0019 and 0020 post-date the v0.2.10 build — one corrects comments that
+still described the pre-port tree, the other is `docs/WINDOWS_PORT.md`. Neither
+touches a translation unit, so the released binaries correspond to the first 18
+Windows patches.
+
 One commit of the original working tree is **deliberately not in the series**:
 `Vendor the WebView2 SDK`, whose only content was those 21 MB of vendored
-binaries. Leaving it out keeps the series 992 KB of readable text and lets
+binaries. Leaving it out keeps the series 1008 KB of readable text and lets
 `build-win.ps1` fetch the same NuGet package on the first build instead. It is
 the **only** difference between the rebuilt tree and the tree the release was
 built from — 6 files, every one of them that SDK.

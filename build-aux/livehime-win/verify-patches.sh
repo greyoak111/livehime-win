@@ -26,7 +26,7 @@ set -eu
 BASE=ba2f32bdf791005443988a4955e963663e16b1ed
 UPSTREAM=https://github.com/obsproject/obs-studio.git
 EXPECT_MAC=53
-EXPECT_WIN=19
+EXPECT_WIN=20
 EXPECT_ENTRY_POINTS=35
 
 here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)

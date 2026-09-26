@@ -1,0 +1,284 @@
+From dea7d3cb6e89a73c7cf527582d54f24d1dfd87af Mon Sep 17 00:00:00 2001
+From: DeepSeek Harness <noreply@deepseek.com>
+Date: Sat, 26 Sep 2026 22:35:17 +0800
+Subject: [PATCH] Make docs/WINDOWS_PORT.md describe the port instead of the
+ plan for it
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The document the README calls the port map was written before any of the port
+existed and was never updated. It opened with "Status: compile layer only ...
+the Bilibili session core behind it is a stub. Nothing here has been run on
+Windows yet", listed livehime-core-stub.cpp as the Windows core, and its "what
+is left, in order" section still asked for the Windows build, the core port, the
+framework replacements, packaging and release automation — every one of which
+shipped. A reader following the README to the port map was told nothing worked.
+
+It now describes the port: the three layers and the C ABI seam between them, the
+framework-for-framework table with the file each replacement lives in, what was
+verified and against what, the seven things that are deliberately not done, and
+the branding and config-isolation sections, which were already accurate and are
+kept.
+
+The verification section names the log events rather than asserting success, and
+says plainly which of them rest on the account owner's word rather than on a log
+line: the account owner took it end to end on 2026-09-26 — sign-in, danmaku,
+going live, sending two danmaku and ending the live all appear in the log as
+account state -> ready, danmaku status -> connected, stream state -> Starting ->
+Live, live event -> danmakuSent and stream state -> Stopping -> liveStopped ->
+Idle — while editing the title is confirmed by them but emits no titleUpdated in
+that log.
+
+Documentation only; no translation unit changes, so the released v0.2.10
+binaries are unaffected.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ docs/WINDOWS_PORT.md | 189 ++++++++++++++++++++++++++++++-------------
+ 1 file changed, 135 insertions(+), 54 deletions(-)
+
+diff --git a/docs/WINDOWS_PORT.md b/docs/WINDOWS_PORT.md
+index f600cba..62b59db 100644
+--- a/docs/WINDOWS_PORT.md
++++ b/docs/WINDOWS_PORT.md
+@@ -1,13 +1,15 @@
+-# LiveHime Windows port — what is real and what is not
++# LiveHime Windows port — the port map
+ 
+-Status: **compile layer only.** The plugin compiles and links from this tree;
+-the Bilibili session core behind it is a stub. Nothing here has been run on
+-Windows yet. Read the table below before trusting any part of it.
++Status: **working, and verified on Windows.** The Qt UI, the OBS integration and
++the session core behind them are all real, and the account owner has taken it
++end to end on a real Bilibili account. Sections 3 and 4 are the honest split:
++what is real, and what deliberately is not.
+ 
+ Source of truth for the macOS side: <https://github.com/greyoak111/livehime-macos>.
+ This tree is that project's 53-patch series (`obs-fork/patches/`) applied to
+ upstream OBS Studio `32.2.2` (`ba2f32bdf791005443988a4955e963663e16b1ed`), plus
+-the compile-only changes listed below.
++this port's 20 patches (`obs-fork/patches-windows/`). Apply order and a script
++that checks the result: section 7.
+ 
+ ## 1. Why this is a port and not a recompile
+ 
+@@ -19,10 +21,10 @@ core/Sources/*.swift session core    6,822 lines, 33 files   Apple-only
+ src/window-native.* window behaviour 149 lines (.mm)         Apple-only
+ ```
+ 
+-`core/` and `window-native` are written against frameworks that do not exist
+-on Windows, and there is **no `#if os(...)` / `#if canImport(...)` guard
+-anywhere in `core/`** — the code was never meant to build outside Apple
+-platforms. Counting the Swift imports:
++`core/` and `window-native` are written against frameworks that do not exist on
++Windows, and there is **no `#if os(...)` / `#if canImport(...)` guard anywhere in
++`core/`** — the code was never meant to build outside Apple platforms. Counting
++the Swift imports:
+ 
+ | Framework | Files | Windows |
+ |---|---|---|
+@@ -35,23 +37,85 @@ platforms. Counting the Swift imports:
+ | AVFoundation | 2 | no |
+ | Speech, CoreMedia, CoreImage, Compression | 4 | no |
+ 
+-**16 files / 3,878 lines import at least one Apple-only framework.** The other
+-17 files are Foundation-only and can move as they are.
++**16 files / 3,878 lines import at least one Apple-only framework.**
+ 
+ The Qt UI never touches bilibili directly: it calls 35 `livehime_core_*`
+-functions declared in `core/include/livehime-core.h` and implemented in
+-`CBridge.swift`. Those 35 symbols are what has to exist for the plugin to link.
++functions declared in `core/include/livehime-core.h`. Those 35 symbols are the
++seam the whole port hangs off, and keeping them unchanged is why the UI needed
++no work.
+ 
+-## 2. What this tree changes (compile layer only)
++## 2. What implements the seam
+ 
+-| Path | Change |
++| | macOS | Windows |
++|---|---|---|
++| session core | `core/Sources/LiveHimeCore/*.swift` (Swift) | `core/win/**` (C++, 33 files / ~14,400 lines) |
++| window behaviour | `src/window-native.mm` | `src/window-native.cpp` |
++| selected in | `plugins/livehime/CMakeLists.txt`, per platform | same file |
++
++The C++ side is a port of the Swift's **behaviour**, not of its structure. Where
++the Swift does something odd — a signature whose field order is load-bearing, a
++notice that stays `failed` rather than returning to `signedOut` — the C++ does
++the same thing and the comment says why. The frozen interfaces, with `file:line`
++cites into the Swift, are in `docs/port-spec/`.
++
++`core/win/livehime-core-stub.cpp` is the first Windows build's core: all 35 entry
++points reporting `"unsupported"`. It is **not built** and is kept only as the
++record of the state the port landed behind, file by file.
++
++## 3. What is real
++
++Every Apple framework the Swift imports has a Windows counterpart, and each one
++is exercised:
++
++| macOS | Windows | Where |
++|---|---|---|
++| `URLSession` | WinHTTP | `core/win/net/http.cpp` |
++| `URLSession.webSocketTask` | WinHTTP WebSocket | `core/win/live/danmaku.cpp` |
++| `CryptoKit` | BCrypt | `core/win/net/crypto.cpp` |
++| `Security` (Keychain) | Credential Manager, DPAPI file fallback | `core/win/auth/credentials.cpp` |
++| `ImageIO` | WIC | `core/win/core/qr/`, emoticon re-encode |
++| `WKWebView` | WebView2 | `core/win/web/webview.cpp` |
++| `CIQRCodeGenerator` | qrcodegen (MIT) + zlib PNG | `core/win/core/qr/` |
++| `DispatchQueue.main` | message-only window | `core/win/platform/dispatch.cpp` |
++| `Compression` (zlib) | zlib | `core/win/live/danmaku.cpp` |
++
++Verified against the live service, not against a mock:
++
++| | Evidence |
++|---|---|
++| QR sign-in | `account state -> qrCode → verifying → ready` |
++| Room load, areas | room event; 450 areas |
++| Danmaku receive | `danmaku status -> connecting → connected`; 101 room events in 34 s in a busy room |
++| Emoticons | 225 images re-encoded through WIC, every one a valid ≤160 px PNG |
++| WBI signing | `getDanmuInfo` answers `code=0` |
++| **Go live / stop live** | `stream state -> Starting → Live`, then `stream state -> Stopping → liveStopped → Idle` |
++| **Send danmaku** | `live event -> danmakuSent` |
++| Updater | `update -> checking → upToDate` against the published release |
++| WebView2 runtime | Evergreen present and probed at startup |
++
++Go live, stop live and sending danmaku were exercised by the **account owner**
++on their own channel on 2026-09-26; editing the title is confirmed by them, but
++note that `titleUpdated` is emitted by `livehime_core_update_title`
++(`core/win/livehime-core.cpp`) and does not appear in the log of that session,
++so that one row rests on the owner's word rather than on a log line.
++
++The Windows core also carries a self-test that runs the real network path at
++startup (`LIVEHIME_SELFTEST=1`), including the parts that cannot be checked by
++clicking: the WBI signature, the danmaku handshake and the credential store.
++
++## 4. What is not
++
++| Item | State |
+ |---|---|
+-| `plugins/livehime/CMakeLists.txt` | Was Darwin-only: listed 21 `.swift` files, `window-native.mm` and five `.framework`s unconditionally, so `cmake` failed on Windows. Now selects `core/` and the window layer per platform. |
+-| `plugins/livehime/src/window-native.cpp` | New. Windows implementation of the five functions in `window-native.hpp` (topmost level, `SetWindowDisplayAffinity` for capture exclusion, HWND as the window id, the capture-exception proc). Each function documents how it differs from the Objective-C++ version. |
+-| `plugins/livehime/core/win/livehime-core-stub.cpp` | New. All 35 `livehime_core_*` entry points, reporting `"unsupported"`/`"failed"`. It exists so the UI links and loads; it implements nothing. |
+-| `build-aux/livehime-win/build-win.ps1` | New. Windows counterpart of `build-macos.sh`; drives upstream's `windows-<target>` preset and winget dependency step, and passes the LiveHime branding below. |
++| Session maintenance | Not implemented: no 12-hour refresh, and signing out does not revoke the session server-side |
++| Publisher verification | The updater checks SHA-256 and the version resource, not Authenticode. **Nothing is faked** |
++| Danmaku `protover=3` | Needs brotli, which neither Windows nor obs-deps ships; the client negotiates `protover=2` (zlib) and fails loudly by name if a room insists on 3 |
++| `open_face_auth_qr` | The Swift version shows a native window, not a web page — the missing piece is not WebView2 |
++| Emoticon cache trim | `Emoticons.swift`'s 30 MB → 20 MB sweep is not ported, so the cache grows unbounded |
++| Live captions | Graceful degradation by design: on-device captions need macOS 26+ APIs with no Windows equivalent here. `set_tts` accepts the flag and speech output is not wired |
++| ATL | Not installed on the build VM, so `frontend-tools`, `obs-qsv11` and the virtual-camera module do not build there. The LiveHime plugin itself does not need it |
+ 
+-### Branding, icon and config isolation
++## 5. Branding, icon and config isolation
+ 
+ The Windows counterpart of what patch `0001` does for the macOS bundle, using
+ the same shape: cache variables with upstream-keeping defaults, overridden at
+@@ -73,52 +137,69 @@ Resulting layout, identical in shape to the macOS build's
+ %APPDATA%\obs-studio\…                    ← a separately installed OBS Studio
+ ```
+ 
+-**Deliberately not changed:**
++The in-app updater points at this project's GitHub releases
++(`greyoak111/livehime-win`); the macOS build keeps pointing at its own.
++
++### Deliberately not changed
+ 
+ - **The executable name stays `obs64.exe`.** Renaming it would break plugin
+   search paths, the crash handler, portable mode and every shortcut. The macOS
+   build renames its executable, but the Windows surface is wider. The product
+   *identity* (version resource, icon, config root, window title) is LiveHime;
+-  the process name is not, yet.
+-- **The installer and code signing.** OBS's CPack/NSIS setup is untouched.
++  the process name is not.
++- **OBS's CPack/NSIS setup.** The Windows installer is built from Inno Setup
++  instead; see `build-aux/livehime-win/`.
+ - **Artwork padding.** The `.ico` keeps the macOS master's Apple-grid padding
+   (the tile is 824 of 1024 units). Windows icons usually fill more of the
+   frame, so this may want a Windows-specific crop later.
++- **Code signing.** The installer and the binaries are unsigned, and the updater
++  does not pretend otherwise.
++
++## 6. Building
++
++```powershell
++# the source tree needs its submodules, once
++git submodule update --init --recursive --depth 1
++
++# x64, RelWithDebInfo
++./build-aux/livehime-win/build-win.ps1
++
++# arm64
++./build-aux/livehime-win/build-win.ps1 -Target arm64
++
++# skip the winget step when the toolchain is already installed
++./build-aux/livehime-win/build-win.ps1 -SkipDependencies
++```
++
++Requires Windows, Visual Studio 2022 or newer, CMake 3.28+ and PowerShell 7.2+.
++The WebView2 SDK is deliberately **not** in the patch series — its header alone
++is 69k lines and its two static loaders are 21 MB — so the script fetches the
++NuGet package into `plugins/livehime/core/win/web/sdk/` on the first build and
++skips it afterwards. The Evergreen Runtime it needs at run time is a machine
++component, present on any current Windows.
+ 
+-## 3. What is left, in order
+-
+-1. **Build it on Windows.** Nothing below is verified until this works.
+-   Needs Visual Studio 2026, CMake 3.28+, PowerShell 7.2+; the script installs
+-   the rest with winget. Expect configure/build fixes in `window-native.cpp`
+-   and the CMake branch — this is the first time either is compiled.
+-2. **Port the Foundation-only core** (17 files / 2,944 lines):
+-   `SessionCoordinator`, `QRLogin`, `ApiProbe`, `Diagnostics`, `LiveRoomActions`,
+-   `CBridge`. They are the session state machine and the room actions, and they
+-   need only an HTTP client, JSON and a credential store interface.
+-3. **Replace the Apple-only APIs** (16 files / 3,878 lines):
+-
+-   | macOS | Windows |
+-   |---|---|
+-   | `WKWebView` (login, face verification, cover manager) | WebView2 |
+-   | Keychain (`CredentialStore`, `SessionMaintenance`) | Credential Manager (`wincred`) |
+-   | `CryptoKit` (signing, digests) | BCrypt / CNG |
+-   | `AVFoundation` + `Speech` (captions) | WASAPI + Windows speech, or Whisper |
+-   | `ImageIO` / `UniformTypeIdentifiers` / `CoreImage` (emoticons, QR) | WIC / stb_image |
+-   | `Compression` (danmaku protocol) | zlib |
+-
+-4. **Packaging**: an installer (OBS's CPack/NSIS setup is untouched) and code
+-   signing. Optionally a Windows-specific icon crop.
+-5. **Release automation**: a GitHub Actions `windows-latest` job mirroring the
+-   macOS release flow (prebuilt OBS, versioned archive, dependency inventory).
+-
+-## 4. Rebuilding this tree from scratch
++## 7. Rebuilding this tree from scratch
+ 
+ ```sh
+-git clone --depth 1 --branch 32.2.2 https://github.com/obsproject/obs-studio.git
++git clone https://github.com/obsproject/obs-studio.git obs-studio
+ cd obs-studio
+ git checkout -b livehime/main ba2f32bdf791005443988a4955e963663e16b1ed
+-git am /path/to/livehime-macos/obs-fork/patches/*.patch
+-# then apply the four compile-layer changes from section 2
++git am /path/to/livehime-win/obs-fork/patches/*.patch
++git am /path/to/livehime-win/obs-fork/patches-windows/*.patch
+ ```
+ 
+-All 53 patches apply cleanly to that commit — verified.
++All 53 macOS patches apply cleanly to that commit and all 20 Windows patches
++apply cleanly on top of them — 73 commits, no fuzz and no rejects. Verified, and
++re-verifiable: `build-aux/livehime-win/verify-patches.sh` does exactly this in a
++scratch directory and then checks the result, including that all 35 entry points
++are implemented and that the WebView2 SDK is correctly absent.
++
++Patches `0019` and `0020` post-date the v0.2.10 build: `0019` corrects two
++comments that still described the pre-port tree, and `0020` is this document.
++Neither touches a translation unit, so the released binaries correspond to the
++first 18 Windows patches.
++
++One commit of the original working tree is deliberately **not** in the series:
++`Vendor the WebView2 SDK`, whose only content was those 21 MB of binaries. It is
++the only difference between the rebuilt tree and the tree the release was built
++from — 6 files, every one of them that SDK.
+-- 
+2.54.0 (Apple Git-157)
+

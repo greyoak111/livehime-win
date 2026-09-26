@@ -15,7 +15,7 @@ verified, and — the part worth reading — **where I got it wrong.**
 
 | | |
 |---|---|
-| 补丁 | 19 个（在 macOS 的 53 个之上），992 KB |
+| 补丁 | 20 个（在 macOS 的 53 个之上），1008 KB |
 | `livehime.dll` | 4,384,256 字节（桩版 1,053,184） |
 | 首次发布 | [v0.2.10](https://github.com/greyoak111/livehime-win/releases/tag/v0.2.10)：安装包 35,166,782 B（33.5 MB），绿色包 51,172,978 B（48.8 MB） |
 | 验证环境 | Windows 11 ARM64 / Parallels，x64 构建在模拟下运行 |
@@ -37,6 +37,18 @@ verified, and — the part worth reading — **where I got it wrong.**
 34 秒 101 个事件）· 分区列表 450 个 · 表情 225 张全部重编码为 ≤160px PNG ·
 WBI 签名被 B 站接受（`getDanmuInfo` 回 `code=0`）· 更新器找到刚发布的 release 并答
 `upToDate`。
+
+**写操作也跑通了** —— 2026-09-26 由账号本人在自己的直播间全程走了一遍：
+
+| 动作 | 日志证据 |
+|---|---|
+| 开播 | `stream state -> Starting → Live` |
+| 发弹幕 | `live event -> danmakuSent`（两次） |
+| 停播 | `stream state -> Stopping → liveStopped → Idle` |
+| 改标题 | 本人确认可用。`titleUpdated` 由 `livehime_core_update_title`（`core/win/livehime-core.cpp:1147`）发出，但那次的日志里没有这条事件 —— 这一行的证据是本人确认，不是日志 |
+
+在此之前，这几个写操作只验到请求构造（未登录时 `missingCSRF` 短路、
+`FetchUpstream` 回 `-101` 而非 `-403`）—— 因为开播会真的上播，只能由账号本人按下。
 
 ---
 
@@ -218,7 +230,6 @@ WebView2 的静态库 10.7 MB × 2 一开始被我 commit 进树里。后来意�
 
 | 项 | 状态 |
 |---|---|
-| 开播 / 停播 / 发弹幕 / 改标题 | 请求构造已验（未登录时 `missingCSRF` 短路、`FetchUpstream` 回 `-101` 而非 `-403`），**成功路径未跑** —— 全是写操作，其中开播会真的上播，需要账号本人按下 |
 | 会话维护 | 未实现：没有 12 小时 refresh，登出不会服务端撤销 |
 | 发布者验证 | 更新器只校验 SHA-256 + 版本资源，没有 Authenticode。**没有伪造** |
 | 弹幕 `protover=3` | 需要 brotli，Windows 和 obs-deps 都没有。当前用 `protover=2`（zlib） |
@@ -281,16 +292,16 @@ Windows 分支编的是 C++ 核心还是那个历史桩、四份规格文档在�
 |---|---|
 | 检出基座 `ba2f32b` | 上游 OBS 32.2.2 |
 | `git am obs-fork/patches/*.patch` | 53 个，**全部干净应用**（exit 0） |
-| `git am obs-fork/patches-windows/*.patch` | 19 个，**全部干净应用**（exit 0） |
-| 重建出的提交数 | 72 —— 与源码树**完全一致** |
+| `git am obs-fork/patches-windows/*.patch` | 20 个，**全部干净应用**（exit 0） |
+| 重建出的提交数 | 73（源码树是 74） |
 | 重建树 vs 源码树 | **只差 6 个文件** |
 
-差的 6 个文件全部在 `plugins/livehime/core/win/web/sdk/`：WebView2 的头文件加两个静态
-加载器。原因是 `Vendor the WebView2 SDK` 那条提交**唯一的内容就是这 21 MB 二进制**，
-它整条被刻意排除在补丁序列之外，改由 `build-win.ps1` 首次构建时从 NuGet 拉取。
+少的这 1 个提交和差的这 6 个文件是**同一件事**：`Vendor the WebView2 SDK` 那条提交
+**唯一的内容就是这 21 MB 二进制**，所以整条被排除在补丁序列之外，改由 `build-win.ps1`
+首次构建时从 NuGet 拉取。
 
 **所以这个差异是设计，不是缺失** —— 补丁序列在语义上精确重建了发布版本；第 0018 个
-补丁的标题本身就是这件事的说明。附带的好处是：补丁系列从 992 KB 里省掉了 21 MB，
+补丁的标题本身就是这件事的说明。附带的好处是：补丁系列从 1008 KB 里省掉了 21 MB，
 而任何人 `git am` 完都不需要额外下载就能读懂全部源码。
 
 源码树里还有过一个不属于任何补丁的散落文件：一份 `README.md` 草稿（第一版，状态还写着
