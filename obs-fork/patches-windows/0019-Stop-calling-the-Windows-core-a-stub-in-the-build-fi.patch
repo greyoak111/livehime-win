@@ -1,0 +1,93 @@
+From 1d3e8cd74fb5edce32b6bb3aec2263db4edb229b Mon Sep 17 00:00:00 2001
+From: DeepSeek Harness <noreply@deepseek.com>
+Date: Sat, 26 Sep 2026 22:27:11 +0800
+Subject: [PATCH] Stop calling the Windows core a stub in the build file
+
+Two comments still described the tree as it was before the port landed, and
+both of them are the kind of stale documentation that is worse than none:
+they tell a reader the Windows core reports "unsupported" and does nothing.
+
+CMakeLists.txt: the file header still said the Windows core is
+core/win/livehime-core-stub.cpp. The WIN32 branch has compiled
+core/win/livehime-core.cpp for the whole port; only the header was left
+behind. It now names the real core and points at the two documents that
+describe it.
+
+livehime-core-stub.cpp: its header still ended with "Replace function by
+function as the port proceeds; delete this file when the last one is gone."
+The port is finished and the file is deliberately kept as the record of the
+state the first Windows build ran in, so the header now says so.
+
+Comment-only: no translation unit changes, so the released v0.2.10 binaries
+are unaffected.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ plugins/livehime/CMakeLists.txt               | 13 ++++++++----
+ .../livehime/core/win/livehime-core-stub.cpp  | 20 ++++++++++---------
+ 2 files changed, 20 insertions(+), 13 deletions(-)
+
+diff --git a/plugins/livehime/CMakeLists.txt b/plugins/livehime/CMakeLists.txt
+index c99c058..917758b 100644
+--- a/plugins/livehime/CMakeLists.txt
++++ b/plugins/livehime/CMakeLists.txt
+@@ -17,11 +17,16 @@ find_package(Qt6 REQUIRED Widgets)
+ # per platform instead of assuming Darwin.
+ #
+ #   macOS    core = Swift (core/Sources/LiveHimeCore), window-native.mm
+-#   Windows  core = core/win/livehime-core-stub.cpp,  window-native.cpp
++#   Windows  core = C++   (core/win/livehime-core.cpp),  window-native.cpp
+ #
+-# The Windows core is a stub: it implements the whole livehime-core.h C ABI so
+-# the plugin compiles, links and loads, and reports "unsupported" to the UI.
+-# Porting the real core is tracked in docs/WINDOWS_PORT.md.
++# The Windows core is a real C++ port of the Swift one, not a stub: it implements
++# the whole livehime-core.h C ABI against WinHTTP, BCrypt, the Credential
++# Manager, WIC and WebView2. The first Windows build compiled against
++# core/win/livehime-core-stub.cpp, which is kept in the tree as the record of
++# that state and is no longer part of the build.
++#
++# What the port covers, and what it does not: docs/WINDOWS_PORT.md.
++# The frozen interfaces: docs/port-spec/CONTRACT.md.
+ # ---------------------------------------------------------------------------
+ 
+ # Portable sources: identical on every platform.
+diff --git a/plugins/livehime/core/win/livehime-core-stub.cpp b/plugins/livehime/core/win/livehime-core-stub.cpp
+index 4b16770..2833e2d 100644
+--- a/plugins/livehime/core/win/livehime-core-stub.cpp
++++ b/plugins/livehime/core/win/livehime-core-stub.cpp
+@@ -1,20 +1,22 @@
+-/* livehime-core-stub.cpp — Windows build of the LiveHime session core.
++/* livehime-core-stub.cpp — the first Windows build's session core. SUPERSEDED.
+  *
+- * The real core lives in core/Sources/LiveHimeCore/*.swift and is macOS-only:
+- * it imports WebKit, AppKit, Security, CryptoKit, AVFoundation, Speech,
+- * ImageIO, UniformTypeIdentifiers, CoreImage and Compression, with no
+- * `#if os(...)` fallback anywhere (see docs/WINDOWS_PORT.md).
++ * Not built. core/win/livehime-core.cpp is the real Windows core and is what
++ * CMakeLists.txt compiles; this file is kept as the record of the state the
++ * first Windows build ran in, while the port landed file by file behind it.
++ *
++ * Why it had to exist: the upstream core lives in
++ * core/Sources/LiveHimeCore/*.swift and is macOS-only — it imports WebKit,
++ * AppKit, Security, CryptoKit, AVFoundation, Speech, ImageIO,
++ * UniformTypeIdentifiers, CoreImage and Compression, with no `#if os(...)`
++ * fallback anywhere (see docs/WINDOWS_PORT.md).
+  *
+  * This file implements the entire livehime-core.h C ABI so the Qt UI compiles,
+- * links and loads on Windows, and so the port can land file by file behind it.
++ * links and loads on Windows.
+  *
+  * Contract with the UI: every entry point reports
+  * {"state":"failed","event":...} / {"status":"unsupported"} through the state
+  * callback. Nothing is ever reported as success. The UI already handles these
+  * shapes — it must never show "signed in" or "live" on the strength of a stub.
+- *
+- * Replace function by function as the port proceeds; delete this file when the
+- * last one is gone.
+  */
+ 
+ #include "livehime-core.h"
+-- 
+2.54.0 (Apple Git-157)
+

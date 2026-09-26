@@ -15,9 +15,9 @@ verified, and — the part worth reading — **where I got it wrong.**
 
 | | |
 |---|---|
-| 补丁 | 18 个（在 macOS 的 53 个之上），984 KB |
+| 补丁 | 19 个（在 macOS 的 53 个之上），992 KB |
 | `livehime.dll` | 4,384,256 字节（桩版 1,053,184） |
-| 首次发布 | [v0.2.10](https://github.com/greyoak111/livehime-win/releases/tag/v0.2.10)，48.6 MB |
+| 首次发布 | [v0.2.10](https://github.com/greyoak111/livehime-win/releases/tag/v0.2.10)：安装包 35,166,782 B（33.5 MB），绿色包 51,172,978 B（48.8 MB） |
 | 验证环境 | Windows 11 ARM64 / Parallels，x64 构建在模拟下运行 |
 
 **技术栈替换**（每一项都落地并在真机验证）：
@@ -33,7 +33,7 @@ verified, and — the part worth reading — **where I got it wrong.**
 | `CIQRCodeGenerator` | qrcodegen（MIT） |
 | `DispatchQueue.main` | message-only 窗口 |
 
-**实测证据**：扫码登录（真实账号，`mid 364662067`）· 房间信息 · 收弹幕（真实直播间
+**实测证据**：扫码登录（真实 B 站账号，mid 已隐去）· 房间信息 · 收弹幕（真实直播间
 34 秒 101 个事件）· 分区列表 450 个 · 表情 225 张全部重编码为 ≤160px PNG ·
 WBI 签名被 B 站接受（`getDanmuInfo` 回 `code=0`）· 更新器找到刚发布的 release 并答
 `upToDate`。
@@ -201,6 +201,17 @@ WebView2 的静态库 10.7 MB × 2 一开始被我 commit 进树里。后来意�
 
 **教训**：文档不是一次性产物。状态变了就要回去改，否则它比没有更糟。
 
+**到交付时还漏了一处，而且它就在最显眼的地方**：`plugins/livehime/CMakeLists.txt`
+的文件头一直写着「Windows 核心 = `core/win/livehime-core-stub.cpp`，它是个桩，对 UI
+报告 unsupported」，而**同一个文件往下 80 行的 WIN32 分支**早就在编
+`core/win/livehime-core.cpp` 了。原因是那条注释是第 1 个补丁写下的，此后 17 个补丁
+没有任何一个回头看过文件头。收尾时补了第 19 个补丁修掉它，顺带把
+`livehime-core-stub.cpp` 自己的头注释（还写着「移植推进时逐个替换、删掉此文件」）改成
+「已被取代、不参与编译」。
+
+**教训（加一条）**：最容易漏掉的文档是**代码文件顶部的注释** —— 它不在 `docs/` 里，
+没有测试会碰它，而它就贴在读者第一眼看到的位置。
+
 ---
 
 ## 四、没做完的 / What is not done
@@ -255,6 +266,36 @@ OBS 日志里可核验的行：
 [livehime] update -> upToDate              ← 更新器找到了正确的仓库
 [livehime] danmaku failed at stage -> ...  ← 失败时指出是哪一步
 ```
+
+### 6.1 补丁序列真的能重建源码树吗
+
+能。而且这一步是**实测过的**，不是声称的 —— 仓库里的
+`build-aux/livehime-win/verify-patches.sh` 会在一份干净的 OBS 克隆上重放整个序列，
+然后**检查重建出来的东西**，而不是相信它：35 个 C 入口是否逐个有声明也有定义、
+Windows 分支编的是 C++ 核心还是那个历史桩、四份规格文档在不在、WebView2 SDK 是不是
+按设计缺席。给它一个 `OBS_MIRROR` 就完全不需要联网。
+
+实测结果：
+
+| 步骤 | 结果 |
+|---|---|
+| 检出基座 `ba2f32b` | 上游 OBS 32.2.2 |
+| `git am obs-fork/patches/*.patch` | 53 个，**全部干净应用**（exit 0） |
+| `git am obs-fork/patches-windows/*.patch` | 19 个，**全部干净应用**（exit 0） |
+| 重建出的提交数 | 72 —— 与源码树**完全一致** |
+| 重建树 vs 源码树 | **只差 6 个文件** |
+
+差的 6 个文件全部在 `plugins/livehime/core/win/web/sdk/`：WebView2 的头文件加两个静态
+加载器。原因是 `Vendor the WebView2 SDK` 那条提交**唯一的内容就是这 21 MB 二进制**，
+它整条被刻意排除在补丁序列之外，改由 `build-win.ps1` 首次构建时从 NuGet 拉取。
+
+**所以这个差异是设计，不是缺失** —— 补丁序列在语义上精确重建了发布版本；第 0018 个
+补丁的标题本身就是这件事的说明。附带的好处是：补丁系列从 992 KB 里省掉了 21 MB，
+而任何人 `git am` 完都不需要额外下载就能读懂全部源码。
+
+源码树里还有过一个不属于任何补丁的散落文件：一份 `README.md` 草稿（第一版，状态还写着
+"This has not been run yet"）。它靠 OBS 自己的 `.gitignore` 规则 `/*` 隐身，所以既没被
+跟踪、也没进过补丁 —— 收尾时删掉了，它已经被仓库里这份取代。
 
 ---
 

@@ -24,17 +24,24 @@ dock, and the domain knowledge in its Swift session core.
 ## Layout
 
 ```
-obs-fork/patches/          the macOS project's 53 patches, unchanged
-obs-fork/patches-windows/  the Windows port, as patches on top of them
+# in this repository
+obs-fork/patches/            the macOS project's 53 patches, unchanged
+obs-fork/patches-windows/    the Windows port, 19 patches on top of them
+build-aux/livehime-win/
+  build-win.ps1              the Windows build (a mirror — the series is authoritative)
+  rebuild-and-package.ps1    clone, patch, build, installer
+  package-installer.iss      the Inno Setup script
+  verify-patches.sh          proves the series rebuilds the tree
+docs/WINDOWS_PORT.md         port map: done / stubbed / remaining
+docs/PORTING_NOTES.md        how the port was done, and where it went wrong
+docs/port-spec/              the port contract and the module specifications
+
+# in the tree, once the series is applied
 plugins/livehime/
-  src/                     Qt UI (portable) + window-native.{mm,cpp}
-  core/Sources/            the macOS session core (Swift — not built on Windows)
-  core/win/                the Windows core, in C++
-  core/include/            livehime-core.h, the C bridge both cores implement
-build-aux/livehime-win/    build-win.ps1
-docs/WINDOWS_PORT.md       port map: done / stubbed / remaining
-docs/PORTING_NOTES.md      how the port was done, and where it went wrong
-docs/port-spec/            the port contract and the module specifications
+  src/                       Qt UI (portable) + window-native.{mm,cpp}
+  core/Sources/              the macOS session core (Swift — not built on Windows)
+  core/win/                  the Windows core, in C++ (~14,400 lines)
+  core/include/              livehime-core.h, the C bridge both cores implement
 ```
 
 The plugin talks to its core through one C ABI (`livehime-core.h`, 35
@@ -80,14 +87,29 @@ machine component and is present on any current Windows.
 ## Rebuilding the fork
 
 ```sh
-git clone --depth 1 --branch 32.2.2 https://github.com/obsproject/obs-studio.git
+git clone https://github.com/obsproject/obs-studio.git obs-studio
 cd obs-studio
 git checkout -b livehime/main ba2f32bdf791005443988a4955e963663e16b1ed
-git am obs-fork/patches/*.patch obs-fork/patches-windows/*.patch
+git am ../livehime-win/obs-fork/patches/*.patch
+git am ../livehime-win/obs-fork/patches-windows/*.patch
 ```
 
-All 53 macOS patches apply cleanly to that commit, and the Windows series on top
-of them.
+All 53 macOS patches apply cleanly to that commit and all 19 Windows patches
+apply cleanly on top of them — 72 commits, no fuzz and no rejects.
+
+`build-aux/livehime-win/verify-patches.sh` does exactly this in a scratch
+directory and then checks the result rather than trusting it: the C ABI's 35
+entry points are each declared and defined, the Windows branch compiles the C++
+core rather than the historical stub, the four specification documents are
+present, and the WebView2 SDK is correctly absent. It needs no network if you
+point `OBS_MIRROR` at a local obs-studio clone.
+
+One commit of the original working tree is **deliberately not in the series**:
+`Vendor the WebView2 SDK`, whose only content was those 21 MB of vendored
+binaries. Leaving it out keeps the series 992 KB of readable text and lets
+`build-win.ps1` fetch the same NuGet package on the first build instead. It is
+the **only** difference between the rebuilt tree and the tree the release was
+built from — 6 files, every one of them that SDK.
 
 ## Credits
 
